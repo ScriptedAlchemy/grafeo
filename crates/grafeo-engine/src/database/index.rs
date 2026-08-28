@@ -34,6 +34,7 @@ impl super::GrafeoDB {
     /// ```
     pub fn create_property_index(&self, property: &str) {
         self.lpg_store().create_property_index(property);
+        self.note_index_state_changed();
         // After a compaction most rows live in the columnar base, which
         // keeps its own hash index; without this the "indexed" lookup
         // would still scan every base column.
@@ -51,7 +52,11 @@ impl super::GrafeoDB {
     ///
     /// Returns `true` if the index existed and was removed.
     pub fn drop_property_index(&self, property: &str) -> bool {
-        self.lpg_store().drop_property_index(property)
+        let removed = self.lpg_store().drop_property_index(property);
+        if removed {
+            self.note_index_state_changed();
+        }
+        removed
     }
 
     /// Returns `true` if the property has an index.
@@ -186,6 +191,7 @@ impl super::GrafeoDB {
                     self.lpg_store()
                         .add_vector_index(label, property, Arc::new(index));
                 }
+                self.note_index_state_changed();
 
                 let _ = (m, ef_construction);
                 grafeo_info!(
@@ -233,6 +239,7 @@ impl super::GrafeoDB {
             self.lpg_store()
                 .add_vector_index(label, property, Arc::new(index));
         }
+        self.note_index_state_changed();
 
         // Suppress unused variable warnings when vector-index is off
         let _ = (m, ef_construction);
@@ -243,6 +250,30 @@ impl super::GrafeoDB {
         );
 
         Ok(())
+    }
+
+    /// Number of vectors a vector index covers, or `None` if there is no
+    /// such index.
+    ///
+    /// The count a caller most often wants after a reopen: it separates
+    /// an index that was restored from its persisted topology from one
+    /// that came back registered but empty.
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_len(&self, label: &str, property: &str) -> Option<usize> {
+        self.lpg_store()
+            .get_vector_index(label, property)
+            .map(|index| index.len())
+    }
+
+    /// Estimated heap bytes a vector index's topology occupies, or
+    /// `None` if there is no such index.
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_heap_bytes(&self, label: &str, property: &str) -> Option<usize> {
+        self.lpg_store()
+            .get_vector_index(label, property)
+            .map(|index| index.heap_memory_bytes())
     }
 
     /// Stamps an opaque binding token on an existing vector index.
@@ -265,6 +296,7 @@ impl super::GrafeoDB {
         }
         self.lpg_store()
             .set_vector_index_binding(label, property, binding);
+        self.note_index_state_changed();
         true
     }
 
@@ -337,6 +369,7 @@ impl super::GrafeoDB {
     pub fn drop_vector_index(&self, label: &str, property: &str) -> bool {
         let removed = self.lpg_store().remove_vector_index(label, property);
         if removed {
+            self.note_index_state_changed();
             grafeo_info!("Vector index dropped: :{label}({property})");
         }
         removed

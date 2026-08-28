@@ -3226,6 +3226,21 @@ impl GrafeoDB {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Index creation, removal, and binding changes are unlogged.
+    ///
+    /// Nothing about an index reaches the WAL - it is derived state,
+    /// rebuilt or restored at open - so a close that skips its flush
+    /// because the WAL has not moved would silently discard it. That was
+    /// harmless while indexes were rebuilt on every open and cost only
+    /// the rebuild. It stops being harmless the moment they are
+    /// restored: an index built after open would never reach the file,
+    /// and the next open would rebuild it again, forever.
+    #[allow(unused)]
+    fn note_index_state_changed(&self) {
+        #[cfg(all(feature = "grafeo-file", feature = "wal"))]
+        self.note_unlogged_state();
+    }
+
     /// Writes the current database state to the `.grafeo` file using the unified flush.
     ///
     /// Does NOT remove the sidecar WAL: callers that want to clean up
