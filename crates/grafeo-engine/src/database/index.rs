@@ -34,6 +34,8 @@ impl super::GrafeoDB {
     /// ```
     pub fn create_property_index(&self, property: &str) {
         self.lpg_store().create_property_index(property);
+        // Not WAL-logged; the persisted index state is behind.
+        self.mark_container_stale();
         // After a compaction most rows live in the columnar base, which
         // keeps its own hash index; without this the "indexed" lookup
         // would still scan every base column.
@@ -51,7 +53,12 @@ impl super::GrafeoDB {
     ///
     /// Returns `true` if the index existed and was removed.
     pub fn drop_property_index(&self, property: &str) -> bool {
-        self.lpg_store().drop_property_index(property)
+        let removed = self.lpg_store().drop_property_index(property);
+        if removed {
+            // Not WAL-logged; the persisted index state is behind.
+            self.mark_container_stale();
+        }
+        removed
     }
 
     /// Returns `true` if the property has an index.
@@ -249,6 +256,30 @@ impl super::GrafeoDB {
         Ok(())
     }
 
+    /// Number of vectors a vector index covers, or `None` if there is no
+    /// such index.
+    ///
+    /// The count a caller most often wants after a reopen: it separates
+    /// an index that was restored from its persisted topology from one
+    /// that came back registered but empty.
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_len(&self, label: &str, property: &str) -> Option<usize> {
+        self.lpg_store()
+            .get_vector_index(label, property)
+            .map(|index| index.len())
+    }
+
+    /// Estimated heap bytes a vector index's topology occupies, or
+    /// `None` if there is no such index.
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_heap_bytes(&self, label: &str, property: &str) -> Option<usize> {
+        self.lpg_store()
+            .get_vector_index(label, property)
+            .map(|index| index.heap_memory_bytes())
+    }
+
     /// Stamps an opaque binding token on an existing vector index.
     ///
     /// The engine never interprets the token. It persists beside the
@@ -269,6 +300,8 @@ impl super::GrafeoDB {
         }
         self.lpg_store()
             .set_vector_index_binding(label, property, binding);
+        // Not WAL-logged; the persisted index state is behind.
+        self.mark_container_stale();
         true
     }
 
