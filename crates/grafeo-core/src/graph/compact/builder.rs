@@ -893,11 +893,7 @@ pub fn from_graph_store(
                     InferredType::Dict => {
                         let str_values: Vec<String> = values
                             .iter()
-                            .map(|v| match v {
-                                Value::Null => String::new(),
-                                Value::String(s) => s.to_string(),
-                                other => format!("{other}"),
-                            })
+                            .map(super::dict_value::encode_dict_entry)
                             .collect();
                         let str_refs: Vec<&str> = str_values.iter().map(String::as_str).collect();
                         let mut dict_builder = DictionaryBuilder::new();
@@ -905,7 +901,18 @@ pub fn from_graph_store(
                             dict_builder.add(s);
                         }
                         let dict = dict_builder.build();
-                        let zone_map = compute_zone_map_strings(&str_refs);
+                        // A marked entry (Bytes payload or escaped string)
+                        // stores an encoded form; min/max bounds over encoded
+                        // forms must not be compared against raw query values,
+                        // so those columns carry no zone-map statistics.
+                        let has_marked = str_refs
+                            .iter()
+                            .any(|s| s.starts_with(super::dict_value::DICT_MARKER_PREFIX));
+                        let zone_map = if has_marked {
+                            ZoneMap::new()
+                        } else {
+                            compute_zone_map_strings(&str_refs)
+                        };
                         t.zone_maps.push((key.clone(), zone_map));
                         t.columns.push((key.clone(), ColumnCodec::Dict(dict)));
                         t.record_len(str_values.len());
@@ -1050,11 +1057,7 @@ pub fn from_graph_store(
                             InferredType::Dict => {
                                 let str_values: Vec<String> = values
                                     .iter()
-                                    .map(|v| match v {
-                                        Value::Null => String::new(),
-                                        Value::String(s) => s.to_string(),
-                                        other => format!("{other}"),
-                                    })
+                                    .map(super::dict_value::encode_dict_entry)
                                     .collect();
                                 let mut dict_builder = DictionaryBuilder::new();
                                 for s in &str_values {
