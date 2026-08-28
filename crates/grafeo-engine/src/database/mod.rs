@@ -199,6 +199,22 @@ pub struct GrafeoDB {
     /// [`detach_compact_base_from_mmap`](Self::detach_compact_base_from_mmap).
     #[cfg(all(feature = "grafeo-file", feature = "compact-store", feature = "lpg"))]
     compact_base_mmap: parking_lot::Mutex<Option<bytes::Bytes>>,
+    /// Set when this database put state into memory that the container
+    /// does not hold and the WAL cannot account for: replayed WAL records
+    /// on open, and the store rebuilds performed by
+    /// [`compact`](Self::compact) / [`recompact`](Self::recompact).
+    ///
+    /// Read only by [`close_would_write_nothing`](Self::close_would_write_nothing),
+    /// which needs the WAL's record count to be the *whole* story before
+    /// it can skip the close-time flush.
+    #[cfg(all(feature = "grafeo-file", feature = "wal"))]
+    unlogged_state: std::sync::atomic::AtomicBool,
+    /// WAL record count as of the last full (`Explicit`) flush through
+    /// [`checkpoint_to_file`](Self::checkpoint_to_file), which leaves the
+    /// container holding every section. While the WAL sits at this
+    /// count, nothing has been written since.
+    #[cfg(all(feature = "grafeo-file", feature = "wal"))]
+    flushed_wal_records: std::sync::atomic::AtomicU64,
 }
 
 impl GrafeoDB {
@@ -388,6 +404,15 @@ impl GrafeoDB {
 
         let is_read_only = config.access_mode == crate::config::AccessMode::ReadOnly;
 
+        // Whether this open put state into the store that the container
+        // does not already hold. Recovered WAL records are exactly that:
+        // they live only in memory and in the sidecar until the next
+        // flush, so `close` must not treat an untouched WAL as proof
+        // that the container is up to date. See
+        // [`close_would_write_nothing`](Self::close_would_write_nothing).
+        #[cfg(all(feature = "grafeo-file", feature = "wal"))]
+        let mut replayed_wal_records = false;
+
         // Phase 5e: capture the deserialized CompactStore base when we
         // reload a v2 section file that was written by a previously
         // compacted database. The post-construction wiring uses this to
@@ -508,6 +533,7 @@ impl GrafeoDB {
                 if config.wal_enabled && fm.has_sidecar_wal() {
                     let recovery = WalRecovery::new(fm.sidecar_wal_path());
                     let records = recovery.recover()?;
+                    replayed_wal_records |= !records.is_empty();
                     Self::apply_wal_records(
                         &store,
                         &catalog,
@@ -560,6 +586,10 @@ impl GrafeoDB {
                 if !is_single_file && wal_path.exists() {
                     let recovery = WalRecovery::new(&wal_path);
                     let records = recovery.recover()?;
+                    #[cfg(feature = "grafeo-file")]
+                    {
+                        replayed_wal_records |= !records.is_empty();
+                    }
                     Self::apply_wal_records(
                         &store,
                         &catalog,
@@ -667,6 +697,10 @@ impl GrafeoDB {
             compact_tiered: None,
             #[cfg(all(feature = "grafeo-file", feature = "compact-store", feature = "lpg"))]
             compact_base_mmap: parking_lot::Mutex::new(None),
+            #[cfg(all(feature = "grafeo-file", feature = "wal"))]
+            unlogged_state: std::sync::atomic::AtomicBool::new(replayed_wal_records),
+            #[cfg(all(feature = "grafeo-file", feature = "wal"))]
+            flushed_wal_records: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Register storage sections as memory consumers for pressure tracking
@@ -825,6 +859,10 @@ impl GrafeoDB {
             compact_tiered: None,
             #[cfg(all(feature = "grafeo-file", feature = "compact-store", feature = "lpg"))]
             compact_base_mmap: parking_lot::Mutex::new(None),
+            #[cfg(all(feature = "grafeo-file", feature = "wal"))]
+            unlogged_state: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(feature = "grafeo-file", feature = "wal"))]
+            flushed_wal_records: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -918,6 +956,10 @@ impl GrafeoDB {
             compact_tiered: None,
             #[cfg(all(feature = "grafeo-file", feature = "compact-store", feature = "lpg"))]
             compact_base_mmap: parking_lot::Mutex::new(None),
+            #[cfg(all(feature = "grafeo-file", feature = "wal"))]
+            unlogged_state: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(feature = "grafeo-file", feature = "wal"))]
+            flushed_wal_records: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1018,6 +1060,11 @@ impl GrafeoDB {
         self.query_cache = Arc::new(QueryCache::default());
         self.projections.write().clear();
 
+        // The store was rebuilt in memory without a single WAL record;
+        // close must not mistake a quiet WAL for a current container.
+        #[cfg(all(feature = "grafeo-file", feature = "wal"))]
+        self.note_unlogged_state();
+
         Ok(())
     }
 
@@ -1096,6 +1143,10 @@ impl GrafeoDB {
 
         self.layered_store = Some(new_layered);
         self.query_cache = Arc::new(QueryCache::default());
+
+        // See `compact`: a merge rewrites the base with no WAL trace.
+        #[cfg(all(feature = "grafeo-file", feature = "wal"))]
+        self.note_unlogged_state();
 
         Ok(())
     }
@@ -2410,15 +2461,27 @@ impl GrafeoDB {
             if let Some(ref wal) = self.wal {
                 wal.sync()?;
             }
-            let flush_result = self.checkpoint_to_file(fm, flush::FlushReason::Explicit)?;
+            // Nothing written since the last full flush: the container
+            // already holds every section, so leave the file alone rather
+            // than re-serializing the whole store over an identical copy.
+            let skipped_flush = self.close_would_write_nothing();
+            let flush_result = if skipped_flush {
+                flush::FlushResult {
+                    sections_written: 0,
+                }
+            } else {
+                self.checkpoint_to_file(fm, flush::FlushReason::Explicit)?
+            };
 
             // Safety check: if WAL has records but the checkpoint was a no-op
             // (zero sections written), the container file may not contain the
             // latest data. This can happen when sections are not marked dirty
             // despite mutations going through the WAL. Force-dirty all sections
-            // and retry before removing the sidecar.
+            // and retry before removing the sidecar. A deliberate skip is
+            // exempt: it has already established that every record the WAL
+            // holds is in the container.
             #[cfg(feature = "wal")]
-            let flush_result = if flush_result.sections_written == 0 {
+            let flush_result = if !skipped_flush && flush_result.sections_written == 0 {
                 if let Some(ref wal) = self.wal {
                     if wal.record_count() > 0 {
                         grafeo_warn!(
@@ -2451,7 +2514,7 @@ impl GrafeoDB {
             #[cfg(not(feature = "wal"))]
             let has_wal_records = false;
 
-            if flush_result.sections_written > 0 || !has_wal_records {
+            if skipped_flush || flush_result.sections_written > 0 || !has_wal_records {
                 {
                     use grafeo_common::testing::crash::maybe_crash;
                     maybe_crash("close:before_remove_sidecar_wal");
@@ -2962,6 +3025,60 @@ impl GrafeoDB {
         backup::do_restore_to_epoch(backup_dir, target_epoch, output_path)
     }
 
+    /// Whether `close` can leave the container completely untouched.
+    ///
+    /// `close` flushes with [`FlushReason::Explicit`](flush::FlushReason),
+    /// which re-serializes *every* section whether or not anything
+    /// changed — on a large graph that is the whole store written back
+    /// over an identical copy, and it is the dominant cost of shutting a
+    /// database down. Skipping it needs positive proof that the container
+    /// is already current, and the per-section `is_dirty` flags are not
+    /// that proof: `build_sections` mints fresh, clean wrappers on every
+    /// flush, so a dirty-only close persists nothing and loses data.
+    ///
+    /// The WAL is the one witness that does hold. With it enabled every
+    /// mutation is logged, so a record count still sitting where the last
+    /// full flush left it means nothing has been written since — and that
+    /// flush wrote every section. Two things the count cannot see are
+    /// tracked separately in `unlogged_state`: records replayed into
+    /// memory when this database opened, and the store rebuilds done by
+    /// `compact` / `recompact`.
+    ///
+    /// The watermark only moves on a full flush taken through this
+    /// database handle. Timer-driven checkpoints run on their own thread
+    /// with their own sections and leave it alone, which costs a skip but
+    /// never a write.
+    ///
+    /// With no WAL there is no such witness, so the full flush stands.
+    #[cfg(feature = "grafeo-file")]
+    fn close_would_write_nothing(&self) -> bool {
+        #[cfg(feature = "wal")]
+        {
+            let Some(ref wal) = self.wal else {
+                return false;
+            };
+            !self
+                .unlogged_state
+                .load(std::sync::atomic::Ordering::Acquire)
+                && wal.record_count()
+                    == self
+                        .flushed_wal_records
+                        .load(std::sync::atomic::Ordering::Acquire)
+        }
+        #[cfg(not(feature = "wal"))]
+        {
+            false
+        }
+    }
+
+    /// Records that memory now holds state the WAL cannot account for,
+    /// so the next `close` must write the container in full.
+    #[cfg(all(feature = "grafeo-file", feature = "wal"))]
+    fn note_unlogged_state(&self) {
+        self.unlogged_state
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Writes the current database state to the `.grafeo` file using the unified flush.
     ///
     /// Does NOT remove the sidecar WAL: callers that want to clean up
@@ -2996,14 +3113,31 @@ impl GrafeoDB {
         #[cfg(not(feature = "lpg"))]
         let context = flush::build_context_minimal(&self.transaction_manager);
 
-        flush::flush(
+        let result = flush::flush(
             fm,
             &section_refs,
             &context,
             reason,
             #[cfg(feature = "wal")]
             self.wal.as_deref(),
-        )
+        )?;
+
+        // A full flush leaves the container holding every section, so the
+        // WAL's current position is the watermark a later close compares
+        // against. Only `Explicit` qualifies: a `Checkpoint`-reason flush
+        // writes a subset.
+        #[cfg(feature = "wal")]
+        if reason == flush::FlushReason::Explicit
+            && let Some(ref wal) = self.wal
+        {
+            self.flushed_wal_records
+                .store(wal.record_count(), std::sync::atomic::Ordering::Release);
+            // Whatever the WAL could not account for is on disk now.
+            self.unlogged_state
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+
+        Ok(result)
     }
 
     /// Mirrors [`flush`](flush::flush)'s section selection so the

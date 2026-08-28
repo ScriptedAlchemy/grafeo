@@ -10,15 +10,20 @@ impl super::GrafeoDB {
     // =========================================================================
 
     /// Returns the number of nodes in the database.
+    ///
+    /// Counts the active graph store, so a compacted database reports the
+    /// columnar base plus its overlay rather than the overlay alone.
     #[must_use]
     pub fn node_count(&self) -> usize {
-        self.lpg_store().node_count()
+        self.graph_store().node_count()
     }
 
     /// Returns the number of edges in the database.
+    ///
+    /// See [`node_count`](Self::node_count).
     #[must_use]
     pub fn edge_count(&self) -> usize {
-        self.lpg_store().edge_count()
+        self.graph_store().edge_count()
     }
 
     /// Returns the number of distinct labels in the database.

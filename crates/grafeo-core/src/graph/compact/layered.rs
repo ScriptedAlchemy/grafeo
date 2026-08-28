@@ -751,9 +751,7 @@ impl GraphStore for LayeredStore {
             .dirty_edge_ids
             .read()
             .iter()
-            .filter(|id| {
-                !deleted_edges.contains(*id) && self.base.load().get_edge(**id).is_some()
-            })
+            .filter(|id| !deleted_edges.contains(*id) && self.base.load().get_edge(**id).is_some())
             .count();
         base_count.saturating_sub(deleted_edges.len() + promoted) + overlay_count
     }
