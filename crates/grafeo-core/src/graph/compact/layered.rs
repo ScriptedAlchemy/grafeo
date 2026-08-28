@@ -384,6 +384,19 @@ impl LayeredStore {
         self.deleted_from_base_nodes.read().contains(&id)
     }
 
+    /// Records a base-node tombstone when the base actually owns `id`.
+    ///
+    /// Used when deleting a node that was promoted into the overlay: both
+    /// layers hold a row under that id, and only the tombstone keeps the
+    /// base one out of `node_ids`.
+    fn tombstone_base_node(&self, id: NodeId) {
+        if self.base.load().get_node(id).is_some()
+            && self.deleted_from_base_nodes.write().insert(id)
+        {
+            self.deletions_dirty.store(true, Ordering::Release);
+        }
+    }
+
     /// Records a base-edge tombstone when the base actually owns `id`.
     ///
     /// Used when deleting an edge that was promoted into the overlay: both
@@ -727,17 +740,20 @@ impl GraphStore for LayeredStore {
 
     fn node_count(&self) -> usize {
         let base_count = self.base.load().node_count();
-        let deleted = self.deleted_from_base_nodes.read().len();
+        let deleted_nodes = self.deleted_from_base_nodes.read();
         let overlay_count = self.overlay.load().node_count();
-        // Dirty nodes that came from the base are counted once in the overlay.
-        // We subtract them from the base total to avoid double counting.
+        // Dirty nodes that came from the base are counted once in the
+        // overlay, so subtract them from the base total. A promoted node
+        // that was then deleted carries both a tombstone and a dirty
+        // marker; count it once, or the two subtractions run the base
+        // total below zero.
         let promoted = self
             .dirty_node_ids
             .read()
             .iter()
-            .filter(|id| self.base.load().get_node(**id).is_some())
+            .filter(|id| !deleted_nodes.contains(*id) && self.base.load().get_node(**id).is_some())
             .count();
-        base_count - deleted - promoted + overlay_count
+        base_count.saturating_sub(deleted_nodes.len() + promoted) + overlay_count
     }
 
     fn edge_count(&self) -> usize {
@@ -1239,7 +1255,10 @@ impl GraphStoreMut for LayeredStore {
     fn delete_node(&self, id: NodeId) -> bool {
         let _guard = self.merge_guard.read();
         if self.is_node_dirty(id) {
-            // Node is in the overlay: delete from overlay.
+            // Node is in the overlay: delete from overlay. A promoted node
+            // exists in both layers under the same id, so the base copy
+            // needs its own tombstone or it reappears in `node_ids`.
+            self.tombstone_base_node(id);
             return self.overlay.load().delete_node(id);
         }
         if self.base.load().get_node(id).is_some() {
@@ -1263,6 +1282,9 @@ impl GraphStoreMut for LayeredStore {
     ) -> bool {
         let _guard = self.merge_guard.read();
         if self.is_node_dirty(id) {
+            // See `delete_node`: the base copy of a promoted node needs
+            // its own tombstone.
+            self.tombstone_base_node(id);
             return self
                 .overlay
                 .load()
