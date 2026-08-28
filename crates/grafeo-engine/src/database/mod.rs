@@ -2954,11 +2954,20 @@ impl GrafeoDB {
         fm: &GrafeoFileManager,
         reason: flush::FlushReason,
     ) -> Result<flush::FlushResult> {
-        // Any write relocates and rewrites section payloads, which would
-        // pull the rug out from under a compact base that is still
-        // reading through a mapping of this same file.
+        // A container write relocates and rewrites section payloads,
+        // which would pull the rug out from under a compact base still
+        // reading through a mapping of this same file. Detach *before*
+        // building the sections below, because those wrap the base as it
+        // stands right now.
+        //
+        // Skipped when the flush would write nothing, which a
+        // `Checkpoint`-reason flush over a clean store does: giving up
+        // the mapping costs a copy of the section, and a flush that
+        // never touches the container has no reason to charge for one.
         #[cfg(all(feature = "lpg", feature = "compact-store"))]
-        self.detach_compact_base_from_mmap()?;
+        if self.compact_base_is_mmap_backed() && self.flush_would_write(reason) {
+            self.detach_compact_base_from_mmap()?;
+        }
 
         let sections = self.build_sections();
         let section_refs: Vec<&dyn grafeo_common::storage::Section> =
@@ -2976,6 +2985,16 @@ impl GrafeoDB {
             #[cfg(feature = "wal")]
             self.wal.as_deref(),
         )
+    }
+
+    /// Mirrors [`flush`](flush::flush)'s section selection so the
+    /// mmap detach can be skipped for a flush that writes nothing.
+    ///
+    /// The sections built here are dropped before the caller detaches,
+    /// so no wrapper outlives the base it was built from.
+    #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+    fn flush_would_write(&self, reason: flush::FlushReason) -> bool {
+        reason == flush::FlushReason::Explicit || self.build_sections().iter().any(|s| s.is_dirty())
     }
 
     /// Returns the file manager if using single-file format.
