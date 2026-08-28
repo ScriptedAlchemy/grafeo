@@ -628,12 +628,36 @@ pub(crate) struct BlockNamedGraph {
 }
 
 /// Serializes LPG data into the block-based binary format.
+///
+/// Thin wrapper over [`write_blocks_into`]: identical bytes, but the
+/// whole section is materialised in the returned `Vec`. Callers on the
+/// flush path should prefer the sink form.
 pub(crate) fn write_blocks(
     nodes: &[BlockNode],
     edges: &[BlockEdge],
     named_graphs: &[BlockNamedGraph],
     epoch: u64,
 ) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_blocks_into(&mut out, nodes, edges, named_graphs, epoch)?;
+    Ok(out)
+}
+
+/// Serializes LPG data into the block-based binary format, writing
+/// straight into `sink`.
+///
+/// The previous assembly step built every block into its own `Vec` and
+/// then copied all of them into one output `Vec`, so the peak was twice
+/// the section size. Blocks still have to be built before the directory
+/// can record their offsets and CRCs, but the second copy is gone: the
+/// header, the directory, and each block body go to the sink in place.
+pub(crate) fn write_blocks_into(
+    sink: &mut dyn std::io::Write,
+    nodes: &[BlockNode],
+    edges: &[BlockEdge],
+    named_graphs: &[BlockNamedGraph],
+    epoch: u64,
+) -> Result<()> {
     let mut strings = StringTableBuilder::new();
     let mut blocks: Vec<(BlockType, Vec<u8>, u32, u32)> = Vec::new(); // (type, data, key_idx, sub_type)
 
@@ -771,9 +795,11 @@ pub(crate) fn write_blocks(
         data_offset += block_data.len();
     }
 
-    // Write output
+    // Write output. Header + directory are fixed-size and tiny
+    // (64 B + 24 B per block), so they are staged in one small buffer;
+    // block bodies go straight to the sink without a second copy.
     let total_size = data_offset;
-    let mut output = Vec::with_capacity(total_size);
+    let mut prologue = Vec::with_capacity(HEADER_SIZE + dir_size);
 
     // Header
     // reason: section block counts fit u16/u32
@@ -789,20 +815,25 @@ pub(crate) fn write_blocks(
         named_graph_count: named_graphs.len() as u32,
         _reserved: [0; 28],
     };
-    header.write_to(&mut output);
+    header.write_to(&mut prologue);
 
     // Directory
     for entry in &dir_entries {
-        entry.write_to(&mut output);
+        entry.write_to(&mut prologue);
     }
+    debug_assert_eq!(prologue.len(), HEADER_SIZE + dir_size);
+    sink.write_all(&prologue)?;
 
     // Block data
+    let mut written = prologue.len();
     for (_, block_data, _, _) in &blocks {
-        output.extend_from_slice(block_data);
+        sink.write_all(block_data)?;
+        written += block_data.len();
     }
 
-    debug_assert_eq!(output.len(), total_size);
-    Ok(output)
+    debug_assert_eq!(written, total_size);
+    let _ = written;
+    Ok(())
 }
 
 fn intern_values_strings(entries: &[(EpochId, Value)], strings: &mut StringTableBuilder) {

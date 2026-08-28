@@ -108,12 +108,50 @@ impl CompactStoreSection {
         &self,
         version: u8,
     ) -> grafeo_common::utils::error::Result<Vec<u8>> {
+        // Size hint preserved from the pre-streaming implementation so
+        // the `Vec` path still allocates once instead of doubling.
+        let capacity = self
+            .store
+            .read()
+            .as_ref()
+            .map_or(0, |store| store.memory_bytes());
+        let mut out = Vec::with_capacity(capacity);
+        self.serialize_into_with_version(&mut out, version)?;
+        Ok(out)
+    }
+
+    /// Streams the section at the requested format version.
+    ///
+    /// The encoder still writes through `&mut Vec<u8>` helpers
+    /// ([`write_len`], [`ColumnCodec::write_to_v3`],
+    /// [`CsrAdjacency::write_to`]) that live in sibling modules, so a
+    /// scratch buffer stays. What changed is its lifetime: it is drained
+    /// to `sink` at every table boundary and reused, so the resident
+    /// peak is the largest single table rather than the whole store.
+    ///
+    /// The trailing CRC is folded incrementally over each drained chunk,
+    /// which covers exactly the same payload bytes as the previous
+    /// one-shot `crc32fast::hash(&buf)`, so files written through either
+    /// entry point are byte-identical.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` when the section holds no store, `Error::Io`
+    /// when the sink rejects a write.
+    pub(crate) fn serialize_into_with_version(
+        &self,
+        sink: &mut dyn std::io::Write,
+        version: u8,
+    ) -> grafeo_common::utils::error::Result<()> {
         let guard = self.store.read();
         let store = guard.as_ref().ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal("no CompactStore to serialize".into())
         })?;
 
-        let mut buf = Vec::with_capacity(store.memory_bytes());
+        // Starts small and grows to the largest table; `drain_chunk`
+        // clears without releasing capacity, so later tables reuse it.
+        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_TARGET_BYTES);
+        let mut crc = crc32fast::Hasher::new();
 
         // Header.
         buf.extend_from_slice(&MAGIC);
@@ -144,6 +182,10 @@ impl CompactStoreSection {
                     version,
                     nt.block_zone_maps().get(key).map(Vec::as_slice),
                 );
+                // Column granularity: a single wide column is the
+                // smallest unit this encoder can emit without rewriting
+                // the sibling-module writers.
+                drain_chunk(&mut buf, sink, &mut crc, false)?;
             }
         }
 
@@ -160,6 +202,7 @@ impl CompactStoreSection {
             } else {
                 buf.push(0);
             }
+            drain_chunk(&mut buf, sink, &mut crc, false)?;
             let properties = rt.properties();
             write_len(&mut buf, properties.len());
             for (key, codec) in properties {
@@ -167,44 +210,75 @@ impl CompactStoreSection {
                 // Edge property columns don't track per-block zone maps
                 // yet; v3 will compute them inline during write.
                 write_codec(codec, &mut buf, version, None);
+                drain_chunk(&mut buf, sink, &mut crc, false)?;
             }
         }
-        // Continue building buf in `serialize()` epilogue.
-        Ok(self.append_id_maps_and_crc(buf, store, version))
+
+        self.write_id_maps(&mut buf, sink, &mut crc, store)?;
+
+        // Flush whatever is left, then the CRC over everything written.
+        drain_chunk(&mut buf, sink, &mut crc, true)?;
+        sink.write_all(&crc.finalize().to_le_bytes())?;
+        Ok(())
     }
 
-    /// Appends ID maps (if applicable) and trailing CRC to the buffer.
-    fn append_id_maps_and_crc(
+    /// Writes the ID maps (when the store preserves ids), draining to
+    /// the sink as the scratch buffer fills.
+    fn write_id_maps(
         &self,
-        mut buf: Vec<u8>,
+        buf: &mut Vec<u8>,
+        sink: &mut dyn std::io::Write,
+        crc: &mut crc32fast::Hasher,
         store: &CompactStore,
-        _version: u8,
-    ) -> Vec<u8> {
-        // ID maps.
-        if store.preserves_ids() {
-            if let Some(ref node_map) = store.node_id_map {
-                write_len(&mut buf, node_map.len());
-                for (&nid, &(tid, off)) in node_map {
-                    write_u64(&mut buf, nid.as_u64());
-                    write_u16(&mut buf, tid);
-                    write_u64(&mut buf, off);
-                }
-            }
-            if let Some(ref edge_map) = store.edge_id_map {
-                write_len(&mut buf, edge_map.len());
-                for (&eid, &(rtid, pos)) in edge_map {
-                    write_u64(&mut buf, eid.as_u64());
-                    write_u16(&mut buf, rtid);
-                    write_u64(&mut buf, pos);
-                }
+    ) -> grafeo_common::utils::error::Result<()> {
+        if !store.preserves_ids() {
+            return Ok(());
+        }
+        if let Some(ref node_map) = store.node_id_map {
+            write_len(buf, node_map.len());
+            for (&nid, &(tid, off)) in node_map {
+                write_u64(buf, nid.as_u64());
+                write_u16(buf, tid);
+                write_u64(buf, off);
+                drain_chunk(buf, sink, crc, false)?;
             }
         }
-
-        // CRC32 at end.
-        let crc = crc32fast::hash(&buf);
-        buf.extend_from_slice(&crc.to_le_bytes());
-        buf
+        if let Some(ref edge_map) = store.edge_id_map {
+            write_len(buf, edge_map.len());
+            for (&eid, &(rtid, pos)) in edge_map {
+                write_u64(buf, eid.as_u64());
+                write_u16(buf, rtid);
+                write_u64(buf, pos);
+                drain_chunk(buf, sink, crc, false)?;
+            }
+        }
+        Ok(())
     }
+}
+
+/// Target scratch size before a drain. Large enough that a per-row
+/// `drain_chunk` call in the id-map loops is a predictable-branch no-op,
+/// small enough that the peak stays bounded.
+const CHUNK_TARGET_BYTES: usize = 1 << 20;
+
+/// Moves `buf` into `sink`, folding it into `crc` on the way, and clears
+/// `buf` without releasing its capacity.
+///
+/// A no-op unless `force` is set or the buffer has reached
+/// [`CHUNK_TARGET_BYTES`], so callers can invoke it on every row.
+fn drain_chunk(
+    buf: &mut Vec<u8>,
+    sink: &mut dyn std::io::Write,
+    crc: &mut crc32fast::Hasher,
+    force: bool,
+) -> grafeo_common::utils::error::Result<()> {
+    if buf.is_empty() || (!force && buf.len() < CHUNK_TARGET_BYTES) {
+        return Ok(());
+    }
+    crc.update(buf);
+    sink.write_all(buf)?;
+    buf.clear();
+    Ok(())
 }
 
 /// Writes a single column codec body using the layout matching the
@@ -241,6 +315,13 @@ impl Section for CompactStoreSection {
 
     fn serialize(&self) -> grafeo_common::utils::error::Result<Vec<u8>> {
         self.serialize_with_version(FORMAT_VERSION)
+    }
+
+    fn serialize_into(
+        &self,
+        sink: &mut dyn std::io::Write,
+    ) -> grafeo_common::utils::error::Result<()> {
+        self.serialize_into_with_version(sink, FORMAT_VERSION)
     }
 
     fn deserialize(&mut self, data: &[u8]) -> grafeo_common::utils::error::Result<()> {
@@ -693,6 +774,80 @@ mod tests {
     use crate::graph::lpg::LpgStore;
     use crate::graph::traits::GraphStore;
     use grafeo_common::types::Value;
+
+    /// Builds a store big enough that the streaming encoder has to drain
+    /// its scratch buffer several times, so the chunk boundaries — and
+    /// therefore the incremental CRC — are actually exercised.
+    fn multi_chunk_store() -> CompactStore {
+        let store = LpgStore::new().unwrap();
+        // ~512 B of string per node over 8k nodes ≈ 4 MiB of column data,
+        // comfortably past CHUNK_TARGET_BYTES.
+        let filler = "x".repeat(512);
+        let mut ids = Vec::new();
+        for i in 0..8_192i64 {
+            let id = store.create_node(&["Person"]);
+            store.set_node_property(id, "name", Value::from(format!("{filler}-{i}").as_str()));
+            store.set_node_property(id, "age", Value::Int64(i));
+            ids.push(id);
+        }
+        for w in ids.windows(2) {
+            store.create_edge(w[0], w[1], "KNOWS");
+        }
+        from_graph_store_preserving_ids(&store).unwrap()
+    }
+
+    /// A container written through the sink path must be bit-for-bit
+    /// what the `Vec` path would have produced, chunk boundaries and
+    /// incrementally-folded CRC included.
+    #[test]
+    fn compact_sink_and_vec_paths_are_byte_identical() {
+        let section = CompactStoreSection::new(Arc::new(multi_chunk_store()));
+
+        let via_vec = section.serialize().expect("serialize");
+        let mut via_sink = Vec::new();
+        section
+            .serialize_into(&mut via_sink)
+            .expect("serialize_into");
+
+        assert!(
+            via_vec.len() > CHUNK_TARGET_BYTES,
+            "fixture must exceed one chunk to prove anything: {} bytes",
+            via_vec.len()
+        );
+        assert_eq!(via_sink.len(), via_vec.len(), "byte counts must match");
+        assert!(via_sink == via_vec, "sink and Vec bytes must be identical");
+
+        // The streamed bytes must still deserialize, which also
+        // re-verifies the trailing CRC.
+        let mut restored = CompactStoreSection::empty();
+        restored.deserialize(&via_sink).expect("deserialize");
+        assert_eq!(restored.store().unwrap().node_count(), 8_192);
+    }
+
+    /// Byte identity has to hold at every format version the writer can
+    /// still emit, not just the current one.
+    #[test]
+    fn compact_sink_matches_vec_for_legacy_versions() {
+        let store = LpgStore::new().unwrap();
+        for i in 0..64i64 {
+            let id = store.create_node(&["Person"]);
+            store.set_node_property(id, "age", Value::Int64(i));
+        }
+        let section =
+            CompactStoreSection::new(Arc::new(from_graph_store_preserving_ids(&store).unwrap()));
+
+        for version in [FORMAT_VERSION_V1, FORMAT_VERSION_V2, FORMAT_VERSION] {
+            let via_vec = section.serialize_with_version(version).unwrap();
+            let mut via_sink = Vec::new();
+            section
+                .serialize_into_with_version(&mut via_sink, version)
+                .unwrap();
+            assert!(
+                via_sink == via_vec,
+                "version {version}: sink and Vec bytes must be identical"
+            );
+        }
+    }
 
     #[test]
     fn test_round_trip_empty() {

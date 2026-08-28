@@ -161,6 +161,16 @@ impl Section for LpgStoreSection {
     }
 
     fn serialize(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.serialize_into(&mut out)?;
+        Ok(out)
+    }
+
+    /// Streams the block-format encoding straight into `sink`.
+    ///
+    /// Both entry points share this encoder, so the `Vec` and sink forms
+    /// cannot produce different bytes.
+    fn serialize_into(&self, sink: &mut dyn std::io::Write) -> Result<()> {
         let nodes = collect_block_nodes(&self.store);
         let edges = collect_block_edges(&self.store);
 
@@ -182,7 +192,7 @@ impl Section for LpgStoreSection {
         #[cfg(not(feature = "temporal"))]
         let epoch = 0u64;
 
-        block::write_blocks(&nodes, &edges, &named_graphs, epoch)
+        block::write_blocks_into(sink, &nodes, &edges, &named_graphs, epoch)
     }
 
     fn deserialize(&mut self, data: &[u8]) -> Result<()> {
@@ -255,6 +265,56 @@ mod tests {
 
         assert_eq!(section2.store().node_count(), 2);
         assert_eq!(section2.store().edge_count(), 1);
+    }
+
+    /// The sink path and the `Vec` path must produce identical bytes:
+    /// a container written through either one has to be readable by the
+    /// same deserializer, and a divergence would only show up as a CRC
+    /// failure on a much later open.
+    #[test]
+    fn lpg_section_sink_and_vec_paths_are_byte_identical() {
+        let store = Arc::new(LpgStore::new().unwrap());
+        // Enough shape to exercise every block kind: labels, node and
+        // edge property columns, string interning, and a named graph.
+        for i in 0..256 {
+            let id = store.create_node(&["Person", "Indexed"]);
+            store.set_node_property(id, "name", Value::String(arcstr::format!("person-{i}")));
+            store.set_node_property(id, "age", Value::Int64(i));
+            store.set_node_property(id, "active", Value::Bool(i % 2 == 0));
+        }
+        for i in 1..256u64 {
+            let e = store.create_edge(NodeId::new(i), NodeId::new(i + 1), "KNOWS");
+            store.set_edge_property(e, "weight", Value::Float64(i as f64));
+        }
+        store.create_graph("social").unwrap();
+        if let Some(g) = store.graph("social") {
+            let n = g.create_node(&["Friend"]);
+            g.set_node_property(n, "nick", Value::String("gus".into()));
+        }
+
+        let section = LpgStoreSection::new(Arc::clone(&store));
+        let via_vec = section.serialize().expect("serialize");
+        let mut via_sink = Vec::new();
+        section
+            .serialize_into(&mut via_sink)
+            .expect("serialize_into");
+
+        assert_eq!(
+            via_sink.len(),
+            via_vec.len(),
+            "sink and Vec paths must write the same number of bytes"
+        );
+        assert!(
+            via_sink == via_vec,
+            "sink and Vec paths must write identical bytes"
+        );
+
+        // And the sink bytes are actually loadable.
+        let reloaded = Arc::new(LpgStore::new().unwrap());
+        let mut section2 = LpgStoreSection::new(Arc::clone(&reloaded));
+        section2.deserialize(&via_sink).expect("deserialize");
+        assert_eq!(reloaded.node_count(), 256);
+        assert_eq!(reloaded.edge_count(), 255);
     }
 
     #[test]
