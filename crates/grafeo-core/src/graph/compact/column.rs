@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
 use arcstr::ArcStr;
 use bytes::{Bytes, BytesMut};
 use grafeo_common::types::Value;
@@ -387,9 +388,7 @@ impl ColumnCodec {
                 let val = Value::Int64(v as i64);
                 val
             }),
-            Self::Dict(dict) => dict
-                .get(index)
-                .map(super::dict_value::decode_dict_entry),
+            Self::Dict(dict) => dict.get(index).map(super::dict_value::decode_dict_entry),
             Self::Bitmap(bv) => bv.get(index).map(Value::Bool),
             Self::Int8Vector { bytes, dimensions } => {
                 let dims = *dimensions as usize;
