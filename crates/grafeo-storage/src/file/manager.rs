@@ -42,6 +42,131 @@ pub struct GrafeoFileManager {
     section_encryptor: Option<grafeo_common::encryption::PageEncryptor>,
 }
 
+/// Buffer size interposed between a streaming section and the file.
+///
+/// Sections emit many small writes (a `u32` length here, a string
+/// there), so the raw `File` would see one syscall each. 256 KiB is a
+/// bounded, constant staging cost that keeps the syscall count in line
+/// with the old one-`write_all`-per-section behaviour.
+const SECTION_WRITE_BUFFER_BYTES: usize = 256 * 1024;
+
+/// One section's payload for the shared container-write path.
+///
+/// Implemented for `(SectionType, &[u8])` (bytes already in hand) and
+/// for `&dyn Section` (bytes produced on demand into the sink), which is
+/// what lets `write_sections` and `write_sections_streaming` share a
+/// single implementation.
+pub trait SectionPayload {
+    /// The section type this payload will be filed under.
+    fn section_type(&self) -> grafeo_common::storage::SectionType;
+
+    /// Writes the payload's bytes into `sink`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload cannot be produced, or if `sink`
+    /// rejects a write.
+    fn write_into(&self, sink: &mut dyn Write) -> Result<()>;
+}
+
+impl SectionPayload for (grafeo_common::storage::SectionType, &[u8]) {
+    fn section_type(&self) -> grafeo_common::storage::SectionType {
+        self.0
+    }
+
+    fn write_into(&self, sink: &mut dyn Write) -> Result<()> {
+        sink.write_all(self.1)?;
+        Ok(())
+    }
+}
+
+impl SectionPayload for &dyn grafeo_common::storage::Section {
+    fn section_type(&self) -> grafeo_common::storage::SectionType {
+        grafeo_common::storage::Section::section_type(*self)
+    }
+
+    fn write_into(&self, sink: &mut dyn Write) -> Result<()> {
+        grafeo_common::storage::Section::serialize_into(*self, sink)
+    }
+}
+
+/// Counts and checksums bytes on their way to an inner writer.
+///
+/// Replaces the `crc32fast::hash(&data)` + `data.len()` pair that the
+/// buffered path could compute only because it held the whole section.
+/// `finish` flushes the inner writer before reporting, so the returned
+/// length always matches what reached the file.
+struct CrcCountingWriter<W: Write> {
+    inner: W,
+    hasher: crc32fast::Hasher,
+    written: u64,
+}
+
+/// Writes to a file while refusing to cross a byte bound.
+///
+/// The out-of-place checkpoint streams the new generation into the gap
+/// below the live one without knowing its size up front; this writer is
+/// what guarantees the stream can never touch a live byte. A write that
+/// would cross `remaining` raises `overflowed` and fails *before* any of
+/// its bytes reach the file, so the caller can abandon the gap attempt
+/// and restart the stream past the live generation.
+struct BoundedFileWriter<'a> {
+    file: &'a mut File,
+    /// Bytes still available before the bound; `None` means unbounded.
+    remaining: Option<u64>,
+    overflowed: &'a std::cell::Cell<bool>,
+}
+
+impl Write for BoundedFileWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(remaining) = self.remaining {
+            if (buf.len() as u64) > remaining {
+                self.overflowed.set(true);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "generation stream reached the live-generation bound",
+                ));
+            }
+            self.remaining = Some(remaining - buf.len() as u64);
+        }
+        self.file.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl<W: Write> CrcCountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+            written: 0,
+        }
+    }
+
+    /// Flushes and returns `(length, crc32)` of everything written.
+    fn finish(mut self) -> Result<(u64, u32)> {
+        self.inner.flush()?;
+        Ok((self.written, self.hasher.finalize()))
+    }
+}
+
+impl<W: Write> Write for CrcCountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 impl GrafeoFileManager {
     /// Creates a new `.grafeo` file at `path`.
     ///
@@ -511,55 +636,67 @@ impl GrafeoFileManager {
         node_count: u64,
         edge_count: u64,
     ) -> Result<()> {
+        self.write_section_payloads(sections, epoch, transaction_id, node_count, edge_count)
+    }
+
+    /// Writes sections by streaming each one straight into the container.
+    ///
+    /// Same on-disk result as [`write_sections`](Self::write_sections),
+    /// but no caller-side `Vec<u8>` per section: each [`Section`] emits
+    /// itself into the file through
+    /// [`Section::serialize_into`](grafeo_common::storage::Section::serialize_into),
+    /// so the transient heap during a full-store persist is bounded by
+    /// the largest buffer a single section chooses to stage rather than
+    /// by the sum of all sections.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database is read-only, if a section fails
+    /// to serialize, or if write/sync fails.
+    pub fn write_sections_streaming(
+        &self,
+        sections: &[&dyn grafeo_common::storage::Section],
+        epoch: u64,
+        transaction_id: u64,
+        node_count: u64,
+        edge_count: u64,
+    ) -> Result<()> {
+        self.write_section_payloads(sections, epoch, transaction_id, node_count, edge_count)
+    }
+
+    /// Shared container-write implementation behind
+    /// [`write_sections`](Self::write_sections) and
+    /// [`write_sections_streaming`](Self::write_sections_streaming).
+    ///
+    /// Generic over [`SectionPayload`] so the directory, alignment,
+    /// truncation, header-commit and fsync ordering exist exactly once:
+    /// the two public entry points differ only in where a section's
+    /// bytes come from.
+    /// Streams one generation — every section, then its directory page —
+    /// into the file starting at `region_start`, never crossing `limit`.
+    ///
+    /// Returns the directory, its offset, and the region end on success,
+    /// and `Ok(None)` when the stream would have crossed `limit`: the bound
+    /// is enforced *before* bytes reach the file, so an overflowing attempt
+    /// leaves every byte at and past `limit` untouched and the caller can
+    /// retry in another region.
+    fn stream_generation<P: SectionPayload>(
+        &self,
+        file: &mut File,
+        sections: &[P],
+        region_start: u64,
+        limit: Option<u64>,
+        active_header: &DbHeader,
+    ) -> Result<Option<(crate::container::SectionDirectory, u64, u64)>> {
         use crate::container::SectionDirectory;
-        use crate::container::directory::SECTION_DATA_OFFSET;
         use grafeo_common::storage::SectionDirectoryEntry;
         use grafeo_common::testing::crash::maybe_crash;
 
-        if self.read_only {
-            return Err(Error::Internal(
-                "cannot write sections: database is open in read-only mode".to_string(),
-            ));
-        }
-
-        let mut dir = SectionDirectory::new();
-        let mut file = self.file.lock();
-        let active_header = self.active_header.lock();
-        let mut active_slot = self.active_slot.lock();
-
-        maybe_crash("write_sections:before_data");
-
-        // Size the new generation up front: page-aligned section payloads
-        // plus one directory page. Encryption adds a fixed per-section
-        // overhead (nonce + tag), so the total stays exact either way.
-        #[cfg(feature = "encryption")]
-        let per_section_overhead: u64 = if self.section_encryptor.is_some() {
-            grafeo_common::encryption::ENCRYPTION_OVERHEAD as u64
-        } else {
-            0
-        };
-        #[cfg(not(feature = "encryption"))]
-        let per_section_overhead: u64 = 0;
-
-        let new_generation_size: u64 = sections
-            .iter()
-            .map(|(_, data)| Self::page_align_up(data.len() as u64 + per_section_overhead))
-            .sum::<u64>()
-            + 4096;
-
-        // Place the new generation outside the live one: in the gap below
-        // it when the whole generation fits, otherwise appended past it.
-        let region_start = match self.live_extent(&mut file, &active_header)? {
-            None => SECTION_DATA_OFFSET,
-            Some((live_lo, _)) if SECTION_DATA_OFFSET + new_generation_size <= live_lo => {
-                SECTION_DATA_OFFSET
-            }
-            Some((_, live_hi)) => Self::page_align_up(live_hi.max(SECTION_DATA_OFFSET)),
-        };
-
-        // Write each section at page-aligned offsets
         let page_size = 4096u64;
+        let mut dir = SectionDirectory::new();
         let mut current_offset = region_start;
+        let overflowed = std::cell::Cell::new(false);
+
         // Next checkpoint iteration, used as the high part of the nonce so that
         // the same (section_type, offset) pair produces a different nonce across
         // checkpoints. Without this, identical section layouts would reuse nonces.
@@ -567,43 +704,78 @@ impl GrafeoFileManager {
         // reason: iteration wraps at u32::MAX which takes billions of checkpoints (~100+ years at 1/s)
         #[allow(clippy::cast_possible_truncation)]
         let nonce_iteration = (active_header.iteration + 1) as u32;
+        #[cfg(not(feature = "encryption"))]
+        let _ = active_header;
 
-        for (section_type, data) in sections {
-            // Encrypt section data if encryption is enabled.
+        for payload in sections {
+            let section_type = payload.section_type();
+
+            file.seek(SeekFrom::Start(current_offset))?;
+
+            // Encryption needs the whole plaintext in hand (AEAD over the
+            // section, with the tag appended), so that path still stages
+            // one section at a time. Unencrypted containers — the default —
+            // stream straight through a CRC-computing writer and never
+            // materialise the section at all.
+            //
             // Nonce high word: iteration in bits [31:8], section type in bits [7:0].
             // Bit-packing (not XOR) ensures unique high words: XOR is commutative
             // so `iter ^ type` can collide across different (iter, type) pairs,
             // but packing into disjoint bit lanes is injective for type < 256.
             // Nonce low word: page-aligned write offset (unique within a checkpoint).
             // AAD binds the ciphertext to the section type, preventing relocation.
-            // Encrypt section data if an encryptor is configured, otherwise
-            // write the plaintext bytes directly (no allocation).
             #[cfg(feature = "encryption")]
-            let encrypted_buf: Option<Vec<u8>> = if let Some(ref enc) = self.section_encryptor {
-                let nonce_high = (nonce_iteration << 8) | (*section_type as u32 & 0xFF);
+            let (length, checksum) = if let Some(ref enc) = self.section_encryptor {
+                let mut plaintext = Vec::new();
+                payload.write_into(&mut plaintext)?;
+                let nonce_high = (nonce_iteration << 8) | (section_type as u32 & 0xFF);
                 let nonce = grafeo_common::encryption::build_nonce(nonce_high, current_offset);
-                let aad = format!("grafeo-section:{}", *section_type as u32);
-                Some(
-                    enc.encrypt(data, &nonce, aad.as_bytes())
-                        .map_err(|e| Error::Internal(format!("section encryption failed: {e}")))?,
-                )
+                let aad = format!("grafeo-section:{}", section_type as u32);
+                let ciphertext = enc
+                    .encrypt(&plaintext, &nonce, aad.as_bytes())
+                    .map_err(|e| Error::Internal(format!("section encryption failed: {e}")))?;
+                if limit.is_some_and(|limit| current_offset + ciphertext.len() as u64 > limit) {
+                    return Ok(None);
+                }
+                file.write_all(&ciphertext)?;
+                (ciphertext.len() as u64, crc32fast::hash(&ciphertext))
             } else {
-                None
+                let bounded = BoundedFileWriter {
+                    file: &mut *file,
+                    remaining: limit.map(|limit| limit.saturating_sub(current_offset)),
+                    overflowed: &overflowed,
+                };
+                let mut writer = CrcCountingWriter::new(std::io::BufWriter::with_capacity(
+                    SECTION_WRITE_BUFFER_BYTES,
+                    bounded,
+                ));
+                match payload.write_into(&mut writer).and_then(|()| writer.finish()) {
+                    Ok(result) => result,
+                    Err(_) if overflowed.get() => return Ok(None),
+                    Err(error) => return Err(error),
+                }
             };
 
-            #[cfg(feature = "encryption")]
-            let write_data: &[u8] = encrypted_buf.as_deref().unwrap_or(data);
             #[cfg(not(feature = "encryption"))]
-            let write_data: &[u8] = data;
-
-            let checksum = crc32fast::hash(write_data);
-            let length = write_data.len() as u64;
-
-            file.seek(SeekFrom::Start(current_offset))?;
-            file.write_all(write_data)?;
+            let (length, checksum) = {
+                let bounded = BoundedFileWriter {
+                    file: &mut *file,
+                    remaining: limit.map(|limit| limit.saturating_sub(current_offset)),
+                    overflowed: &overflowed,
+                };
+                let mut writer = CrcCountingWriter::new(std::io::BufWriter::with_capacity(
+                    SECTION_WRITE_BUFFER_BYTES,
+                    bounded,
+                ));
+                match payload.write_into(&mut writer).and_then(|()| writer.finish()) {
+                    Ok(result) => result,
+                    Err(_) if overflowed.get() => return Ok(None),
+                    Err(error) => return Err(error),
+                }
+            };
 
             dir.upsert(SectionDirectoryEntry {
-                section_type: *section_type,
+                section_type,
                 version: 1,
                 flags: section_type.default_flags(),
                 offset: current_offset,
@@ -622,9 +794,72 @@ impl GrafeoFileManager {
         // `current_offset` is already page-aligned by the section loop.
         let directory_offset = current_offset;
         let dir_bytes = dir.to_bytes();
+        if limit.is_some_and(|limit| directory_offset + dir_bytes.len() as u64 > limit) {
+            return Ok(None);
+        }
         file.seek(SeekFrom::Start(directory_offset))?;
         file.write_all(&dir_bytes)?;
         let region_end = directory_offset + dir_bytes.len() as u64;
+
+        Ok(Some((dir, directory_offset, region_end)))
+    }
+
+    fn write_section_payloads<P: SectionPayload>(
+        &self,
+        sections: &[P],
+        epoch: u64,
+        transaction_id: u64,
+        node_count: u64,
+        edge_count: u64,
+    ) -> Result<()> {
+        use crate::container::directory::SECTION_DATA_OFFSET;
+        use grafeo_common::testing::crash::maybe_crash;
+
+        if self.read_only {
+            return Err(Error::Internal(
+                "cannot write sections: database is open in read-only mode".to_string(),
+            ));
+        }
+
+        let mut file = self.file.lock();
+        let active_header = self.active_header.lock();
+        let mut active_slot = self.active_slot.lock();
+
+        maybe_crash("write_sections:before_data");
+
+        // Place the new generation outside the live one. Streaming payloads
+        // do not know their serialized size up front, so the gap below the
+        // live generation is tried optimistically: the stream runs behind a
+        // bound that refuses to touch a live byte, and a stream that would
+        // cross it is abandoned (the partial bytes are dead space nothing
+        // references) and restarted past the live end. Sections re-emit
+        // deterministically, so the retry writes the same generation.
+        let live = self.live_extent(&mut file, &active_header)?;
+        let first_limit = live.map(|(live_lo, _)| live_lo);
+        let attempt = self.stream_generation(
+            &mut file,
+            sections,
+            SECTION_DATA_OFFSET,
+            first_limit,
+            &active_header,
+        )?;
+        let (dir, directory_offset, region_end) = match (attempt, live) {
+            (Some(written), _) => written,
+            (None, Some((_, live_hi))) => {
+                let region_start = Self::page_align_up(live_hi.max(SECTION_DATA_OFFSET));
+                self.stream_generation(&mut file, sections, region_start, None, &active_header)?
+                    .ok_or_else(|| {
+                        Error::Internal(
+                            "unbounded generation stream reported a bound overflow".to_string(),
+                        )
+                    })?
+            }
+            (None, None) => {
+                return Err(Error::Internal(
+                    "generation stream overflowed with no live generation".to_string(),
+                ));
+            }
+        };
 
         maybe_crash("write_sections:after_directory");
 
@@ -878,6 +1113,24 @@ impl GrafeoFileManager {
         ))
     }
 
+    /// Whether section payloads in this container are encrypted at rest.
+    ///
+    /// [`mmap_section`](Self::mmap_section) hands back the raw on-disk
+    /// bytes, so a zero-copy reader must fall back to
+    /// [`read_section_data`](Self::read_section_data) — which decrypts —
+    /// when this returns `true`.
+    #[must_use]
+    pub fn section_encryption_enabled(&self) -> bool {
+        #[cfg(feature = "encryption")]
+        {
+            self.section_encryptor.is_some()
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            false
+        }
+    }
+
     /// Copies the database file to `dest` using the already-locked file handle.
     ///
     /// `std::fs::copy()` opens the source with a new handle, which fails on
@@ -927,6 +1180,160 @@ mod tests {
 
     fn test_dir() -> TempDir {
         TempDir::new().expect("create temp dir")
+    }
+
+    /// Section that emits its payload in many small writes — the shape a
+    /// real streaming serializer produces, and the case where a naive
+    /// length/CRC accumulator would go wrong.
+    struct ChattySection {
+        section_type: grafeo_common::storage::SectionType,
+        payload: Vec<u8>,
+    }
+
+    impl grafeo_common::storage::Section for ChattySection {
+        fn section_type(&self) -> grafeo_common::storage::SectionType {
+            self.section_type
+        }
+        fn serialize(&self) -> Result<Vec<u8>> {
+            Ok(self.payload.clone())
+        }
+        fn serialize_into(&self, sink: &mut dyn Write) -> Result<()> {
+            // Deliberately awkward chunking, and not a divisor of the
+            // payload length.
+            for chunk in self.payload.chunks(7) {
+                sink.write_all(chunk)?;
+            }
+            Ok(())
+        }
+        fn deserialize(&mut self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn is_dirty(&self) -> bool {
+            true
+        }
+        fn mark_clean(&self) {}
+        fn memory_usage(&self) -> usize {
+            self.payload.len()
+        }
+    }
+
+    /// The streaming writer must land the same directory (offsets,
+    /// lengths, CRCs) and the same payload bytes as the buffered writer.
+    /// Anything else is a silent format fork.
+    #[test]
+    fn alix_streaming_and_buffered_writes_produce_identical_containers() {
+        use grafeo_common::storage::{Section, SectionType};
+
+        let sections = [
+            ChattySection {
+                section_type: SectionType::Catalog,
+                payload: (0..5_000u32).flat_map(u32::to_le_bytes).collect(),
+            },
+            ChattySection {
+                section_type: SectionType::LpgStore,
+                // Crosses several page boundaries so alignment is exercised.
+                payload: vec![0x5A; 40_000],
+            },
+            ChattySection {
+                section_type: SectionType::VectorStore,
+                payload: b"short".to_vec(),
+            },
+        ];
+
+        let dir = test_dir();
+
+        let buffered_path = dir.path().join("buffered.grafeo");
+        {
+            let manager = GrafeoFileManager::create(&buffered_path).unwrap();
+            let owned: Vec<(SectionType, Vec<u8>)> = sections
+                .iter()
+                .map(|s| (s.section_type, s.serialize().unwrap()))
+                .collect();
+            let refs: Vec<(SectionType, &[u8])> =
+                owned.iter().map(|(t, d)| (*t, d.as_slice())).collect();
+            manager.write_sections(&refs, 7, 9, 11, 13).unwrap();
+            manager.close().unwrap();
+        }
+
+        let streamed_path = dir.path().join("streamed.grafeo");
+        {
+            let manager = GrafeoFileManager::create(&streamed_path).unwrap();
+            let refs: Vec<&dyn Section> = sections.iter().map(|s| s as &dyn Section).collect();
+            manager
+                .write_sections_streaming(&refs, 7, 9, 11, 13)
+                .unwrap();
+            manager.close().unwrap();
+        }
+
+        let buffered = GrafeoFileManager::open(&buffered_path).unwrap();
+        let streamed = GrafeoFileManager::open(&streamed_path).unwrap();
+
+        let buffered_dir = buffered.read_section_directory().unwrap().unwrap();
+        let streamed_dir = streamed.read_section_directory().unwrap().unwrap();
+
+        for section in &sections {
+            let b = buffered_dir.find(section.section_type).expect("buffered");
+            let s = streamed_dir.find(section.section_type).expect("streamed");
+            assert_eq!(b.offset, s.offset, "{:?} offset", section.section_type);
+            assert_eq!(b.length, s.length, "{:?} length", section.section_type);
+            assert_eq!(
+                b.checksum, s.checksum,
+                "{:?} checksum",
+                section.section_type
+            );
+            assert_eq!(
+                buffered.read_section_data(b).unwrap(),
+                streamed.read_section_data(s).unwrap(),
+                "{:?} payload",
+                section.section_type
+            );
+            assert_eq!(
+                streamed.read_section_data(s).unwrap(),
+                section.payload,
+                "{:?} payload must survive the streaming write",
+                section.section_type
+            );
+        }
+
+        // Same layout end-to-end, so the files must also be the same size.
+        assert_eq!(buffered.file_size().unwrap(), streamed.file_size().unwrap());
+    }
+
+    /// A section that fails mid-stream must surface the error rather
+    /// than committing a truncated section to the directory.
+    #[test]
+    fn gus_streaming_write_propagates_section_errors() {
+        use grafeo_common::storage::{Section, SectionType};
+
+        struct FailingSection;
+        impl Section for FailingSection {
+            fn section_type(&self) -> SectionType {
+                SectionType::LpgStore
+            }
+            fn serialize(&self) -> Result<Vec<u8>> {
+                Err(Error::Internal("boom".to_string()))
+            }
+            fn deserialize(&mut self, _data: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            fn is_dirty(&self) -> bool {
+                true
+            }
+            fn mark_clean(&self) {}
+            fn memory_usage(&self) -> usize {
+                0
+            }
+        }
+
+        let dir = test_dir();
+        let path = dir.path().join("failing.grafeo");
+        let manager = GrafeoFileManager::create(&path).unwrap();
+        let section = FailingSection;
+        let refs: Vec<&dyn Section> = vec![&section];
+        let err = manager
+            .write_sections_streaming(&refs, 1, 1, 0, 0)
+            .expect_err("section failure must surface");
+        assert!(err.to_string().contains("boom"), "got {err}");
     }
 
     #[test]

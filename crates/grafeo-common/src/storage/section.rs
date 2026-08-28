@@ -202,10 +202,46 @@ pub trait Section: Send + Sync {
     /// Called by the flush path (checkpoint, eviction, explicit CHECKPOINT).
     /// The returned bytes are opaque to the container writer.
     ///
+    /// Materialises the whole section in the heap. Prefer
+    /// [`serialize_into`](Section::serialize_into) on write paths that
+    /// have a sink handy: it lets a section emit itself in pieces so the
+    /// flush peak is bounded by the largest piece rather than by the
+    /// whole section.
+    ///
     /// # Errors
     ///
     /// Returns an error if serialization fails (e.g., encoding error).
     fn serialize(&self) -> Result<Vec<u8>>;
+
+    /// Serialize section contents directly into `sink`.
+    ///
+    /// The byte sequence written here is **identical** to what
+    /// [`serialize`](Section::serialize) returns; the difference is only
+    /// how much of it is resident at once. Implementations that can emit
+    /// their payload incrementally should override this and let
+    /// `serialize` delegate to it, so both entry points share one
+    /// encoder and cannot drift.
+    ///
+    /// The default materialises via `serialize()` and writes the result
+    /// in one call, which is correct for small sections (catalog,
+    /// deletion log) where streaming buys nothing.
+    ///
+    /// `sink` is `&mut dyn Write` rather than a generic parameter so the
+    /// trait stays object-safe: the flush path holds `&dyn Section`.
+    /// Callers are responsible for buffering — a section may issue many
+    /// small writes, so pass a `BufWriter` when the sink is a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails, or [`Error::Io`] if the
+    /// sink rejects a write.
+    ///
+    /// [`Error::Io`]: crate::utils::error::Error::Io
+    fn serialize_into(&self, sink: &mut dyn std::io::Write) -> Result<()> {
+        let bytes = self.serialize()?;
+        sink.write_all(&bytes)?;
+        Ok(())
+    }
 
     /// Populate section contents from bytes.
     ///
@@ -543,6 +579,40 @@ mod tests {
         assert_eq!(stub.section_type(), SectionType::LpgStore);
         assert!(!stub.is_dirty());
         assert_eq!(stub.memory_usage(), 64);
+    }
+
+    #[test]
+    fn alix_default_serialize_into_matches_serialize() {
+        // The default `serialize_into` must be a faithful stand-in for
+        // `serialize`: sections that do not override it still write the
+        // same bytes through the streaming container path.
+        let stub = StubSection { dirty: false };
+        let mut sink = Vec::new();
+        stub.serialize_into(&mut sink).unwrap();
+        assert_eq!(sink, stub.serialize().unwrap());
+    }
+
+    #[test]
+    fn gus_serialize_into_propagates_sink_io_errors() {
+        /// Sink that refuses every write.
+        struct FailingSink;
+        impl std::io::Write for FailingSink {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("nope"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let stub = StubSection { dirty: false };
+        let err = stub
+            .serialize_into(&mut FailingSink)
+            .expect_err("sink failure must surface");
+        assert!(
+            matches!(err, crate::utils::error::Error::Io(_)),
+            "sink failures are typed as Error::Io, got {err:?}"
+        );
     }
 
     #[test]
