@@ -134,10 +134,23 @@ impl LayeredStore {
     /// the snapshot read from that section, when one is present in the
     /// container directory.
     ///
-    /// The overlay's id allocator state is preserved as-is; callers
-    /// should ensure it has been seeded correctly during deserialization.
+    /// **Note on the id allocator:** the overlay's allocator is raised
+    /// above the base's highest id here, never lowered. Deserializing an
+    /// overlay only recovers the ids of the rows it actually carries, and
+    /// a fully compacted database has an *empty* overlay — so without
+    /// this the allocator restarts at 0 and the first post-reopen insert
+    /// takes an id the base already owns. The overlay row then shadows
+    /// the base row on read, and deleting it tombstones the base row
+    /// instead, losing an untouched node for good.
     #[must_use]
     pub fn with_overlay(base: Arc<CompactStore>, overlay: Arc<LpgStore>) -> Self {
+        if let Some(max) = base.max_node_id() {
+            overlay.raise_next_node_id(max.as_u64().saturating_add(1));
+        }
+        if let Some(max) = base.max_edge_id() {
+            overlay.raise_next_edge_id(max.as_u64().saturating_add(1));
+        }
+
         let mut dirty_nodes: FxHashSet<NodeId> = FxHashSet::default();
         for nid in overlay.all_node_ids() {
             if base.get_node(nid).is_some() {
@@ -371,6 +384,19 @@ impl LayeredStore {
         self.deleted_from_base_nodes.read().contains(&id)
     }
 
+    /// Records a base-edge tombstone when the base actually owns `id`.
+    ///
+    /// Used when deleting an edge that was promoted into the overlay: both
+    /// layers hold a row under that id, and only the tombstone stops the
+    /// base one from reappearing in `edges_from`.
+    fn tombstone_base_edge(&self, id: EdgeId) {
+        if self.base.load().get_edge(id).is_some()
+            && self.deleted_from_base_edges.write().insert(id)
+        {
+            self.deletions_dirty.store(true, Ordering::Release);
+        }
+    }
+
     /// Checks whether an edge ID is in the overlay (dirty or deleted).
     #[inline]
     fn is_edge_dirty(&self, id: EdgeId) -> bool {
@@ -579,8 +605,11 @@ impl GraphStore for LayeredStore {
 
         let mut results = Vec::new();
 
-        // Base neighbors (minus deleted).
-        if !deleted_nodes.contains(&node) && !self.is_node_dirty(node) {
+        // Base neighbors (minus deleted). Consulted even when the node is
+        // dirty: promotion into the overlay copies the node and its
+        // properties but not its adjacency, so the base still holds the
+        // only record of edges written before `compact()`.
+        if !deleted_nodes.contains(&node) {
             for nid in self.base.load().neighbors(node, direction) {
                 if !deleted_nodes.contains(&nid) {
                     results.push(nid);
@@ -610,8 +639,14 @@ impl GraphStore for LayeredStore {
 
         let mut results = Vec::new();
 
-        // Base edges (minus deleted).
-        if !deleted_nodes.contains(&node) && !self.is_node_dirty(node) {
+        // Base edges (minus deleted). Consulted even when the node is
+        // dirty: `ensure_in_overlay` promotes the node and its properties
+        // but not its adjacency, so gating on dirtiness dropped every
+        // pre-`compact()` edge of any node that later gained a new one.
+        // Promoted edges keep their id, so the dedup below collapses the
+        // pair; edges deleted after promotion are tombstoned against the
+        // base by `delete_edge`, so the filter here still catches them.
+        if !deleted_nodes.contains(&node) {
             for (target, eid) in self.base.load().edges_from(node, direction) {
                 if !deleted_nodes.contains(&target) && !deleted_edges.contains(&eid) {
                     results.push((target, eid));
@@ -707,15 +742,20 @@ impl GraphStore for LayeredStore {
 
     fn edge_count(&self) -> usize {
         let base_count = self.base.load().edge_count();
-        let deleted = self.deleted_from_base_edges.read().len();
+        let deleted_edges = self.deleted_from_base_edges.read();
         let overlay_count = self.overlay.load().edge_count();
+        // A promoted edge that was then deleted carries both a tombstone
+        // and a dirty marker; count it once, or the two subtractions run
+        // the base total below zero.
         let promoted = self
             .dirty_edge_ids
             .read()
             .iter()
-            .filter(|id| self.base.load().get_edge(**id).is_some())
+            .filter(|id| {
+                !deleted_edges.contains(*id) && self.base.load().get_edge(**id).is_some()
+            })
             .count();
-        base_count - deleted - promoted + overlay_count
+        base_count.saturating_sub(deleted_edges.len() + promoted) + overlay_count
     }
 
     fn edge_type(&self, id: EdgeId) -> Option<ArcStr> {
@@ -1207,7 +1247,11 @@ impl GraphStoreMut for LayeredStore {
             }
             return true;
         }
-        false
+        // Mirrors the read fall-through in `get_node`: an id the base does
+        // not own can only be an overlay row. `dirty_node_ids` records the
+        // ids this store minted, but the engine's direct `LpgStore` APIs
+        // write to the overlay without going through it.
+        self.overlay.load().delete_node(id)
     }
 
     fn delete_node_versioned(
@@ -1229,15 +1273,19 @@ impl GraphStoreMut for LayeredStore {
             }
             return true;
         }
-        false
+        // Mirrors the read fall-through in `get_node`: an id the base does
+        // not own can only be an overlay row.
+        self.overlay
+            .load()
+            .delete_node_versioned(id, epoch, transaction_id)
     }
 
     fn delete_node_edges(&self, node_id: NodeId) {
         let _guard = self.merge_guard.read();
-        // Delete overlay edges.
-        if self.is_node_dirty(node_id) {
-            self.overlay.load().delete_node_edges(node_id);
-        }
+        // Delete overlay edges. Unconditional: the overlay also holds
+        // edges of nodes it never promoted (post-`compact()` writes), and
+        // it simply reports nothing for an id it does not know.
+        self.overlay.load().delete_node_edges(node_id);
         // Mark base edges as deleted.
         let mut deleted_any = false;
         let mut edges = self.deleted_from_base_edges.write();
@@ -1255,6 +1303,10 @@ impl GraphStoreMut for LayeredStore {
     fn delete_edge(&self, id: EdgeId) -> bool {
         let _guard = self.merge_guard.read();
         if self.is_edge_dirty(id) {
+            // A promoted edge exists in both layers under the same id;
+            // tombstone the base copy too, or the base row reappears in
+            // `edges_from`.
+            self.tombstone_base_edge(id);
             return self.overlay.load().delete_edge(id);
         }
         if self.base.load().get_edge(id).is_some() {
@@ -1263,7 +1315,8 @@ impl GraphStoreMut for LayeredStore {
             }
             return true;
         }
-        false
+        // See `delete_node`: an id the base does not own is an overlay row.
+        self.overlay.load().delete_edge(id)
     }
 
     fn delete_edge_versioned(
@@ -1274,6 +1327,9 @@ impl GraphStoreMut for LayeredStore {
     ) -> bool {
         let _guard = self.merge_guard.read();
         if self.is_edge_dirty(id) {
+            // See `delete_edge`: the base copy of a promoted edge needs
+            // its own tombstone.
+            self.tombstone_base_edge(id);
             return self
                 .overlay
                 .load()
@@ -1285,7 +1341,10 @@ impl GraphStoreMut for LayeredStore {
             }
             return true;
         }
-        false
+        // See `delete_node`: an id the base does not own is an overlay row.
+        self.overlay
+            .load()
+            .delete_edge_versioned(id, epoch, transaction_id)
     }
 
     fn set_node_property(&self, id: NodeId, key: &str, value: Value) {

@@ -1482,6 +1482,8 @@ impl GrafeoDB {
             Vec<grafeo_common::types::EdgeId>,
         )>,
     ) -> Result<()> {
+        use grafeo_common::utils::error::StorageError;
+        use grafeo_core::graph::GraphStore;
         use grafeo_core::graph::compact::layered::LayeredStore;
 
         let overlay_store = self
@@ -1489,8 +1491,25 @@ impl GrafeoDB {
             .as_ref()
             .ok_or_else(|| Error::Internal("wire_layered_after_load: no LpgStore".into()))?;
 
-        // Adopt the loaded base + the loaded overlay (id allocator state
-        // is preserved on the overlay during deserialization).
+        // A base that carries rows but cannot name its highest id would
+        // leave the overlay allocator free to mint colliding ids, which
+        // silently shadows and then deletes base rows. Refuse the open
+        // instead: the section is not self-consistent.
+        if compact_base.node_count() > 0 && compact_base.max_node_id().is_none() {
+            return Err(Error::Storage(StorageError::Corruption(
+                "compact base holds nodes but reports no maximum node id".into(),
+            )));
+        }
+        if compact_base.edge_count() > 0 && compact_base.max_edge_id().is_none() {
+            return Err(Error::Storage(StorageError::Corruption(
+                "compact base holds edges but reports no maximum edge id".into(),
+            )));
+        }
+
+        // Adopt the loaded base + the loaded overlay; `with_overlay`
+        // raises the overlay's id allocator above the base's high-water
+        // mark, which deserialization alone cannot recover for a fully
+        // compacted database (its overlay is empty).
         let layered = Arc::new(LayeredStore::with_overlay(
             Arc::clone(&compact_base),
             Arc::clone(overlay_store),
