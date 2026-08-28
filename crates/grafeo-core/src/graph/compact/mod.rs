@@ -82,6 +82,11 @@ pub struct CompactStore {
     node_offset_to_id: Option<Vec<Vec<NodeId>>>,
     /// Reverse: rel_table_id index -> vec of original `EdgeId` per CSR position.
     edge_offset_to_id: Option<Vec<Vec<EdgeId>>>,
+    /// Highest preserved `NodeId`, cached from `node_id_map` at the point
+    /// the maps are attached. `None` when not ID-preserving or empty.
+    max_node_id: Option<NodeId>,
+    /// Highest preserved `EdgeId`. See [`max_node_id`](Self::max_node_id).
+    max_edge_id: Option<EdgeId>,
 }
 
 impl std::fmt::Debug for CompactStore {
@@ -149,6 +154,8 @@ impl CompactStore {
             edge_id_map: None,
             node_offset_to_id: None,
             edge_offset_to_id: None,
+            max_node_id: None,
+            max_edge_id: None,
         }
     }
 
@@ -289,10 +296,58 @@ impl CompactStore {
         node_offset_to_id: Vec<Vec<NodeId>>,
         edge_offset_to_id: Vec<Vec<EdgeId>>,
     ) {
+        // Cache the high-water marks while the maps are in hand: the
+        // layered overlay reads them on every open to seed its allocator,
+        // and re-scanning a million-entry map there is pure waste.
+        self.max_node_id = node_id_map.keys().copied().max();
+        self.max_edge_id = edge_id_map.keys().copied().max();
         self.node_id_map = Some(node_id_map);
         self.edge_id_map = Some(edge_id_map);
         self.node_offset_to_id = Some(node_offset_to_id);
         self.edge_offset_to_id = Some(edge_offset_to_id);
+    }
+
+    /// Returns the highest `NodeId` the base owns, or `None` when it holds
+    /// no nodes.
+    ///
+    /// The layered overlay seeds its ID allocator from this so IDs minted
+    /// after a reopen cannot collide with — and thereby shadow or
+    /// tombstone — a base row.
+    #[must_use]
+    pub fn max_node_id(&self) -> Option<NodeId> {
+        if self.preserves_ids() {
+            return self.max_node_id;
+        }
+        // Synthetic IDs: the largest one a table owns is its last row.
+        self.node_tables_by_id
+            .iter()
+            .enumerate()
+            .filter(|(_, nt)| !nt.is_empty())
+            .filter_map(|(tid, nt)| {
+                let table_id = u16::try_from(tid).ok()?;
+                Some(id::encode_node_id(table_id, nt.len() as u64 - 1))
+            })
+            .max()
+    }
+
+    /// Returns the highest `EdgeId` the base owns, or `None` when it holds
+    /// no edges.
+    ///
+    /// See [`max_node_id`](Self::max_node_id).
+    #[must_use]
+    pub fn max_edge_id(&self) -> Option<EdgeId> {
+        if self.preserves_ids() {
+            return self.max_edge_id;
+        }
+        self.rel_tables_by_id
+            .iter()
+            .enumerate()
+            .filter(|(_, rt)| rt.num_edges() > 0)
+            .filter_map(|(rid, rt)| {
+                let rel_table_id = u16::try_from(rid).ok()?;
+                Some(id::encode_edge_id(rel_table_id, rt.num_edges() as u64 - 1))
+            })
+            .max()
     }
 
     /// Resolves an input `NodeId` to (table_id, offset).

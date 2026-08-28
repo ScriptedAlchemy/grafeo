@@ -600,6 +600,24 @@ impl LpgStore {
         self.next_edge_id.store(id, Ordering::Release);
     }
 
+    /// Raises the next node ID counter to `id`, leaving it alone if it is
+    /// already at or above that value.
+    ///
+    /// Used when adopting an existing overlay under a compact base: the
+    /// overlay may already have allocated past the base's high-water mark
+    /// and must not be wound back.
+    #[doc(hidden)]
+    pub fn raise_next_node_id(&self, id: u64) {
+        self.next_node_id.fetch_max(id, Ordering::AcqRel);
+    }
+
+    /// Raises the next edge ID counter. See
+    /// [`raise_next_node_id`](Self::raise_next_node_id).
+    #[doc(hidden)]
+    pub fn raise_next_edge_id(&self, id: u64) {
+        self.next_edge_id.fetch_max(id, Ordering::AcqRel);
+    }
+
     /// Removes all data from the store, resetting it to an empty state.
     ///
     /// Acquires locks in the documented ordering to prevent deadlocks.

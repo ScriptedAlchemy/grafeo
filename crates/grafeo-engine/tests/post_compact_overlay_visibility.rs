@@ -112,3 +112,44 @@ fn post_compact_node_property_survives_reread() {
         "overlay-only node property should be readable"
     );
 }
+
+/// Attaching a new edge to a base node promotes that node into the
+/// overlay. Promotion copies the node and its properties but not its
+/// adjacency, so the base remains the only record of the edges written
+/// before `compact()` — they must still be traversable.
+#[test]
+fn pre_compact_edges_survive_their_source_being_promoted() {
+    let mut db = GrafeoDB::new_in_memory();
+    let a = db.create_node(&["P"]);
+    let b = db.create_node(&["P"]);
+    db.create_edge(a, b, "KNOWS");
+    db.compact().expect("compact");
+
+    // Promotes `a` into the overlay.
+    db.create_edge(a, b, "LIKES");
+
+    assert_eq!(int_scalar(&db, "MATCH ()-[r]->() RETURN count(r)"), 2);
+    assert_eq!(int_scalar(&db, "MATCH ()-[r:KNOWS]->() RETURN count(r)"), 1);
+    assert_eq!(int_scalar(&db, "MATCH ()-[r:LIKES]->() RETURN count(r)"), 1);
+}
+
+/// The counterpart: an edge deleted after its promotion must not be
+/// resurrected by the base copy that promotion left behind.
+#[test]
+fn a_promoted_edge_stays_deleted() {
+    let mut db = GrafeoDB::new_in_memory();
+    let a = db.create_node(&["P"]);
+    let b = db.create_node(&["P"]);
+    db.create_edge(a, b, "KNOWS");
+    db.compact().expect("compact");
+
+    // Writing a property promotes the edge into the overlay; deleting it
+    // afterwards has to tombstone the base row as well.
+    let s = db.session();
+    s.execute("MATCH ()-[r:KNOWS]->() SET r.since = 2020")
+        .unwrap();
+    s.execute("MATCH ()-[r:KNOWS]->() DELETE r").unwrap();
+    drop(s);
+
+    assert_eq!(int_scalar(&db, "MATCH ()-[r]->() RETURN count(r)"), 0);
+}
