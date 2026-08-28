@@ -940,6 +940,52 @@ fn test_discard_uncommitted_versions() {
     );
 }
 
+#[test]
+fn transaction_version_settlement_is_isolated_to_written_entities() {
+    let store = LpgStore::new().unwrap();
+    let source = store.create_node(&["Source"]);
+    let target = store.create_node(&["Target"]);
+    let first_transaction = TransactionId::new(41);
+    let second_transaction = TransactionId::new(42);
+    let first_epoch = store.new_epoch();
+    let second_epoch = store.new_epoch();
+
+    let first_node = store.create_node_versioned(&["First"], first_epoch, first_transaction);
+    let first_edge =
+        store.create_edge_versioned(source, target, "FIRST", first_epoch, first_transaction);
+    let second_node = store.create_node_versioned(&["Second"], second_epoch, second_transaction);
+    let second_edge =
+        store.create_edge_versioned(source, target, "SECOND", second_epoch, second_transaction);
+
+    {
+        let pending = store.pending_version_writes.lock();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[&first_transaction].nodes.len(), 1);
+        assert_eq!(pending[&first_transaction].edges.len(), 1);
+        assert_eq!(pending[&second_transaction].nodes.len(), 1);
+        assert_eq!(pending[&second_transaction].edges.len(), 1);
+    }
+
+    let committed_epoch = store.new_epoch();
+    store.finalize_version_epochs(first_transaction, committed_epoch);
+
+    assert_eq!(store.get_node_history(first_node)[0].0, committed_epoch);
+    assert_eq!(store.get_edge_history(first_edge)[0].0, committed_epoch);
+    assert_eq!(store.get_node_history(second_node)[0].0, EpochId::PENDING);
+    assert_eq!(store.get_edge_history(second_edge)[0].0, EpochId::PENDING);
+    {
+        let pending = store.pending_version_writes.lock();
+        assert!(!pending.contains_key(&first_transaction));
+        assert!(pending.contains_key(&second_transaction));
+    }
+
+    store.discard_uncommitted_versions(second_transaction);
+
+    assert!(store.get_node_history(second_node).is_empty());
+    assert!(store.get_edge_history(second_edge).is_empty());
+    assert!(store.pending_version_writes.lock().is_empty());
+}
+
 // === Property Index Tests ===
 
 #[test]

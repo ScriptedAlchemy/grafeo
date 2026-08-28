@@ -74,6 +74,7 @@ impl LpgStore {
         };
         let chain = VersionChain::with_initial(record, version_epoch, transaction_id);
         self.edges.write().insert(id, chain);
+        self.track_edge_version(transaction_id, id);
 
         // Update adjacency
         self.forward_adj.add_edge(src, dst, id);
@@ -130,6 +131,8 @@ impl LpgStore {
         } else {
             versions.insert(id, VersionIndex::with_initial(hot_ref));
         }
+        drop(versions);
+        self.track_edge_version(transaction_id, id);
 
         // Update adjacency
         self.forward_adj.add_edge(src, dst, id);
@@ -488,6 +491,7 @@ impl LpgStore {
             // Mark deleted with transaction tracking
             chain.mark_deleted(epoch, transaction_id);
             drop(edges);
+            self.track_edge_version(transaction_id, id);
 
             // Get edge type name for undo log
             let edge_type_name = {
@@ -566,6 +570,7 @@ impl LpgStore {
             // Mark deleted with transaction tracking
             index.mark_deleted(epoch, transaction_id);
             drop(versions);
+            self.track_edge_version(transaction_id, id);
 
             // Get edge type name for undo log
             let edge_type_name = {

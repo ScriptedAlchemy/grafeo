@@ -202,6 +202,12 @@ pub(super) struct LabelRegistry {
     id_to_name: Vec<ArcStr>,
 }
 
+#[derive(Default)]
+pub(super) struct TransactionVersionWrites {
+    pub(super) nodes: FxHashSet<NodeId>,
+    pub(super) edges: FxHashSet<EdgeId>,
+}
+
 impl LabelRegistry {
     fn new() -> Self {
         Self {
@@ -329,6 +335,12 @@ pub struct LpgStore {
     /// Lock order: 2
     #[cfg(not(feature = "tiered-storage"))]
     pub(super) edges: RwLock<FxHashMap<EdgeId, VersionChain<EdgeRecord>>>,
+
+    /// Entity version chains carrying an uncommitted version per transaction.
+    /// Commit and rollback consume this write set instead of scanning every
+    /// chain in the graph.
+    pub(super) pending_version_writes:
+        parking_lot::Mutex<FxHashMap<TransactionId, TransactionVersionWrites>>,
 
     // === Tiered Storage Fields (feature-gated) ===
     //
@@ -498,6 +510,7 @@ impl LpgStore {
             nodes: RwLock::new(FxHashMap::default()),
             #[cfg(not(feature = "tiered-storage"))]
             edges: RwLock::new(FxHashMap::default()),
+            pending_version_writes: parking_lot::Mutex::new(FxHashMap::default()),
             #[cfg(feature = "tiered-storage")]
             arena_allocator: Arc::new(ArenaAllocator::new()?),
             #[cfg(feature = "tiered-storage")]
@@ -624,6 +637,7 @@ impl LpgStore {
         // Nested: Properties and adjacency
         self.node_properties.clear();
         self.edge_properties.clear();
+        self.pending_version_writes.lock().clear();
         self.forward_adj.clear();
         if let Some(ref backward) = self.backward_adj {
             backward.clear();
