@@ -245,6 +245,40 @@ impl super::GrafeoDB {
         Ok(())
     }
 
+    /// Stamps an opaque binding token on an existing vector index.
+    ///
+    /// The engine never interprets the token. It persists beside the
+    /// index in the catalog section, so a process that reopens the file
+    /// can compare what it finds against the identity it expects and
+    /// decide whether the restored topology still describes its rows.
+    ///
+    /// Typical tokens are whatever identity the caller already has: a
+    /// generation digest, a content hash, a snapshot id. Callers that
+    /// mutate the indexed rows are responsible for re-stamping, exactly
+    /// as they would be for any other derived artifact.
+    ///
+    /// Returns `false` when no index exists for the pair.
+    #[cfg(feature = "vector-index")]
+    pub fn set_vector_index_binding(&self, label: &str, property: &str, binding: &str) -> bool {
+        if self.lpg_store().get_vector_index(label, property).is_none() {
+            return false;
+        }
+        self.lpg_store()
+            .set_vector_index_binding(label, property, binding);
+        true
+    }
+
+    /// Reads the binding token stamped on a vector index, if any.
+    ///
+    /// Survives a close and reopen: the token rides the catalog section
+    /// alongside the index definition it describes. A restored index with
+    /// no token was written before the caller started stamping them.
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_binding(&self, label: &str, property: &str) -> Option<String> {
+        self.lpg_store().vector_index_binding(label, property)
+    }
+
     /// Parses a quantization string into a [`QuantizationType`].
     #[cfg(feature = "vector-index")]
     fn parse_quantization(

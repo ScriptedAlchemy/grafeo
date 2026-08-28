@@ -1777,6 +1777,54 @@ impl GrafeoDB {
 
     /// Loads from a section-based `.grafeo` file (v2 format).
     ///
+    /// Rebuilds the store's vector index entries from persisted topology.
+    ///
+    /// Each definition becomes an *empty* `HnswIndex` carrying the config
+    /// the catalog recorded, the `VectorStore` section fills in its
+    /// topology, and only the ones that came back non-empty are published
+    /// to the store. An index that exists but knows about no nodes is
+    /// worse than one that is missing: `has_vector_index` reports `true`,
+    /// searches return nothing, and no caller has a signal to rebuild.
+    #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "vector-index"))]
+    fn restore_vector_indexes(
+        store: &Arc<LpgStore>,
+        definitions: &[catalog_section::RestoredVectorIndex],
+        data: &[u8],
+    ) -> Result<()> {
+        use grafeo_common::storage::Section;
+        use grafeo_core::index::vector::{HnswConfig, HnswIndex, VectorIndexKind};
+
+        let mut restored: Vec<(String, Arc<VectorIndexKind>)> =
+            Vec::with_capacity(definitions.len());
+        for definition in definitions {
+            let config = HnswConfig::new(definition.dimensions, definition.metric)
+                .with_m(definition.m)
+                .with_ef_construction(definition.ef_construction);
+            let index = Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(config)));
+            restored.push((
+                format!("{}:{}", definition.label, definition.property),
+                index,
+            ));
+        }
+
+        let mut section = grafeo_core::index::vector::VectorStoreSection::new(restored.clone());
+        section.deserialize(data)?;
+
+        for (definition, (_, index)) in definitions.iter().zip(restored.iter()) {
+            if index.is_empty() {
+                grafeo_common::grafeo_warn!(
+                    "VectorStore section carried no topology for :{}({}); leaving it unregistered for rebuild",
+                    definition.label,
+                    definition.property
+                );
+                continue;
+            }
+            store.add_vector_index(&definition.label, &definition.property, Arc::clone(index));
+        }
+
+        Ok(())
+    }
+
     /// Reads the section directory, then deserializes each section independently.
     #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
     fn load_from_sections(
@@ -1795,6 +1843,8 @@ impl GrafeoDB {
 
         // Load catalog section first (schema defs needed before data)
         let mut property_indexes: Vec<String> = Vec::new();
+        #[cfg(feature = "vector-index")]
+        let mut vector_indexes: Vec<catalog_section::RestoredVectorIndex> = Vec::new();
         if let Some(entry) = dir.find(SectionType::Catalog) {
             let data = fm.read_section_data(entry)?;
             let tm = Arc::new(crate::transaction::TransactionManager::new());
@@ -1805,6 +1855,10 @@ impl GrafeoDB {
             );
             section.deserialize(&data)?;
             property_indexes = section.restored_property_indexes();
+            #[cfg(feature = "vector-index")]
+            {
+                vector_indexes = section.restored_vector_indexes();
+            }
         }
 
         // Load LPG store (Phase 5e: when the file has a CompactStore section,
@@ -1839,14 +1893,43 @@ impl GrafeoDB {
             section.deserialize(&data)?;
         }
 
-        // Restore HNSW topology (if vector indexes exist in both catalog and section)
+        // Restore HNSW topology.
+        //
+        // The catalog's index definitions have to be re-registered first.
+        // A cold open builds its `LpgStore` from nothing, so
+        // `vector_index_entries()` is empty until something puts entries
+        // back - and this loop used to run against that empty map, find
+        // no index to fill, and drop the persisted topology on the floor.
+        // The result was a vector index that was durable on disk and
+        // absent in memory: every reopen re-indexed the whole corpus, and
+        // vector search was unavailable until it finished.
+        //
+        // Each definition is registered *empty*. Building it the ordinary
+        // way would scan the label and re-link every vector, which is the
+        // rebuild the `VectorStore` section exists to avoid. The vectors
+        // themselves are not needed here: they live in LPG node
+        // properties (already loaded above) and are read through a
+        // `VectorAccessor` at query time, so topology plus properties is
+        // the whole index.
         #[cfg(feature = "vector-index")]
-        if let Some(entry) = dir.find(SectionType::VectorStore) {
-            let data = fm.read_section_data(entry)?;
-            let indexes = store.vector_index_entries();
-            if !indexes.is_empty() {
-                let mut section = grafeo_core::index::vector::VectorStoreSection::new(indexes);
-                section.deserialize(&data)?;
+        if !vector_indexes.is_empty() {
+            match dir.find(SectionType::VectorStore) {
+                Some(entry) => {
+                    let data = fm.read_section_data(entry)?;
+                    Self::restore_vector_indexes(store, &vector_indexes, &data)?;
+                }
+                None => {
+                    // Definitions without a topology section. Registering
+                    // them anyway would be the worst outcome available:
+                    // `has_vector_index` would answer `true` and every
+                    // search would return nothing, reporting an index
+                    // that indexes no rows. Leave them absent so the
+                    // caller can see the gap and rebuild.
+                    grafeo_common::grafeo_warn!(
+                        "Catalog lists {} vector index(es) but the file carries no VectorStore section; they will need rebuilding",
+                        vector_indexes.len()
+                    );
+                }
             }
         }
 

@@ -175,7 +175,44 @@ impl LpgStore {
     #[cfg(feature = "vector-index")]
     pub fn remove_vector_index(&self, label: &str, property: &str) -> bool {
         let key = format!("{label}:{property}");
+        self.vector_index_bindings.write().remove(&key);
         self.vector_indexes.write().remove(&key).is_some()
+    }
+
+    /// Stamps an opaque binding token on a vector index.
+    ///
+    /// The store never interprets the token; it persists it beside the
+    /// index in the catalog section so that a caller reopening the file
+    /// can tell a restored topology that still matches its data from one
+    /// that has drifted. Overwrites any previous token for the pair.
+    #[cfg(feature = "vector-index")]
+    pub fn set_vector_index_binding(&self, label: &str, property: &str, binding: &str) {
+        let key = format!("{label}:{property}");
+        self.vector_index_bindings
+            .write()
+            .insert(key, binding.to_string());
+    }
+
+    /// Reads back the binding token stamped on a vector index, if any.
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_binding(&self, label: &str, property: &str) -> Option<String> {
+        let key = format!("{label}:{property}");
+        self.vector_index_bindings.read().get(&key).cloned()
+    }
+
+    /// Returns every binding token as `(key, token)` pairs.
+    ///
+    /// Keys are in `"label:property"` format, matching
+    /// [`vector_index_entries`](Self::vector_index_entries).
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_binding_entries(&self) -> Vec<(String, String)> {
+        self.vector_index_bindings
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Returns all vector index entries as `(key, index)` pairs.
