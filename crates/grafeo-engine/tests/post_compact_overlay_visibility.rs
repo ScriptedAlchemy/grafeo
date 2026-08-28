@@ -153,3 +153,30 @@ fn a_promoted_edge_stays_deleted() {
 
     assert_eq!(int_scalar(&db, "MATCH ()-[r]->() RETURN count(r)"), 0);
 }
+
+/// The node counterpart of `a_promoted_edge_stays_deleted`: writing a
+/// property promotes a base node into the overlay, and deleting it
+/// afterwards must not leave the base copy visible in `node_ids`.
+#[test]
+fn a_promoted_node_stays_deleted() {
+    let mut db = GrafeoDB::new_in_memory();
+    db.create_node(&["P"]);
+    db.create_node(&["P"]);
+    db.compact().expect("compact");
+
+    let s = db.session();
+    s.execute("MATCH (n:P) WHERE id(n) = 0 SET n.tag = 1")
+        .unwrap();
+    s.execute("MATCH (n:P) WHERE id(n) = 0 DELETE n").unwrap();
+    drop(s);
+
+    assert_eq!(int_scalar(&db, "MATCH (n:P) RETURN count(n)"), 1);
+    let store = db.graph_store();
+    assert_eq!(
+        store.node_ids().len(),
+        1,
+        "the promoted node's base copy is still listed: {:?}",
+        store.node_ids()
+    );
+    assert_eq!(store.node_count(), 1);
+}
