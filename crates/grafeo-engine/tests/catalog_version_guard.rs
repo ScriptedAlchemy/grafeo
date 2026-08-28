@@ -62,8 +62,8 @@ fn store_with_foreign_catalog_version_fails_typed_not_crc() {
     // format version.
     let source = write_current_store(&dir, "source.grafeo");
     let (_, _, mut payload) = read_catalog_section(&source);
-    assert_eq!(payload[0], 1, "current revision writes catalog version 1");
-    payload[0] = 2;
+    assert_eq!(payload[0], 2, "current revision writes catalog version 2");
+    payload[0] = 3;
 
     let victim = dir.path().join("foreign_version.grafeo");
     {
@@ -80,7 +80,7 @@ fn store_with_foreign_catalog_version_fails_typed_not_crc() {
     };
     let msg = err.to_string();
     assert!(
-        msg.contains("unsupported catalog version 2 (supported 1)"),
+        msg.contains("unsupported catalog version 3 (supported 1, 2)"),
         "error must name found and supported versions, got: {msg}"
     );
     assert!(

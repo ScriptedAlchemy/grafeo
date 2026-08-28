@@ -429,6 +429,21 @@ pub struct LpgStore {
     #[cfg(feature = "vector-index")]
     pub(super) vector_indexes: RwLock<FxHashMap<String, Arc<VectorIndexKind>>>,
 
+    /// Caller-supplied binding tokens: "label:property" -> opaque token.
+    ///
+    /// A vector index is only as trustworthy as the data it was built over,
+    /// and the store cannot know what "the same data" means to its embedder.
+    /// So the caller stamps whatever identity it already has - a generation
+    /// digest, a content hash, a snapshot id - and reads it back after a
+    /// reopen to decide whether the restored topology still describes the
+    /// rows. The store treats the token as opaque and never interprets it.
+    ///
+    /// Rides the catalog section, so it is written and restored atomically
+    /// with the index it describes.
+    /// Lock order: 7 (same level as vector_indexes, disjoint map)
+    #[cfg(feature = "vector-index")]
+    pub(super) vector_index_bindings: RwLock<FxHashMap<String, String>>,
+
     /// Text indexes: "label:property" -> inverted index with BM25 scoring.
     ///
     /// Created via [`GrafeoDB::create_text_index`](grafeo_engine::GrafeoDB::create_text_index).
@@ -531,6 +546,8 @@ impl LpgStore {
             property_indexes: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "vector-index")]
             vector_indexes: RwLock::new(FxHashMap::default()),
+            #[cfg(feature = "vector-index")]
+            vector_index_bindings: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "text-index")]
             text_indexes: RwLock::new(FxHashMap::default()),
             next_node_id: AtomicU64::new(0),
@@ -649,6 +666,8 @@ impl LpgStore {
         self.property_indexes.write().clear();
         #[cfg(feature = "vector-index")]
         self.vector_indexes.write().clear();
+        #[cfg(feature = "vector-index")]
+        self.vector_index_bindings.write().clear();
         #[cfg(feature = "text-index")]
         self.text_indexes.write().clear();
 
