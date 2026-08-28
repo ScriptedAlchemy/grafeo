@@ -119,16 +119,37 @@ impl LpgStore {
     pub(super) fn update_property_index_on_remove(&self, node_id: NodeId, key: &PropertyKey) {
         let indexes = self.property_indexes.read();
         if let Some(index) = indexes.get(key) {
-            // Get old value to remove from index
-            if let Some(old_value) = self.node_properties.get(node_id, key) {
-                let old_hv = HashableValue::new(old_value);
-                if let Some(mut nodes) = index.get_mut(&old_hv) {
-                    nodes.remove(&node_id);
-                    if nodes.is_empty() {
-                        drop(nodes);
-                        index.remove(&old_hv);
-                    }
-                }
+            Self::unindex(index, node_id, self.node_properties.get(node_id, key));
+        }
+    }
+
+    /// Removes a node from every property index it appears in.
+    ///
+    /// Called on the delete paths, before the node's properties are torn
+    /// down: without it a deleted node stays in the index and
+    /// [`find_nodes_by_property`](Self::find_nodes_by_property) keeps
+    /// handing out its id, which callers then have to re-validate.
+    pub(super) fn remove_node_from_property_indexes(&self, node_id: NodeId) {
+        let indexes = self.property_indexes.read();
+        for (key, index) in indexes.iter() {
+            Self::unindex(index, node_id, self.node_properties.get(node_id, key));
+        }
+    }
+
+    /// Drops `node_id` from `index` under `value`, and drops the bucket
+    /// once it is empty.
+    fn unindex(
+        index: &DashMap<HashableValue, FxHashSet<NodeId>>,
+        node_id: NodeId,
+        value: Option<Value>,
+    ) {
+        let Some(value) = value else { return };
+        let hv = HashableValue::new(value);
+        if let Some(mut nodes) = index.get_mut(&hv) {
+            nodes.remove(&node_id);
+            if nodes.is_empty() {
+                drop(nodes);
+                index.remove(&hv);
             }
         }
     }

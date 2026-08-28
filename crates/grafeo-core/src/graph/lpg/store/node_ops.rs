@@ -562,9 +562,11 @@ impl LpgStore {
                 }
             }
 
-            // Remove from text indexes before removing properties
+            // Remove from text and property indexes before removing
+            // properties: both read the node's current values.
             #[cfg(feature = "text-index")]
             self.remove_from_all_text_indexes(id);
+            self.remove_node_from_property_indexes(id);
 
             // Remove properties
             drop(nodes); // Release lock before removing properties
@@ -620,9 +622,11 @@ impl LpgStore {
                 }
             }
 
-            // Remove from text indexes before removing properties
+            // Remove from text and property indexes before removing
+            // properties: both read the node's current values.
             #[cfg(feature = "text-index")]
             self.remove_from_all_text_indexes(id);
+            self.remove_node_from_property_indexes(id);
 
             // Remove properties
             drop(versions);
@@ -719,9 +723,11 @@ impl LpgStore {
             drop(index);
             drop(node_labels_w);
 
-            // Remove from text indexes
+            // Remove from text and property indexes before removing
+            // properties: both read the node's current values.
             #[cfg(feature = "text-index")]
             self.remove_from_all_text_indexes(id);
+            self.remove_node_from_property_indexes(id);
 
             // Remove properties (will be restored on rollback)
             #[cfg(not(feature = "temporal"))]
@@ -825,9 +831,11 @@ impl LpgStore {
             drop(label_index);
             drop(node_labels_w);
 
-            // Remove from text indexes
+            // Remove from text and property indexes before removing
+            // properties: both read the node's current values.
             #[cfg(feature = "text-index")]
             self.remove_from_all_text_indexes(id);
+            self.remove_node_from_property_indexes(id);
 
             // Remove properties
             #[cfg(not(feature = "temporal"))]

@@ -1024,6 +1024,59 @@ fn test_property_index_maintained_on_remove() {
 }
 
 #[test]
+fn test_property_index_maintained_on_node_delete() {
+    let store = LpgStore::new().unwrap();
+
+    store.create_property_index("email");
+
+    let alix = store.create_node(&["Person"]);
+    let gus = store.create_node(&["Person"]);
+    store.set_node_property(alix, "email", Value::from("alix@example.com"));
+    store.set_node_property(gus, "email", Value::from("gus@example.com"));
+
+    assert!(store.delete_node(alix));
+
+    // The index must not keep handing out a deleted node's id.
+    let found = store.find_nodes_by_property("email", &Value::from("alix@example.com"));
+    assert!(
+        found.is_empty(),
+        "deleted node still reachable through the property index: {found:?}"
+    );
+
+    // The surviving node is untouched.
+    let found = store.find_nodes_by_property("email", &Value::from("gus@example.com"));
+    assert_eq!(found, vec![gus]);
+}
+
+#[test]
+fn test_property_index_restored_on_rolled_back_node_delete() {
+    let store = LpgStore::new().unwrap();
+
+    store.create_property_index("email");
+
+    let alix = store.create_node(&["Person"]);
+    store.set_node_property(alix, "email", Value::from("alix@example.com"));
+
+    let tx = TransactionId::new(7);
+    let epoch = store.new_epoch();
+    assert!(store.delete_node_transactional(alix, epoch, tx));
+    assert!(
+        store
+            .find_nodes_by_property("email", &Value::from("alix@example.com"))
+            .is_empty()
+    );
+
+    store.rollback_transaction_properties(tx);
+
+    let found = store.find_nodes_by_property("email", &Value::from("alix@example.com"));
+    assert_eq!(
+        found,
+        vec![alix],
+        "rolling the delete back must put the node back in the index"
+    );
+}
+
+#[test]
 fn test_property_index_drop() {
     let store = LpgStore::new().unwrap();
 
