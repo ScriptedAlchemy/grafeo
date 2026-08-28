@@ -1011,6 +1011,18 @@ impl GrafeoDB {
         let compact = from_graph_store_preserving_ids(current_store.as_ref())
             .map_err(|e| Error::Internal(e.to_string()))?;
 
+        // Carry the property indexes across: rows that move into the
+        // columnar base would otherwise fall back to a column scan for
+        // every lookup the LpgStore was answering in O(1).
+        if let Some(ref store) = self.store {
+            compact.enable_property_indexes(
+                store
+                    .property_index_keys()
+                    .into_iter()
+                    .map(|k| grafeo_common::types::PropertyKey::new(&k)),
+            );
+        }
+
         let layered = Arc::new(
             LayeredStore::new(compact, max_node_id, max_edge_id)
                 .map_err(|e| Error::Internal(e.to_string()))?,
@@ -1028,6 +1040,12 @@ impl GrafeoDB {
             layered
                 .overlay_store()
                 .install_named_graphs(old.take_named_graphs());
+            // The overlay is a fresh `LpgStore`; without this the property
+            // indexes disappear at compaction time and never come back,
+            // in memory or in the catalog section written at close.
+            for key in old.property_index_keys() {
+                layered.overlay_store().create_property_index(&key);
+            }
         }
 
         self.external_read_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreSearch>);
@@ -1098,6 +1116,16 @@ impl GrafeoDB {
         let fresh_compact = from_graph_store_preserving_ids(combined.as_ref())
             .map_err(|e| Error::Internal(e.to_string()))?;
 
+        // See `compact`: the merged base has to keep answering indexed
+        // lookups without a scan.
+        fresh_compact.enable_property_indexes(
+            layered
+                .overlay_store()
+                .property_index_keys()
+                .into_iter()
+                .map(|k| grafeo_common::types::PropertyKey::new(&k)),
+        );
+
         let new_layered = Arc::new(
             LayeredStore::new(fresh_compact, max_node_id, max_edge_id)
                 .map_err(|e| Error::Internal(e.to_string()))?,
@@ -1111,6 +1139,10 @@ impl GrafeoDB {
         new_layered
             .overlay_store()
             .install_named_graphs(layered.overlay_store().take_named_graphs());
+        // See `compact`: the fresh overlay starts with no indexes.
+        for key in layered.overlay_store().property_index_keys() {
+            new_layered.overlay_store().create_property_index(&key);
+        }
 
         self.external_read_store = Some(Arc::clone(&new_layered) as Arc<dyn GraphStoreSearch>);
         self.external_write_store = Some(Arc::clone(&new_layered) as Arc<dyn GraphStoreMut>);
@@ -1557,6 +1589,15 @@ impl GrafeoDB {
             )));
         }
 
+        // The hash indexes are derived state and never serialized, so
+        // rebuild them from the index names the overlay restored.
+        compact_base.enable_property_indexes(
+            overlay_store
+                .property_index_keys()
+                .into_iter()
+                .map(|k| grafeo_common::types::PropertyKey::new(&k)),
+        );
+
         // Adopt the loaded base + the loaded overlay; `with_overlay`
         // raises the overlay's id allocator above the base's high-water
         // mark, which deserialization alone cannot recover for a fully
@@ -1753,6 +1794,7 @@ impl GrafeoDB {
         })?;
 
         // Load catalog section first (schema defs needed before data)
+        let mut property_indexes: Vec<String> = Vec::new();
         if let Some(entry) = dir.find(SectionType::Catalog) {
             let data = fm.read_section_data(entry)?;
             let tm = Arc::new(crate::transaction::TransactionManager::new());
@@ -1762,6 +1804,7 @@ impl GrafeoDB {
                 move || tm.current_epoch().as_u64(),
             );
             section.deserialize(&data)?;
+            property_indexes = section.restored_property_indexes();
         }
 
         // Load LPG store (Phase 5e: when the file has a CompactStore section,
@@ -1771,6 +1814,13 @@ impl GrafeoDB {
             let data = fm.read_section_data(entry)?;
             let mut section = grafeo_core::graph::lpg::LpgStoreSection::new(Arc::clone(store));
             section.deserialize(&data)?;
+        }
+
+        // Rebuild the property indexes the catalog listed. Deferred to
+        // here because creating one scans the rows it covers, which only
+        // exist after the LPG section above.
+        for name in &property_indexes {
+            store.create_property_index(name);
         }
 
         // Load RDF store
@@ -2858,6 +2908,20 @@ impl GrafeoDB {
             let overlay = layered.overlay_store();
             let overlay_section = grafeo_core::graph::lpg::LpgStoreSection::new(overlay);
             sections.push(Box::new(overlay_section));
+
+            // Catalog. A compacted database used to omit this entirely, so
+            // closing one dropped every schema definition and index name it
+            // held - including the property indexes the base rebuilds from
+            // on the next open.
+            let catalog = catalog_section::CatalogSection::new(
+                Arc::clone(&self.catalog),
+                layered.overlay_store(),
+                {
+                    let tm = Arc::clone(&self.transaction_manager);
+                    move || tm.current_epoch().as_u64()
+                },
+            );
+            sections.push(Box::new(catalog));
 
             // Overlay deletion log: persists base-node/edge tombstones
             // that have not yet been merged into the base. Without this,

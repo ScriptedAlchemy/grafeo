@@ -770,11 +770,12 @@ impl GraphStore for LayeredStore {
     }
 
     fn has_property_index(&self, property: &str) -> bool {
-        // Property indexes only live on the overlay LpgStore (the columnar
-        // base has no index store). Without this delegate the trait default
-        // returns false, and the planner's property-index fast path silently
-        // disables itself after `compact()`.
+        // Without this delegate the trait default returns false, and the
+        // planner's property-index fast path silently disables itself
+        // after `compact()`. Either layer having one is enough: reads
+        // consult both.
         self.overlay.load().has_property_index(property)
+            || self.base.load().has_property_index(property)
     }
 
     fn find_nodes_by_property(&self, property: &str, value: &Value) -> Vec<NodeId> {

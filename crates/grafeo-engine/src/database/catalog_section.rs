@@ -74,6 +74,12 @@ pub struct CatalogSection {
     store: Arc<grafeo_core::graph::lpg::LpgStore>,
     epoch_fn: Box<dyn Fn() -> u64 + Send + Sync>,
     dirty: AtomicBool,
+    /// Property index names read back by [`deserialize`](Self::deserialize).
+    ///
+    /// Creating an index scans the rows it covers, so the loader cannot
+    /// act on these until the data sections are in - see
+    /// [`restored_property_indexes`](Self::restored_property_indexes).
+    restored_property_indexes: parking_lot::Mutex<Vec<String>>,
 }
 
 impl CatalogSection {
@@ -91,7 +97,17 @@ impl CatalogSection {
             store,
             epoch_fn: Box::new(epoch_fn),
             dirty: AtomicBool::new(false),
+            restored_property_indexes: parking_lot::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Property index names this section carried, once deserialized.
+    ///
+    /// The loader replays them after the LPG section lands: without that
+    /// every property index is silently lost across a reopen, and lookups
+    /// that were O(1) fall back to a full scan.
+    pub fn restored_property_indexes(&self) -> Vec<String> {
+        self.restored_property_indexes.lock().clone()
     }
 
     /// Mark this section as dirty.
@@ -210,9 +226,11 @@ impl Section for CatalogSection {
             let _ = self.catalog.bind_graph_type(graph_name, type_name.clone());
         }
 
-        // Index metadata is stored for reference. Actual index rebuilding
-        // happens in the engine after all data sections are loaded.
-        // The engine reads the catalog's index defs and calls create_*_index.
+        // Index rebuilding scans the rows, so it has to wait until the
+        // data sections are loaded. Hand the names to the loader instead.
+        self.restored_property_indexes
+            .lock()
+            .clone_from(&snapshot.indexes.property_indexes);
 
         Ok(())
     }

@@ -34,6 +34,17 @@ impl super::GrafeoDB {
     /// ```
     pub fn create_property_index(&self, property: &str) {
         self.lpg_store().create_property_index(property);
+        // After a compaction most rows live in the columnar base, which
+        // keeps its own hash index; without this the "indexed" lookup
+        // would still scan every base column.
+        #[cfg(feature = "compact-store")]
+        if let Some(ref layered) = self.layered_store {
+            layered
+                .base_store_arc()
+                .enable_property_indexes(std::iter::once(grafeo_common::types::PropertyKey::new(
+                    property,
+                )));
+        }
     }
 
     /// Drops an index on a node property.
