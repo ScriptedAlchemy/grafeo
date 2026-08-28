@@ -197,6 +197,15 @@ pub struct GrafeoDB {
     /// `layered_store` via `swap_base()`.
     #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
     compact_tiered: Option<Arc<compact_tiered::CompactStoreTiered>>,
+    /// Owns the container mapping the compact base reads through, when
+    /// the open path took the zero-copy route.
+    ///
+    /// `Some` means the base's column codecs are slices of a live
+    /// `mmap` over this database's own file, so the mapping must outlive
+    /// them and must be released before the container is rewritten. See
+    /// [`detach_compact_base_from_mmap`](Self::detach_compact_base_from_mmap).
+    #[cfg(all(feature = "grafeo-file", feature = "compact-store", feature = "lpg"))]
+    compact_base_mmap: parking_lot::Mutex<Option<bytes::Bytes>>,
 }
 
 impl GrafeoDB {
@@ -391,9 +400,13 @@ impl GrafeoDB {
         // compacted database. The post-construction wiring uses this to
         // rebuild the LayeredStore + tier wrapper + overlay consumer.
         #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
-        let mut loaded_compact_base: Option<
+        // `Some((base, mapping))`: `mapping` is the container mmap the
+        // base reads through, or `None` when the base was copied to the
+        // heap (encrypted container, or the mapping could not be taken).
+        let mut loaded_compact_base: Option<(
             Arc<grafeo_core::graph::compact::CompactStore>,
-        > = None;
+            Option<bytes::Bytes>,
+        )> = None;
 
         // Phase 5e: snapshot of the OverlayDeletions section (if present),
         // applied after the LayeredStore is wired so that previously-deleted
@@ -671,6 +684,8 @@ impl GrafeoDB {
             layered_store: None,
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             compact_tiered: None,
+            #[cfg(all(feature = "grafeo-file", feature = "compact-store", feature = "lpg"))]
+            compact_base_mmap: parking_lot::Mutex::new(None),
         };
 
         // Register storage sections as memory consumers for pressure tracking
@@ -682,7 +697,10 @@ impl GrafeoDB {
         // engine sees the full picture and the read/write paths route
         // through the layered store.
         #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
-        if let Some(compact_base) = loaded_compact_base {
+        if let Some((compact_base, mapping)) = loaded_compact_base {
+            // Retain the mapping (if any) before anything can reach the
+            // base: dropping it would unmap the bytes the base reads.
+            *db.compact_base_mmap.lock() = mapping;
             db.wire_layered_after_load(compact_base, loaded_overlay_deletions)?;
         }
 
@@ -691,6 +709,13 @@ impl GrafeoDB {
         if let (Some(interval), Some(fm)) = (checkpoint_interval, &db.file_manager)
             && !is_read_only
         {
+            // The timer rewrites the container from a background thread
+            // with no `&self` to route through the detach. Give up the
+            // mapping up front rather than let a periodic checkpoint
+            // rewrite the bytes the base is reading.
+            #[cfg(feature = "compact-store")]
+            db.detach_compact_base_from_mmap()?;
+
             *db.checkpoint_timer.lock() = Some(checkpoint_timer::CheckpointTimer::start(
                 interval,
                 Arc::clone(fm),
@@ -819,6 +844,8 @@ impl GrafeoDB {
             layered_store: None,
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             compact_tiered: None,
+            #[cfg(all(feature = "grafeo-file", feature = "compact-store", feature = "lpg"))]
+            compact_base_mmap: parking_lot::Mutex::new(None),
         })
     }
 
@@ -912,6 +939,8 @@ impl GrafeoDB {
             layered_store: None,
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             compact_tiered: None,
+            #[cfg(all(feature = "grafeo-file", feature = "compact-store", feature = "lpg"))]
+            compact_base_mmap: parking_lot::Mutex::new(None),
         })
     }
 
@@ -1530,10 +1559,22 @@ impl GrafeoDB {
     /// section file, if present. Used by the open path to reconstruct
     /// the LayeredStore wiring after a previously-compacted database
     /// reopens.
+    ///
+    /// Returns the base plus, when the zero-copy path was taken, the
+    /// `Bytes` that owns the mapping the base's column codecs point
+    /// into. The caller must keep that `Bytes` alive for as long as the
+    /// base serves reads, and must call
+    /// [`detach_compact_base_from_mmap`](Self::detach_compact_base_from_mmap)
+    /// before any write to the container.
     #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
     fn extract_compact_base(
         fm: &GrafeoFileManager,
-    ) -> Result<Option<Arc<grafeo_core::graph::compact::CompactStore>>> {
+    ) -> Result<
+        Option<(
+            Arc<grafeo_core::graph::compact::CompactStore>,
+            Option<bytes::Bytes>,
+        )>,
+    > {
         use grafeo_common::storage::{Section, SectionType};
         let Some(dir) = fm.read_section_directory()? else {
             return Ok(None);
@@ -1541,10 +1582,81 @@ impl GrafeoDB {
         let Some(entry) = dir.find(SectionType::CompactStore) else {
             return Ok(None);
         };
+
+        // Zero-copy path. `SectionType::CompactStore` is declared
+        // `mmap_able`, and `CompactStoreSection::deserialize_from_bytes`
+        // re-bases every column codec onto slices of the supplied
+        // `Bytes` instead of copying — so mapping the section and
+        // handing the mapping over means the store is built without a
+        // heap copy of the file at all.
+        //
+        // Two reasons to fall back to `read_section_data`:
+        //
+        // * encryption — `mmap_section` exposes ciphertext and does not
+        //   decrypt, whereas `read_section_data` does;
+        // * a mapping failure — a short file, an unmappable region, or a
+        //   CRC mismatch surfaced by `mmap_section`. Only the first two
+        //   are worth retrying through the read path, but retrying all
+        //   of them keeps the open behaviour identical to before this
+        //   optimisation: `read_section_data` re-checks the same CRC and
+        //   reports the same error if the section really is corrupt.
+        if compact_base_mmap_enabled()
+            && !fm.section_encryption_enabled()
+            && let Ok(mapping) = fm.mmap_section(entry)
+        {
+            let bytes = bytes::Bytes::from_owner(mapping);
+            let mut section = grafeo_core::graph::compact::section::CompactStoreSection::empty();
+            section.deserialize_from_bytes(bytes.clone())?;
+            return Ok(section.store().map(|store| (store, Some(bytes))));
+        }
+
         let data = fm.read_section_data(entry)?;
         let mut section = grafeo_core::graph::compact::section::CompactStoreSection::empty();
         section.deserialize(&data)?;
-        Ok(section.store())
+        Ok(section.store().map(|store| (store, None)))
+    }
+
+    /// Rebuilds the compact base on the heap and releases the container
+    /// mapping it was reading from.
+    ///
+    /// Writing the container relocates and rewrites section payloads, and
+    /// `mmap_section` maps shared, so a live mapping would start serving
+    /// the *new* bytes at the old offsets mid-query. Every container write
+    /// therefore goes through here first.
+    ///
+    /// The cost is one copy of the section plus a pointer re-base — that
+    /// is, exactly what the pre-mmap open path paid eagerly on every open,
+    /// now paid lazily and only when the process actually writes.
+    ///
+    /// No-op when the base is already heap-backed.
+    #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+    fn detach_compact_base_from_mmap(&self) -> Result<()> {
+        let mut guard = self.compact_base_mmap.lock();
+        let Some(mapped) = guard.take() else {
+            return Ok(());
+        };
+
+        let Some(ref layered) = self.layered_store else {
+            // No layered store to re-point: dropping the mapping is
+            // enough, nothing is reading through it.
+            return Ok(());
+        };
+
+        let mut section = grafeo_core::graph::compact::section::CompactStoreSection::empty();
+        section.deserialize_from_bytes(bytes::Bytes::copy_from_slice(&mapped))?;
+        let heap_base = section.store().ok_or_else(|| {
+            Error::Internal("empty CompactStoreSection while detaching from mmap".to_string())
+        })?;
+
+        layered.swap_base(Arc::clone(&heap_base));
+        #[cfg(feature = "mmap")]
+        if let Some(ref tiered) = self.compact_tiered {
+            tiered.rebase_in_memory(heap_base);
+        }
+
+        // `mapped` drops here, unmapping the container section.
+        drop(mapped);
+        Ok(())
     }
 
     /// Reads the persisted overlay deletion log from the container, if
@@ -2232,6 +2344,19 @@ impl GrafeoDB {
         self.compact_tiered.as_ref()
     }
 
+    /// Whether the compact base is currently reading through a mapping
+    /// of the container rather than a heap copy.
+    ///
+    /// `true` right after an open that took the zero-copy path, and
+    /// `false` again once the first container write has forced a detach.
+    /// Exposed for introspection and for tests that need to confirm which
+    /// open path ran.
+    #[cfg(all(feature = "grafeo-file", feature = "compact-store", feature = "lpg"))]
+    #[must_use]
+    pub fn compact_base_is_mmap_backed(&self) -> bool {
+        self.compact_base_mmap.lock().is_some()
+    }
+
     /// Returns the query cache.
     #[must_use]
     pub fn query_cache(&self) -> &Arc<QueryCache> {
@@ -2904,6 +3029,12 @@ impl GrafeoDB {
         fm: &GrafeoFileManager,
         reason: flush::FlushReason,
     ) -> Result<flush::FlushResult> {
+        // Any write relocates and rewrites section payloads, which would
+        // pull the rug out from under a compact base that is still
+        // reading through a mapping of this same file.
+        #[cfg(all(feature = "lpg", feature = "compact-store"))]
+        self.detach_compact_base_from_mmap()?;
+
         let sections = self.build_sections();
         let section_refs: Vec<&dyn grafeo_common::storage::Section> =
             sections.iter().map(|s| s.as_ref()).collect();
@@ -2939,6 +3070,24 @@ impl GrafeoDB {
     /// the on-disk container as current and must checkpoint.
     pub(crate) fn mark_container_stale(&self) {
         self.container_stale.store(true, Ordering::Release);
+    }
+}
+
+/// Whether the compact base may be served straight from a mapping of
+/// the container.
+///
+/// On by default. `GRAFEO_COMPACT_BASE_MMAP=0` (or `false`/`off`) forces
+/// the heap-copy open path — an operational escape hatch on filesystems
+/// where mapping the database file is undesirable, and the knob the
+/// resident-set probe uses to measure the two paths against each other.
+#[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+fn compact_base_mmap_enabled() -> bool {
+    match std::env::var("GRAFEO_COMPACT_BASE_MMAP") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
     }
 }
 
