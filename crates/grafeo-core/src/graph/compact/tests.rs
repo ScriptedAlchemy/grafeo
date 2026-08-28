@@ -1824,3 +1824,103 @@ fn test_raw_i64_inline_and_mapped_find_eq_match() {
     assert_eq!(inline.find_eq(&target), mapped.find_eq(&target));
     assert!(!inline.find_eq(&target).is_empty());
 }
+
+// ── Bytes round-trip through the Dict codec ─────────────────────────
+
+#[test]
+fn test_preserving_ids_bytes_property_round_trips() {
+    use crate::graph::compact::from_graph_store_preserving_ids;
+    use crate::graph::lpg::LpgStore;
+    use std::sync::Arc;
+
+    let store = LpgStore::new().unwrap();
+    let payload: Vec<u8> = (0u8..=255).collect();
+    let a = store.create_node(&["Record"]);
+    store.set_node_property(
+        a,
+        "blob",
+        Value::Bytes(Arc::from(payload.clone().into_boxed_slice())),
+    );
+    let b = store.create_node(&["Record"]);
+    store.set_node_property(b, "blob", Value::Bytes(Arc::from(b"other".as_slice())));
+
+    let compact = from_graph_store_preserving_ids(&store).unwrap();
+
+    let node = compact.get_node(a).expect("node a resolves");
+    assert_eq!(
+        node.properties.get(&PropertyKey::new("blob")),
+        Some(&Value::Bytes(Arc::from(payload.clone().into_boxed_slice()))),
+        "a Bytes property must come back as the exact bytes, not a string"
+    );
+
+    // Column-scan equality on the Bytes value.
+    let matches = compact.find_nodes_by_property(
+        "blob",
+        &Value::Bytes(Arc::from(payload.clone().into_boxed_slice())),
+    );
+    assert_eq!(matches, vec![a]);
+
+    // Hash-indexed equality on the Bytes value.
+    compact.enable_property_indexes(std::iter::once(PropertyKey::new("blob")));
+    let matches = compact.find_nodes_by_property(
+        "blob",
+        &Value::Bytes(Arc::from(payload.into_boxed_slice())),
+    );
+    assert_eq!(matches, vec![a]);
+}
+
+#[test]
+fn test_preserving_ids_marker_prefixed_string_round_trips() {
+    use crate::graph::compact::from_graph_store_preserving_ids;
+    use crate::graph::lpg::LpgStore;
+
+    let store = LpgStore::new().unwrap();
+    // A string that begins with the internal marker prefix must survive the
+    // escape rather than decode as bytes or lose its prefix.
+    let tricky = "\u{0}gfo1:b:00ff";
+    let a = store.create_node(&["Record"]);
+    store.set_node_property(a, "name", Value::from(tricky));
+
+    let compact = from_graph_store_preserving_ids(&store).unwrap();
+    let node = compact.get_node(a).expect("node resolves");
+    assert_eq!(
+        node.properties.get(&PropertyKey::new("name")),
+        Some(&Value::from(tricky))
+    );
+    assert_eq!(
+        compact.find_nodes_by_property("name", &Value::from(tricky)),
+        vec![a]
+    );
+}
+
+#[test]
+fn test_bytes_property_survives_section_round_trip() {
+    use crate::graph::compact::from_graph_store_preserving_ids;
+    use crate::graph::compact::section::CompactStoreSection;
+    use crate::graph::lpg::LpgStore;
+    use crate::storage::Section;
+    use std::sync::Arc;
+
+    let store = LpgStore::new().unwrap();
+    let payload = b"serialized-record-payload\x00\xff\x80".to_vec();
+    let a = store.create_node(&["Record"]);
+    store.set_node_property(
+        a,
+        "blob",
+        Value::Bytes(Arc::from(payload.clone().into_boxed_slice())),
+    );
+
+    let section = CompactStoreSection::new(Arc::new(
+        from_graph_store_preserving_ids(&store).unwrap(),
+    ));
+    let bytes = section.serialize().expect("serialize");
+    let mut restored = CompactStoreSection::empty();
+    restored.deserialize(&bytes).expect("deserialize");
+    let restored_store = restored.store().expect("restored store");
+    let node = restored_store.get_node(a).expect("node resolves after reopen");
+    assert_eq!(
+        node.properties.get(&PropertyKey::new("blob")),
+        Some(&Value::Bytes(Arc::from(payload.into_boxed_slice()))),
+        "a persisted Bytes property must survive the section round trip"
+    );
+}

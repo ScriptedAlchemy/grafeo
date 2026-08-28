@@ -367,7 +367,8 @@ impl ColumnCodec {
     /// Decodes the value at `index` into a [`Value`].
     ///
     /// - [`BitPacked`](Self::BitPacked) → `Value::Int64(v as i64)`
-    /// - [`Dict`](Self::Dict) → `Value::String(ArcStr::from(s))`
+    /// - [`Dict`](Self::Dict) → the decoded entry (`Value::String`, or
+    ///   `Value::Bytes` for marked byte payloads; see `dict_value`)
     /// - [`Bitmap`](Self::Bitmap) → `Value::Bool(b)`
     /// - [`Int8Vector`](Self::Int8Vector) → `Value::List(...)` of `Int64` values
     /// - [`Float64`](Self::Float64) → `Value::Float64(f)`
@@ -386,7 +387,9 @@ impl ColumnCodec {
                 let val = Value::Int64(v as i64);
                 val
             }),
-            Self::Dict(dict) => dict.get(index).map(|s| Value::String(ArcStr::from(s))),
+            Self::Dict(dict) => dict
+                .get(index)
+                .map(super::dict_value::decode_dict_entry),
             Self::Bitmap(bv) => bv.get(index).map(Value::Bool),
             Self::Int8Vector { bytes, dimensions } => {
                 let dims = *dimensions as usize;
@@ -571,10 +574,15 @@ impl ColumnCodec {
                 // as real instruction cost (Tasks 1-8 follow-up).
                 bp.scan_eq(target_u64)
             }
-            (Self::Dict(dict), Value::String(s)) => match dict.encode(s.as_str()) {
-                Some(code) => dict.filter_by_code(|c| c == code),
-                None => Vec::new(),
-            },
+            // String and Bytes targets resolve through the same entry
+            // encoding the builder used, so marked entries (Bytes payloads,
+            // escaped strings) are found by their exact dictionary code.
+            (Self::Dict(dict), Value::String(_) | Value::Bytes(_)) => {
+                match dict.encode(&super::dict_value::encode_dict_entry(target)) {
+                    Some(code) => dict.filter_by_code(|c| c == code),
+                    None => Vec::new(),
+                }
+            }
             (Self::Bitmap(bv), &Value::Bool(target_bool)) => (0..bv.len())
                 .filter(|&i| bv.get(i) == Some(target_bool))
                 .collect(),

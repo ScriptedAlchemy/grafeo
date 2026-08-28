@@ -14,6 +14,7 @@ pub mod csr;
 /// Container section serialization for the layered overlay deletion log.
 #[cfg(feature = "lpg")]
 pub mod deletions_section;
+pub(crate) mod dict_value;
 mod graph_store_impl;
 /// Node/edge ID encoding and decoding helpers.
 pub mod id;
