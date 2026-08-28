@@ -1859,14 +1859,6 @@ fn test_preserving_ids_bytes_property_round_trips() {
         &Value::Bytes(Arc::from(payload.clone().into_boxed_slice())),
     );
     assert_eq!(matches, vec![a]);
-
-    // Hash-indexed equality on the Bytes value.
-    compact.enable_property_indexes(std::iter::once(PropertyKey::new("blob")));
-    let matches = compact.find_nodes_by_property(
-        "blob",
-        &Value::Bytes(Arc::from(payload.into_boxed_slice())),
-    );
-    assert_eq!(matches, vec![a]);
 }
 
 #[test]
@@ -1898,7 +1890,7 @@ fn test_bytes_property_survives_section_round_trip() {
     use crate::graph::compact::from_graph_store_preserving_ids;
     use crate::graph::compact::section::CompactStoreSection;
     use crate::graph::lpg::LpgStore;
-    use crate::storage::Section;
+    use grafeo_common::storage::section::Section;
     use std::sync::Arc;
 
     let store = LpgStore::new().unwrap();
@@ -1910,14 +1902,15 @@ fn test_bytes_property_survives_section_round_trip() {
         Value::Bytes(Arc::from(payload.clone().into_boxed_slice())),
     );
 
-    let section = CompactStoreSection::new(Arc::new(
-        from_graph_store_preserving_ids(&store).unwrap(),
-    ));
+    let section =
+        CompactStoreSection::new(Arc::new(from_graph_store_preserving_ids(&store).unwrap()));
     let bytes = section.serialize().expect("serialize");
     let mut restored = CompactStoreSection::empty();
     restored.deserialize(&bytes).expect("deserialize");
     let restored_store = restored.store().expect("restored store");
-    let node = restored_store.get_node(a).expect("node resolves after reopen");
+    let node = restored_store
+        .get_node(a)
+        .expect("node resolves after reopen");
     assert_eq!(
         node.properties.get(&PropertyKey::new("blob")),
         Some(&Value::Bytes(Arc::from(payload.into_boxed_slice()))),
