@@ -18,6 +18,15 @@ use crate::catalog::{
 };
 
 /// Current catalog section format version.
+///
+/// `version` is the first field of [`CatalogSnapshot`] and a `u8`, which
+/// bincode's standard config writes as a single leading byte — so a reader
+/// can identify the payload format from `data[0]` before attempting a full
+/// decode. [`CatalogSection::deserialize`] rejects any other value with a
+/// typed unsupported-version error: the section CRC has already proven the
+/// bytes intact by the time the payload reaches this module, so a foreign
+/// version byte means an incompatible revision wrote the store, not
+/// corruption.
 const CATALOG_SECTION_VERSION: u8 = 1;
 
 // ── Snapshot types ──────────────────────────────────────────────────
@@ -182,6 +191,21 @@ impl Section for CatalogSection {
     }
 
     fn deserialize(&mut self, data: &[u8]) -> Result<()> {
+        // Validate the format version before decoding anything else. A
+        // mismatched snapshot shape would otherwise surface as opaque
+        // bincode noise — or, when the divergent fields happen to be in
+        // empty collections, decode silently under the wrong format.
+        let found = *data.first().ok_or_else(|| {
+            Error::Serialization(
+                "Catalog section is empty: missing format version byte".to_string(),
+            )
+        })?;
+        if found != CATALOG_SECTION_VERSION {
+            return Err(Error::Serialization(format!(
+                "unsupported catalog version {found} (supported {CATALOG_SECTION_VERSION})"
+            )));
+        }
+
         let config = bincode::config::standard();
         let (snapshot, _): (CatalogSnapshot, _) = bincode::serde::decode_from_slice(data, config)
             .map_err(|e| {
@@ -339,7 +363,42 @@ mod tests {
     #[test]
     fn catalog_deserialize_corrupt_data() {
         let mut section = make_section();
-        let result = section.deserialize(&[0xFF, 0xFE, 0xFD, 0x00]);
+        let result = section.deserialize(&[0x01, 0xFE, 0xFD, 0x00]);
         assert!(result.is_err(), "corrupt data should fail deserialization");
+    }
+
+    #[test]
+    fn catalog_deserialize_rejects_unsupported_version() {
+        let section = make_section();
+        let mut bytes = section.serialize().unwrap();
+        bytes[0] = CATALOG_SECTION_VERSION + 1;
+
+        let mut section2 = make_section();
+        let err = section2
+            .deserialize(&bytes)
+            .expect_err("foreign version byte must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported catalog version 2 (supported 1)"),
+            "error must name found and supported versions, got: {msg}"
+        );
+        assert_eq!(
+            err.error_code().as_str(),
+            "GRAFEO-X002",
+            "version rejection is a serialization-class error, distinct \
+             from the GRAFEO-X001 section CRC mismatch"
+        );
+    }
+
+    #[test]
+    fn catalog_deserialize_rejects_empty_payload() {
+        let mut section = make_section();
+        let err = section
+            .deserialize(&[])
+            .expect_err("empty payload must fail");
+        assert!(
+            err.to_string().contains("missing format version byte"),
+            "unexpected error: {err}"
+        );
     }
 }
