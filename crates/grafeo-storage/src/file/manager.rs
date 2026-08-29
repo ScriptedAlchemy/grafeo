@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use grafeo_common::utils::error::{Error, Result};
+use grafeo_common::utils::error::{Error, Result, StorageError};
 use parking_lot::Mutex;
 
 use super::format::{DATA_OFFSET, DbHeader, FileHeader};
@@ -720,10 +720,10 @@ impl GrafeoFileManager {
         // logic would mask the underlying cause.
         let file_size = self.file.lock().metadata()?.len();
         if file_size < directory_offset + 4096 {
-            return Err(Error::Internal(format!(
+            return Err(Error::Storage(StorageError::Corruption(format!(
                 "v2 header indicates section directory at offset {directory_offset:#X}, \
                  but file is only {file_size} bytes",
-            )));
+            ))));
         }
 
         let mut file = self.file.lock();
@@ -733,9 +733,9 @@ impl GrafeoFileManager {
         std::io::Read::read_exact(&mut *file, &mut buf)?;
 
         let dir = SectionDirectory::from_bytes(&buf).map_err(|e| {
-            Error::Internal(format!(
+            Error::Storage(StorageError::Corruption(format!(
                 "v2 section directory at offset {directory_offset:#X} failed to parse: {e}",
-            ))
+            )))
         })?;
 
         // Cross-check the directory bytes against the CRC the writer recorded
@@ -744,10 +744,10 @@ impl GrafeoFileManager {
         // format ambiguity.
         let actual_checksum = crc32fast::hash(&buf);
         if actual_checksum != expected_checksum {
-            return Err(Error::Internal(format!(
+            return Err(Error::Storage(StorageError::Corruption(format!(
                 "v2 section directory checksum mismatch: \
                  header recorded {expected_checksum:#010X}, computed {actual_checksum:#010X}",
-            )));
+            ))));
         }
 
         if dir.is_empty() {
@@ -780,10 +780,10 @@ impl GrafeoFileManager {
         // Verify CRC on the raw bytes (encrypted or plaintext)
         let actual_crc = crc32fast::hash(&data);
         if actual_crc != entry.checksum {
-            return Err(Error::Internal(format!(
+            return Err(Error::Storage(StorageError::Corruption(format!(
                 "section {:?} CRC mismatch: expected {:#010X}, got {actual_crc:#010X}",
                 entry.section_type, entry.checksum
-            )));
+            ))));
         }
 
         // Decrypt if encryption is enabled
@@ -865,10 +865,10 @@ impl GrafeoFileManager {
         // prefetch disguised as an integrity check.
         let actual_crc = crc32fast::hash(&mmap);
         if actual_crc != entry.checksum {
-            return Err(Error::Internal(format!(
+            return Err(Error::Storage(StorageError::Corruption(format!(
                 "section {:?} CRC mismatch: expected {:#010X}, got {actual_crc:#010X}",
                 entry.section_type, entry.checksum
-            )));
+            ))));
         }
 
         Ok(crate::container::MmapSection::new(
