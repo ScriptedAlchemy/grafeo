@@ -22,7 +22,7 @@ impl LpgStore {
         self.update_text_index_on_set(id, key, &value);
 
         #[cfg(not(feature = "temporal"))]
-        self.node_properties.set(id, prop_key, value);
+        let inserted = self.node_properties.set(id, prop_key, value);
         #[cfg(feature = "temporal")]
         self.node_properties
             .set(id, prop_key, value, self.current_epoch());
@@ -30,11 +30,11 @@ impl LpgStore {
         // Update props_count in record
         #[cfg(not(feature = "temporal"))]
         {
-            let count = u16::try_from(self.node_properties.count(id)).unwrap_or(u16::MAX);
-            if let Some(chain) = self.nodes.write().get_mut(&id)
+            if inserted
+                && let Some(chain) = self.nodes.write().get_mut(&id)
                 && let Some(record) = chain.latest_mut()
             {
-                record.props_count = count;
+                record.props_count = record.props_count.saturating_add(1);
             }
         }
     }
