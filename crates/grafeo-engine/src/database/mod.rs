@@ -208,6 +208,22 @@ pub struct GrafeoDB {
     compact_base_mmap: parking_lot::Mutex<Option<bytes::Bytes>>,
 }
 
+#[cfg(all(feature = "wal", feature = "lpg"))]
+struct WalReplayCursor {
+    current_graph: Option<String>,
+    target_store: Arc<LpgStore>,
+}
+
+#[cfg(all(feature = "wal", feature = "lpg"))]
+impl WalReplayCursor {
+    fn new(store: &Arc<LpgStore>) -> Self {
+        Self {
+            current_graph: None,
+            target_store: Arc::clone(store),
+        }
+    }
+}
+
 impl GrafeoDB {
     /// Returns a reference to the built-in LPG store.
     ///
@@ -524,15 +540,18 @@ impl GrafeoDB {
                 #[cfg(all(feature = "wal", feature = "lpg"))]
                 if config.wal_enabled && fm.has_sidecar_wal() {
                     let recovery = WalRecovery::new(fm.sidecar_wal_path());
-                    let records = recovery.recover()?;
-                    sidecar_wal_replayed = !records.is_empty();
-                    Self::apply_wal_records(
-                        &store,
-                        &catalog,
-                        #[cfg(feature = "triple-store")]
-                        &rdf_store,
-                        &records,
-                    )?;
+                    let mut replay_cursor = WalReplayCursor::new(&store);
+                    recovery.recover_committed_as::<WalRecord, _>(|records| {
+                        sidecar_wal_replayed |= !records.is_empty();
+                        Self::apply_wal_records(
+                            &store,
+                            &catalog,
+                            #[cfg(feature = "triple-store")]
+                            &rdf_store,
+                            records,
+                            &mut replay_cursor,
+                        )
+                    })?;
                 }
 
                 Some(Arc::new(fm))
@@ -577,14 +596,17 @@ impl GrafeoDB {
                 #[cfg(feature = "lpg")]
                 if !is_single_file && wal_path.exists() {
                     let recovery = WalRecovery::new(&wal_path);
-                    let records = recovery.recover()?;
-                    Self::apply_wal_records(
-                        &store,
-                        &catalog,
-                        #[cfg(feature = "triple-store")]
-                        &rdf_store,
-                        &records,
-                    )?;
+                    let mut replay_cursor = WalReplayCursor::new(&store);
+                    recovery.recover_committed_as::<WalRecord, _>(|records| {
+                        Self::apply_wal_records(
+                            &store,
+                            &catalog,
+                            #[cfg(feature = "triple-store")]
+                            &rdf_store,
+                            records,
+                            &mut replay_cursor,
+                        )
+                    })?;
                 }
 
                 // Open/create WAL manager with configured durability
@@ -1166,16 +1188,12 @@ impl GrafeoDB {
         catalog: &Catalog,
         #[cfg(feature = "triple-store")] rdf_store: &Arc<RdfStore>,
         records: &[WalRecord],
+        cursor: &mut WalReplayCursor,
     ) -> Result<()> {
         use crate::catalog::{
             EdgeTypeDefinition, NodeTypeDefinition, PropertyDataType, TypeConstraint, TypedProperty,
         };
         use grafeo_common::utils::error::Error;
-
-        // Graph cursor: tracks which named graph receives data mutations.
-        // `None` means the default graph.
-        let mut current_graph: Option<String> = None;
-        let mut target_store: Arc<LpgStore> = Arc::clone(store);
 
         for record in records {
             match record {
@@ -1186,14 +1204,14 @@ impl GrafeoDB {
                 WalRecord::DropNamedGraph { name } => {
                     store.drop_graph(name);
                     // Reset cursor if the dropped graph was active
-                    if current_graph.as_deref() == Some(name.as_str()) {
-                        current_graph = None;
-                        target_store = Arc::clone(store);
+                    if cursor.current_graph.as_deref() == Some(name.as_str()) {
+                        cursor.current_graph = None;
+                        cursor.target_store = Arc::clone(store);
                     }
                 }
                 WalRecord::SwitchGraph { name } => {
-                    current_graph.clone_from(name);
-                    target_store = match &current_graph {
+                    cursor.current_graph.clone_from(name);
+                    cursor.target_store = match &cursor.current_graph {
                         None => Arc::clone(store),
                         Some(graph_name) => store
                             .graph_or_create(graph_name)
@@ -1204,10 +1222,10 @@ impl GrafeoDB {
                 // --- Data mutations: routed through target_store ---
                 WalRecord::CreateNode { id, labels } => {
                     let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-                    target_store.create_node_with_id(*id, &label_refs)?;
+                    cursor.target_store.create_node_with_id(*id, &label_refs)?;
                 }
                 WalRecord::DeleteNode { id } => {
-                    target_store.delete_node(*id);
+                    cursor.target_store.delete_node(*id);
                 }
                 WalRecord::CreateEdge {
                     id,
@@ -1215,28 +1233,34 @@ impl GrafeoDB {
                     dst,
                     edge_type,
                 } => {
-                    target_store.create_edge_with_id(*id, *src, *dst, edge_type)?;
+                    cursor
+                        .target_store
+                        .create_edge_with_id(*id, *src, *dst, edge_type)?;
                 }
                 WalRecord::DeleteEdge { id } => {
-                    target_store.delete_edge(*id);
+                    cursor.target_store.delete_edge(*id);
                 }
                 WalRecord::SetNodeProperty { id, key, value } => {
-                    target_store.set_node_property(*id, key, value.clone());
+                    cursor
+                        .target_store
+                        .set_node_property(*id, key, value.clone());
                 }
                 WalRecord::SetEdgeProperty { id, key, value } => {
-                    target_store.set_edge_property(*id, key, value.clone());
+                    cursor
+                        .target_store
+                        .set_edge_property(*id, key, value.clone());
                 }
                 WalRecord::AddNodeLabel { id, label } => {
-                    target_store.add_label(*id, label);
+                    cursor.target_store.add_label(*id, label);
                 }
                 WalRecord::RemoveNodeLabel { id, label } => {
-                    target_store.remove_label(*id, label);
+                    cursor.target_store.remove_label(*id, label);
                 }
                 WalRecord::RemoveNodeProperty { id, key } => {
-                    target_store.remove_node_property(*id, key);
+                    cursor.target_store.remove_node_property(*id, key);
                 }
                 WalRecord::RemoveEdgeProperty { id, key } => {
-                    target_store.remove_edge_property(*id, key);
+                    cursor.target_store.remove_edge_property(*id, key);
                 }
 
                 // --- Schema DDL replay (always on root catalog) ---
@@ -1443,7 +1467,7 @@ impl GrafeoDB {
                     // are recorded at the correct epoch in their VersionLogs.
                     #[cfg(feature = "temporal")]
                     {
-                        target_store.new_epoch();
+                        cursor.target_store.new_epoch();
                     }
                 }
                 WalRecord::TransactionAbort { .. } | WalRecord::Checkpoint { .. } => {
@@ -3749,6 +3773,54 @@ mod tests {
             let node1 = db.get_node(grafeo_common::types::NodeId::new(1)).unwrap();
             assert!(node1.labels.iter().any(|l| l.as_str() == "Person"));
         }
+    }
+
+    #[cfg(feature = "wal")]
+    #[test]
+    fn streamed_replay_preserves_named_graph_cursor_between_transactions() {
+        let store = Arc::new(LpgStore::new().unwrap());
+        let catalog = Catalog::new();
+        let mut cursor = WalReplayCursor::new(&store);
+
+        GrafeoDB::apply_wal_records(
+            &store,
+            &catalog,
+            #[cfg(feature = "triple-store")]
+            &Arc::new(RdfStore::new()),
+            &[
+                WalRecord::CreateNamedGraph {
+                    name: "social".to_string(),
+                },
+                WalRecord::SwitchGraph {
+                    name: Some("social".to_string()),
+                },
+                WalRecord::TransactionCommit {
+                    transaction_id: grafeo_common::types::TransactionId::new(1),
+                },
+            ],
+            &mut cursor,
+        )
+        .unwrap();
+        GrafeoDB::apply_wal_records(
+            &store,
+            &catalog,
+            #[cfg(feature = "triple-store")]
+            &Arc::new(RdfStore::new()),
+            &[
+                WalRecord::CreateNode {
+                    id: grafeo_common::types::NodeId::new(7),
+                    labels: vec!["Person".to_string()],
+                },
+                WalRecord::TransactionCommit {
+                    transaction_id: grafeo_common::types::TransactionId::new(2),
+                },
+            ],
+            &mut cursor,
+        )
+        .unwrap();
+
+        assert_eq!(store.node_count(), 0);
+        assert_eq!(store.graph("social").unwrap().node_count(), 1);
     }
 
     #[cfg(feature = "wal")]
