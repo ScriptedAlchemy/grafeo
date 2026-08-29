@@ -1149,6 +1149,8 @@ impl LpgStore {
     #[must_use]
     #[cfg(not(feature = "tiered-storage"))]
     pub fn node_count(&self) -> usize {
+        #[cfg(debug_assertions)]
+        crate::testing::count_probe::record_node_count();
         let epoch = self.current_epoch();
         self.nodes
             .read()
@@ -1163,6 +1165,8 @@ impl LpgStore {
     #[must_use]
     #[cfg(feature = "tiered-storage")]
     pub fn node_count(&self) -> usize {
+        #[cfg(debug_assertions)]
+        crate::testing::count_probe::record_node_count();
         let epoch = self.current_epoch();
         let versions = self.node_versions.read();
         versions

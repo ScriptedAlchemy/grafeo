@@ -623,6 +623,8 @@ impl LpgStore {
     #[must_use]
     #[cfg(not(feature = "tiered-storage"))]
     pub fn edge_count(&self) -> usize {
+        #[cfg(debug_assertions)]
+        crate::testing::count_probe::record_edge_count();
         let epoch = self.current_epoch();
         self.edges
             .read()
@@ -637,6 +639,8 @@ impl LpgStore {
     #[must_use]
     #[cfg(feature = "tiered-storage")]
     pub fn edge_count(&self) -> usize {
+        #[cfg(debug_assertions)]
+        crate::testing::count_probe::record_edge_count();
         let epoch = self.current_epoch();
         let versions = self.edge_versions.read();
         versions
