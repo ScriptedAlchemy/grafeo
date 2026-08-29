@@ -313,6 +313,17 @@ impl<Id: EntityId> PropertyStorage<Id> {
         result
     }
 
+    /// Counts the properties currently retained for one entity without
+    /// materializing or cloning their keys and values.
+    #[must_use]
+    pub fn count(&self, id: Id) -> usize {
+        self.columns
+            .read()
+            .values()
+            .filter(|column| column.has_value(id))
+            .count()
+    }
+
     /// Gets property values for multiple entities in a single lock acquisition.
     ///
     /// More efficient than calling [`Self::get`] in a loop because it acquires
@@ -1019,6 +1030,10 @@ impl<Id: EntityId> PropertyColumn<Id> {
         None
     }
 
+    fn has_value(&self, id: Id) -> bool {
+        self.values.contains_key(&id)
+    }
+
     /// Removes a value for an entity.
     pub fn remove(&mut self, id: Id) -> Option<Value> {
         let removed = self.values.remove(&id);
@@ -1673,6 +1688,13 @@ impl<Id: EntityId> PropertyColumn<Id> {
             .and_then(|log| log.latest())
             .filter(|v| !v.is_null())
             .cloned()
+    }
+
+    fn has_value(&self, id: Id) -> bool {
+        self.values
+            .get(&id)
+            .and_then(VersionLog::latest)
+            .is_some_and(|value| !value.is_null())
     }
 
     /// Removes a value by appending a tombstone (Null) at the given epoch.
@@ -2441,6 +2463,22 @@ mod tests {
                 .block_zone_maps_for(&PropertyKey::new("missing"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn property_count_matches_materialized_properties() {
+        let storage: PropertyStorage<NodeId> = PropertyStorage::new();
+        let target = NodeId::new(7);
+        let other = NodeId::new(8);
+
+        storage.set(target, PropertyKey::new("name"), Value::from("Alix"));
+        storage.set(target, PropertyKey::new("age"), Value::Int64(30));
+        storage.set(other, PropertyKey::new("name"), Value::from("Gus"));
+        storage.set(other, PropertyKey::new("active"), Value::Bool(true));
+
+        assert_eq!(storage.count(target), storage.get_all(target).len());
+        assert_eq!(storage.count(other), storage.get_all(other).len());
+        assert_eq!(storage.count(NodeId::new(9)), 0);
     }
 
     #[test]
