@@ -114,6 +114,10 @@ impl super::GrafeoDB {
         use grafeo_common::types::{PropertyKey, Value};
         use grafeo_core::index::vector::DistanceMetric;
 
+        // The vector-index section is persisted but this build is not
+        // WAL-logged; the container can no longer be treated as current.
+        self.mark_container_stale();
+
         let metric = match metric {
             Some(m) => DistanceMetric::from_str(m).ok_or_else(|| {
                 grafeo_common::utils::error::Error::Internal(format!(
@@ -292,6 +296,8 @@ impl super::GrafeoDB {
     pub fn drop_vector_index(&self, label: &str, property: &str) -> bool {
         let removed = self.lpg_store().remove_vector_index(label, property);
         if removed {
+            // Not WAL-logged; the persisted vector-index section is behind.
+            self.mark_container_stale();
             grafeo_info!("Vector index dropped: :{label}({property})");
         }
         removed
@@ -377,6 +383,10 @@ impl super::GrafeoDB {
         use grafeo_common::types::{PropertyKey, Value};
         use grafeo_core::index::text::{BM25Config, InvertedIndex};
 
+        // The text-index section is persisted but this build is not
+        // WAL-logged; the container can no longer be treated as current.
+        self.mark_container_stale();
+
         let mut index = InvertedIndex::new(BM25Config::default());
         let prop_key = PropertyKey::new(property);
 
@@ -399,7 +409,12 @@ impl super::GrafeoDB {
     /// Returns `true` if the index existed and was removed.
     #[cfg(feature = "text-index")]
     pub fn drop_text_index(&self, label: &str, property: &str) -> bool {
-        self.lpg_store().remove_text_index(label, property)
+        let removed = self.lpg_store().remove_text_index(label, property);
+        if removed {
+            // Not WAL-logged; the persisted text-index section is behind.
+            self.mark_container_stale();
+        }
+        removed
     }
 
     /// Rebuilds a text index by re-scanning all matching nodes.

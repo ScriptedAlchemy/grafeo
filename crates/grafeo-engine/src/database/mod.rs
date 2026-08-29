@@ -54,7 +54,7 @@ use grafeo_common::{grafeo_error, grafeo_warn};
 #[cfg(feature = "wal")]
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 
@@ -146,6 +146,13 @@ pub struct GrafeoDB {
     /// Wrapped in Mutex because `close()` takes `&self` but needs to stop the timer.
     #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
     checkpoint_timer: parking_lot::Mutex<Option<checkpoint_timer::CheckpointTimer>>,
+    /// Whether in-memory state has diverged from the on-disk container in a
+    /// way the WAL does not record: a sidecar WAL replayed at open (those
+    /// records live only in memory and the sidecar), or a DB-level mutation
+    /// that bypasses the WAL (index build/drop/rebuild, named-graph
+    /// create/drop). Cleared by a successful full checkpoint. `close()`
+    /// consults this before treating the container as already current.
+    container_stale: std::sync::atomic::AtomicBool,
     /// Shared registry of spilled vector storages.
     /// Used by the search path to create `SpillableVectorAccessor` instances.
     #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
@@ -398,6 +405,16 @@ impl GrafeoDB {
         )> = None;
 
         // --- Single-file format (.grafeo) ---
+
+        // Records replayed from a sidecar WAL exist only in memory and the
+        // sidecar until the next checkpoint, so a replay leaves the container
+        // behind the live state. `close()` consults this before deciding the
+        // container is already current.
+        #[cfg(all(feature = "grafeo-file", feature = "wal", feature = "lpg"))]
+        let mut sidecar_wal_replayed = false;
+        #[cfg(not(all(feature = "grafeo-file", feature = "wal", feature = "lpg")))]
+        let sidecar_wal_replayed = false;
+
         #[cfg(feature = "grafeo-file")]
         let file_manager: Option<Arc<GrafeoFileManager>> = if is_read_only {
             // Read-only mode: open with shared lock, load snapshot, skip WAL
@@ -495,6 +512,7 @@ impl GrafeoDB {
                 if config.wal_enabled && fm.has_sidecar_wal() {
                     let recovery = WalRecovery::new(fm.sidecar_wal_path());
                     let records = recovery.recover()?;
+                    sidecar_wal_replayed = !records.is_empty();
                     Self::apply_wal_records(
                         &store,
                         &catalog,
@@ -638,6 +656,7 @@ impl GrafeoDB {
             file_manager,
             #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
             checkpoint_timer: parking_lot::Mutex::new(None),
+            container_stale: std::sync::atomic::AtomicBool::new(sidecar_wal_replayed),
             #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
             vector_spill_storages: None,
             external_read_store: None,
@@ -784,6 +803,8 @@ impl GrafeoDB {
             file_manager: None,
             #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
             checkpoint_timer: parking_lot::Mutex::new(None),
+            // External stores have no container; fail closed if ever read.
+            container_stale: std::sync::atomic::AtomicBool::new(true),
             #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
             vector_spill_storages: None,
             external_read_store: Some(Arc::clone(&store) as Arc<dyn GraphStoreSearch>),
@@ -875,6 +896,8 @@ impl GrafeoDB {
             file_manager: None,
             #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
             checkpoint_timer: parking_lot::Mutex::new(None),
+            // External stores have no container; fail closed if ever read.
+            container_stale: std::sync::atomic::AtomicBool::new(true),
             #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
             vector_spill_storages: None,
             external_read_store: Some(store),
@@ -2017,7 +2040,14 @@ impl GrafeoDB {
     /// Returns an error if arena allocation fails.
     #[cfg(feature = "lpg")]
     pub fn create_graph(&self, name: &str) -> Result<bool> {
-        Ok(self.lpg_store().create_graph(name)?)
+        let created = self.lpg_store().create_graph(name)?;
+        if created {
+            // Named graphs persist inside the LPG section, but this DB-level
+            // API is not WAL-logged; the container is behind until the next
+            // checkpoint.
+            self.mark_container_stale();
+        }
+        Ok(created)
     }
 
     /// Drops a named graph. Returns `true` if dropped, `false` if it did not exist.
@@ -2031,6 +2061,10 @@ impl GrafeoDB {
         };
         let dropped = store.drop_graph(name);
         if dropped {
+            // Named graphs persist inside the LPG section, but this DB-level
+            // API is not WAL-logged; the container is behind until the next
+            // checkpoint.
+            self.mark_container_stale();
             let mut current = self.current_graph.write();
             if current
                 .as_deref()
@@ -2266,7 +2300,48 @@ impl GrafeoDB {
             if let Some(ref wal) = self.wal {
                 wal.sync()?;
             }
-            let flush_result = self.checkpoint_to_file(fm, flush::FlushReason::Explicit)?;
+            // A close needs a checkpoint only when the container is behind
+            // the live state. Three authorities prove it is not: the WAL
+            // recorded no mutations (none appended in this process, none
+            // replayed at open, no WAL-bypassing DB-level mutation flagged
+            // `container_stale`), the store is not in layered/compacted mode,
+            // and the live store still matches the epoch and row-count
+            // watermarks the active header captured at the last checkpoint.
+            // When all hold, every section's bytes in the container are
+            // exactly what a checkpoint would serialize again, and the
+            // unconditional `Explicit` rewrite this replaces was corpus-scale
+            // work — the entire accumulated store re-serialized and
+            // rewritten — to change nothing. Any doubt (WAL disabled,
+            // external store, watermark drift) falls back to the full
+            // checkpoint, and the WAL-records safety valve below still
+            // guards against a skipped write that left records behind.
+            #[cfg(all(feature = "wal", feature = "lpg", feature = "compact-store"))]
+            let layered = self.layered_store.is_some();
+            #[cfg(all(feature = "wal", feature = "lpg", not(feature = "compact-store")))]
+            let layered = false;
+            #[cfg(all(feature = "wal", feature = "lpg"))]
+            let container_is_current = !layered
+                && !self.container_stale.load(Ordering::Acquire)
+                && self
+                    .wal
+                    .as_ref()
+                    .is_some_and(|wal| wal.record_count() == 0)
+                && self.store.as_ref().is_some_and(|store| {
+                    let header = fm.active_header();
+                    header.epoch == store.current_epoch().0
+                        && header.node_count == store.node_count() as u64
+                        && header.edge_count == store.edge_count() as u64
+                });
+            #[cfg(not(all(feature = "wal", feature = "lpg")))]
+            let container_is_current = false;
+
+            let flush_result = if container_is_current {
+                flush::FlushResult {
+                    sections_written: 0,
+                }
+            } else {
+                self.checkpoint_to_file(fm, flush::FlushReason::Explicit)?
+            };
 
             // Safety check: if WAL has records but the checkpoint was a no-op
             // (zero sections written), the container file may not contain the
@@ -2837,14 +2912,20 @@ impl GrafeoDB {
         #[cfg(not(feature = "lpg"))]
         let context = flush::build_context_minimal(&self.transaction_manager);
 
-        flush::flush(
+        let result = flush::flush(
             fm,
             &section_refs,
             &context,
             reason,
             #[cfg(feature = "wal")]
             self.wal.as_deref(),
-        )
+        )?;
+        // A full serialization pass captured every section, including state
+        // from WAL-bypassing mutations and sidecar replay.
+        if reason == flush::FlushReason::Explicit {
+            self.container_stale.store(false, Ordering::Release);
+        }
+        Ok(result)
     }
 
     /// Returns the file manager if using single-file format.
@@ -2852,6 +2933,12 @@ impl GrafeoDB {
     #[must_use]
     pub fn file_manager(&self) -> Option<&Arc<GrafeoFileManager>> {
         self.file_manager.as_ref()
+    }
+
+    /// Records a mutation that bypasses the WAL, so `close()` cannot treat
+    /// the on-disk container as current and must checkpoint.
+    pub(crate) fn mark_container_stale(&self) {
+        self.container_stale.store(true, Ordering::Release);
     }
 }
 
