@@ -282,6 +282,7 @@ impl GrafeoFileManager {
             node_count,
             edge_count,
             timestamp_ms,
+            directory_offset: 0,
         };
         header::write_db_header(&mut file, target_slot, &new_header)?;
 
@@ -420,11 +421,84 @@ impl GrafeoFileManager {
 
     // ── Section-based I/O (v2 container format) ─────────────────────
 
+    /// Rounds `value` up to the next container page boundary (4 KiB).
+    fn page_align_up(value: u64) -> u64 {
+        value.div_ceil(4096) * 4096
+    }
+
+    /// Returns the byte offset of the active generation's directory page.
+    ///
+    /// Headers written before out-of-place checkpoints carry
+    /// `directory_offset == 0` (decoded from zero padding), which means the
+    /// legacy fixed location.
+    fn directory_location(header: &DbHeader) -> u64 {
+        if header.directory_offset == 0 {
+            crate::container::directory::DIRECTORY_OFFSET
+        } else {
+            header.directory_offset
+        }
+    }
+
+    /// Computes the byte extent `[lo, hi)` occupied by the committed (live)
+    /// generation, which an in-progress checkpoint must not touch.
+    ///
+    /// Returns `None` for a store with no committed data. If the live
+    /// directory cannot be read or verified (the store is already damaged),
+    /// falls back to the whole file so the new generation appends past
+    /// everything rather than guessing at reusable space.
+    fn live_extent(&self, file: &mut File, active: &DbHeader) -> Result<Option<(u64, u64)>> {
+        use crate::container::SectionDirectory;
+        use crate::container::directory::SECTION_DATA_OFFSET;
+
+        if active.is_empty() {
+            return Ok(None);
+        }
+        // v1 blob layout: the snapshot occupies [DATA_OFFSET, DATA_OFFSET + len).
+        if active.snapshot_length > 0 {
+            return Ok(Some((DATA_OFFSET, DATA_OFFSET + active.snapshot_length)));
+        }
+
+        let dir_offset = Self::directory_location(active);
+        let conservative = {
+            let file_len = file.metadata()?.len();
+            Some((SECTION_DATA_OFFSET.min(dir_offset), file_len.max(dir_offset + 4096)))
+        };
+
+        file.seek(SeekFrom::Start(dir_offset))?;
+        let mut buf = vec![0u8; 4096];
+        if std::io::Read::read_exact(&mut *file, &mut buf).is_err() {
+            return Ok(conservative);
+        }
+        if crc32fast::hash(&buf) != active.checksum {
+            return Ok(conservative);
+        }
+        let Ok(dir) = SectionDirectory::from_bytes(&buf) else {
+            return Ok(conservative);
+        };
+
+        let mut lo = dir_offset;
+        let mut hi = dir_offset + 4096;
+        for entry in dir.entries() {
+            lo = lo.min(entry.offset);
+            hi = hi.max(entry.offset + entry.length);
+        }
+        Ok(Some((lo, hi)))
+    }
+
     /// Writes multiple sections to the file using the v2 container format.
     ///
-    /// Each section is written at a page-aligned offset. A section directory
-    /// is written at `DIRECTORY_OFFSET`, and a new DbHeader is committed to
-    /// the inactive slot.
+    /// The new generation — section data followed by its directory page —
+    /// is written **out of place**, into space not occupied by the live
+    /// generation (the gap below it when the new generation fits there,
+    /// otherwise appended past it), and made durable with an fsync. Only
+    /// then is the new [`DbHeader`] committed to the inactive slot and
+    /// fsynced: the header flip is the single atomic commit point, so a
+    /// kill at any byte of the checkpoint leaves the store openable at the
+    /// previous generation. Space held by the now-dead generation is
+    /// reclaimed after the flip by truncating past the new generation's
+    /// end when it sits below the dead one (successive generations
+    /// ping-pong between the low region and the appended region, so the
+    /// file oscillates around one-to-two generations in size).
     ///
     /// # Errors
     ///
@@ -438,7 +512,7 @@ impl GrafeoFileManager {
         edge_count: u64,
     ) -> Result<()> {
         use crate::container::SectionDirectory;
-        use crate::container::directory::{DIRECTORY_OFFSET, SECTION_DATA_OFFSET};
+        use crate::container::directory::SECTION_DATA_OFFSET;
         use grafeo_common::storage::SectionDirectoryEntry;
         use grafeo_common::testing::crash::maybe_crash;
 
@@ -455,9 +529,37 @@ impl GrafeoFileManager {
 
         maybe_crash("write_sections:before_data");
 
+        // Size the new generation up front: page-aligned section payloads
+        // plus one directory page. Encryption adds a fixed per-section
+        // overhead (nonce + tag), so the total stays exact either way.
+        #[cfg(feature = "encryption")]
+        let per_section_overhead: u64 = if self.section_encryptor.is_some() {
+            grafeo_common::encryption::ENCRYPTION_OVERHEAD as u64
+        } else {
+            0
+        };
+        #[cfg(not(feature = "encryption"))]
+        let per_section_overhead: u64 = 0;
+
+        let new_generation_size: u64 = sections
+            .iter()
+            .map(|(_, data)| Self::page_align_up(data.len() as u64 + per_section_overhead))
+            .sum::<u64>()
+            + 4096;
+
+        // Place the new generation outside the live one: in the gap below
+        // it when the whole generation fits, otherwise appended past it.
+        let region_start = match self.live_extent(&mut file, &active_header)? {
+            None => SECTION_DATA_OFFSET,
+            Some((live_lo, _)) if SECTION_DATA_OFFSET + new_generation_size <= live_lo => {
+                SECTION_DATA_OFFSET
+            }
+            Some((_, live_hi)) => Self::page_align_up(live_hi.max(SECTION_DATA_OFFSET)),
+        };
+
         // Write each section at page-aligned offsets
         let page_size = 4096u64;
-        let mut current_offset = SECTION_DATA_OFFSET;
+        let mut current_offset = region_start;
         // Next checkpoint iteration, used as the high part of the nonce so that
         // the same (section_type, offset) pair produces a different nonce across
         // checkpoints. Without this, identical section layouts would reuse nonces.
@@ -516,17 +618,22 @@ impl GrafeoFileManager {
 
         maybe_crash("write_sections:after_data");
 
-        // Truncate file to remove stale trailing data
-        file.set_len(current_offset)?;
-
-        // Write section directory
+        // Write this generation's directory page right after its sections.
+        // `current_offset` is already page-aligned by the section loop.
+        let directory_offset = current_offset;
         let dir_bytes = dir.to_bytes();
-        file.seek(SeekFrom::Start(DIRECTORY_OFFSET))?;
+        file.seek(SeekFrom::Start(directory_offset))?;
         file.write_all(&dir_bytes)?;
+        let region_end = directory_offset + dir_bytes.len() as u64;
 
         maybe_crash("write_sections:after_directory");
 
-        // Build and write new DbHeader to inactive slot
+        // Make the whole new generation durable BEFORE the header flip. If
+        // the process dies anywhere up to here, the previous header still
+        // points at the untouched previous generation.
+        file.sync_all()?;
+
+        // Build and write new DbHeader to inactive slot — the atomic commit.
         let new_iteration = active_header.iteration + 1;
         let target_slot = u8::from(*active_slot == 0);
         // reason: millis since UNIX epoch fits in u64 for ~585 million years
@@ -545,13 +652,22 @@ impl GrafeoFileManager {
             node_count,
             edge_count,
             timestamp_ms,
+            directory_offset,
         };
         header::write_db_header(&mut file, target_slot, &new_header)?;
 
-        // Ensure everything is on disk
+        // Ensure the flip is on disk before reclaiming the old generation.
         file.sync_all()?;
 
         maybe_crash("write_sections:after_fsync");
+
+        // Reclaim: everything past the new generation is now dead (either
+        // the previous generation, when this one was placed below it, or
+        // stale trailing bytes). Truncation only runs after the flip is
+        // durable, so a kill anywhere earlier leaves the old bytes intact.
+        if file.metadata()?.len() > region_end {
+            file.set_len(region_end)?;
+        }
 
         // Update internal state
         drop(active_header);
@@ -583,7 +699,6 @@ impl GrafeoFileManager {
     /// - The directory page CRC does not match the value recorded in the active header
     pub fn read_section_directory(&self) -> Result<Option<crate::container::SectionDirectory>> {
         use crate::container::SectionDirectory;
-        use crate::container::directory::DIRECTORY_OFFSET;
 
         let active_header = self.active_header.lock();
 
@@ -594,6 +709,9 @@ impl GrafeoFileManager {
             return Ok(None);
         }
         let expected_checksum = active_header.checksum;
+        // Headers written before out-of-place checkpoints carry 0 here and
+        // mean the legacy fixed directory page.
+        let directory_offset = Self::directory_location(&active_header);
         drop(active_header);
 
         // Past this point the header asserts v2: any failure to read or parse
@@ -601,22 +719,22 @@ impl GrafeoFileManager {
         // it instead of silently falling through to read_snapshot, where v1 CRC
         // logic would mask the underlying cause.
         let file_size = self.file.lock().metadata()?.len();
-        if file_size < DIRECTORY_OFFSET + 4096 {
+        if file_size < directory_offset + 4096 {
             return Err(Error::Internal(format!(
-                "v2 header indicates section directory at offset {DIRECTORY_OFFSET:#X}, \
+                "v2 header indicates section directory at offset {directory_offset:#X}, \
                  but file is only {file_size} bytes",
             )));
         }
 
         let mut file = self.file.lock();
-        file.seek(SeekFrom::Start(DIRECTORY_OFFSET))?;
+        file.seek(SeekFrom::Start(directory_offset))?;
 
         let mut buf = vec![0u8; 4096];
         std::io::Read::read_exact(&mut *file, &mut buf)?;
 
         let dir = SectionDirectory::from_bytes(&buf).map_err(|e| {
             Error::Internal(format!(
-                "v2 section directory at offset {DIRECTORY_OFFSET:#X} failed to parse: {e}",
+                "v2 section directory at offset {directory_offset:#X} failed to parse: {e}",
             ))
         })?;
 
@@ -963,24 +1081,25 @@ mod tests {
         // degrade to "this is a v1 file" — that masking is what made the
         // GRAFEO-X001 in #323 surface as a misleading snapshot CRC error
         // instead of pointing at the real directory corruption.
-        use crate::container::directory::DIRECTORY_OFFSET;
         use grafeo_common::storage::SectionType;
 
         let dir = test_dir();
         let path = dir.path().join("corrupt_dir.grafeo");
 
+        let directory_offset;
         {
             let manager = GrafeoFileManager::create(&path).unwrap();
             manager
                 .write_sections(&[(SectionType::LpgStore, b"section payload")], 1, 1, 0, 0)
                 .unwrap();
+            directory_offset = manager.active_header().directory_offset;
         }
 
         // Overwrite the directory page count field with a value above MAX_SECTIONS
         // so SectionDirectory::from_bytes rejects it as malformed.
         {
             let mut file = OpenOptions::new().write(true).open(&path).unwrap();
-            file.seek(SeekFrom::Start(DIRECTORY_OFFSET)).unwrap();
+            file.seek(SeekFrom::Start(directory_offset)).unwrap();
             file.write_all(&u32::MAX.to_le_bytes()).unwrap();
         }
 
@@ -1001,17 +1120,18 @@ mod tests {
         // bytes inconsistent with the CRC the writer recorded in the active
         // header. The pre-fix wildcard match swallowed this, falling through to
         // v1 read logic that reported a misleading snapshot checksum mismatch.
-        use crate::container::directory::DIRECTORY_OFFSET;
         use grafeo_common::storage::SectionType;
 
         let dir = test_dir();
         let path = dir.path().join("torn_dir.grafeo");
 
+        let directory_offset;
         {
             let manager = GrafeoFileManager::create(&path).unwrap();
             manager
                 .write_sections(&[(SectionType::LpgStore, b"section payload")], 1, 1, 0, 0)
                 .unwrap();
+            directory_offset = manager.active_header().directory_offset;
         }
 
         // Flip a byte in the reserved area of the directory page (bytes 4-7).
@@ -1019,7 +1139,7 @@ mod tests {
         // CRC over the page no longer matches the value in the active header.
         {
             let mut file = OpenOptions::new().write(true).open(&path).unwrap();
-            file.seek(SeekFrom::Start(DIRECTORY_OFFSET + 4)).unwrap();
+            file.seek(SeekFrom::Start(directory_offset + 4)).unwrap();
             file.write_all(&[0xAA]).unwrap();
         }
 
