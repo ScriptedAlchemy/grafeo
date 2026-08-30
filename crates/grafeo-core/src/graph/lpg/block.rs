@@ -627,11 +627,82 @@ pub(crate) struct BlockNamedGraph {
     pub edges: Vec<BlockEdge>,
 }
 
+/// Repeatable, deterministically ordered source for the block encoder.
+///
+/// The encoder makes several passes (string interning, entity blocks, labels,
+/// and property columns). A live store can implement those passes by lending
+/// one materialized entity to the visitor at a time instead of retaining a
+/// second owned copy of the whole graph.
+pub(crate) trait BlockSource {
+    fn node_count(&self) -> usize;
+    fn edge_count(&self) -> usize;
+    fn named_graph_count(&self) -> usize;
+
+    fn visit_nodes(&self, visitor: &mut dyn FnMut(&BlockNode) -> Result<()>) -> Result<()>;
+    fn visit_edges(&self, visitor: &mut dyn FnMut(&BlockEdge) -> Result<()>) -> Result<()>;
+    fn visit_named_graphs(
+        &self,
+        visitor: &mut dyn FnMut(&str, &dyn BlockSource) -> Result<()>,
+    ) -> Result<()>;
+}
+
+#[cfg(test)]
+struct SliceBlockSource<'a> {
+    nodes: &'a [BlockNode],
+    edges: &'a [BlockEdge],
+    named_graphs: &'a [BlockNamedGraph],
+}
+
+#[cfg(test)]
+impl BlockSource for SliceBlockSource<'_> {
+    fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    fn named_graph_count(&self) -> usize {
+        self.named_graphs.len()
+    }
+
+    fn visit_nodes(&self, visitor: &mut dyn FnMut(&BlockNode) -> Result<()>) -> Result<()> {
+        for node in self.nodes {
+            visitor(node)?;
+        }
+        Ok(())
+    }
+
+    fn visit_edges(&self, visitor: &mut dyn FnMut(&BlockEdge) -> Result<()>) -> Result<()> {
+        for edge in self.edges {
+            visitor(edge)?;
+        }
+        Ok(())
+    }
+
+    fn visit_named_graphs(
+        &self,
+        visitor: &mut dyn FnMut(&str, &dyn BlockSource) -> Result<()>,
+    ) -> Result<()> {
+        for graph in self.named_graphs {
+            let source = SliceBlockSource {
+                nodes: &graph.nodes,
+                edges: &graph.edges,
+                named_graphs: &[],
+            };
+            visitor(&graph.name, &source)?;
+        }
+        Ok(())
+    }
+}
+
 /// Serializes LPG data into the block-based binary format.
 ///
 /// Thin wrapper over [`write_blocks_into`]: identical bytes, but the
 /// whole section is materialised in the returned `Vec`. Callers on the
 /// flush path should prefer the sink form.
+#[cfg(test)]
 pub(crate) fn write_blocks(
     nodes: &[BlockNode],
     edges: &[BlockEdge],
@@ -651,6 +722,7 @@ pub(crate) fn write_blocks(
 /// the section size. Blocks still have to be built before the directory
 /// can record their offsets and CRCs, but the second copy is gone: the
 /// header, the directory, and each block body go to the sink in place.
+#[cfg(test)]
 pub(crate) fn write_blocks_into(
     sink: &mut dyn std::io::Write,
     nodes: &[BlockNode],
@@ -658,78 +730,63 @@ pub(crate) fn write_blocks_into(
     named_graphs: &[BlockNamedGraph],
     epoch: u64,
 ) -> Result<()> {
+    let source = SliceBlockSource {
+        nodes,
+        edges,
+        named_graphs,
+    };
+    write_source_blocks_into(sink, &source, epoch)
+}
+
+pub(crate) fn write_source_blocks_into(
+    sink: &mut dyn std::io::Write,
+    source: &dyn BlockSource,
+    epoch: u64,
+) -> Result<()> {
     let mut strings = StringTableBuilder::new();
-    let mut blocks: Vec<(BlockType, Vec<u8>, u32, u32)> = Vec::new(); // (type, data, key_idx, sub_type)
+    let mut node_property_keys = std::collections::BTreeSet::new();
+    let mut edge_property_keys = std::collections::BTreeSet::new();
 
     // Phase 1: intern all strings first so the table is complete before
-    // we write any blocks that reference string indices.
-    for node in nodes {
+    // we write any blocks that reference string indices. Property keys are
+    // deduplicated during the same source pass instead of materialising one
+    // key copy per entity.
+    source.visit_nodes(&mut |node| {
         for label in &node.labels {
             strings.intern(label);
         }
         for (key, entries) in &node.properties {
             strings.intern(key);
+            node_property_keys.insert(key.clone());
             intern_values_strings(entries, &mut strings);
         }
-    }
-    for edge in edges {
+        Ok(())
+    })?;
+    source.visit_edges(&mut |edge| {
         strings.intern(&edge.edge_type);
         for (key, entries) in &edge.properties {
             strings.intern(key);
+            edge_property_keys.insert(key.clone());
             intern_values_strings(entries, &mut strings);
         }
-    }
-    for graph in named_graphs {
-        strings.intern(&graph.name);
-        for node in &graph.nodes {
-            for label in &node.labels {
-                strings.intern(label);
-            }
-            for (key, entries) in &node.properties {
-                strings.intern(key);
-                intern_values_strings(entries, &mut strings);
-            }
-        }
-        for edge in &graph.edges {
-            strings.intern(&edge.edge_type);
-            for (key, entries) in &edge.properties {
-                strings.intern(key);
-                intern_values_strings(entries, &mut strings);
-            }
-        }
-    }
+        Ok(())
+    })?;
+    source.visit_named_graphs(&mut |name, graph| {
+        strings.intern(name);
+        intern_source_strings(graph, &mut strings)
+    })?;
 
-    // Block 0: String table
-    let st_data = strings.serialize();
-    blocks.push((BlockType::StringTable, st_data, 0, 0));
-
-    // Block 1: Node data
-    // Format: for each node [id:u64]
-    let mut node_buf = Vec::with_capacity(nodes.len() * 8);
-    for node in nodes {
-        node_buf.extend_from_slice(&node.id.as_u64().to_le_bytes());
-    }
-    blocks.push((BlockType::NodeData, node_buf, 0, 0));
-
-    // Block 2: Edge data
-    // Format: for each edge [id:u64][src:u64][dst:u64][type_str_idx:u32]
-    let mut edge_buf = Vec::with_capacity(edges.len() * 28);
-    for edge in edges {
-        edge_buf.extend_from_slice(&edge.id.as_u64().to_le_bytes());
-        edge_buf.extend_from_slice(&edge.src.as_u64().to_le_bytes());
-        edge_buf.extend_from_slice(&edge.dst.as_u64().to_le_bytes());
-        let type_idx = strings.intern(&edge.edge_type);
-        edge_buf.extend_from_slice(&type_idx.to_le_bytes());
-    }
-    blocks.push((BlockType::EdgeData, edge_buf, 0, 0));
-
-    // Block 3: Label assignments
-    // Format: [node_count:u32] for each node [label_count:u16][label_idx:u32*count]
+    // Phase 2: encode every top-level node exactly once into all node-backed
+    // blocks. The block buffers are the durable output pieces; only the one
+    // currently visited entity is materialized beside them.
+    let mut node_buf = Vec::with_capacity(source.node_count() * 8);
     let mut label_buf = Vec::new();
     // reason: node and label counts within a section fit u32/u16
     #[allow(clippy::cast_possible_truncation)]
-    label_buf.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
-    for node in nodes {
+    label_buf.extend_from_slice(&(source.node_count() as u32).to_le_bytes());
+    let mut node_property_columns = property_column_builders(node_property_keys, &mut strings);
+    source.visit_nodes(&mut |node| {
+        node_buf.extend_from_slice(&node.id.as_u64().to_le_bytes());
         // reason: label count per node is bounded, fits u16
         #[allow(clippy::cast_possible_truncation)]
         label_buf.extend_from_slice(&(node.labels.len() as u16).to_le_bytes());
@@ -737,37 +794,57 @@ pub(crate) fn write_blocks_into(
             let idx = strings.intern(label);
             label_buf.extend_from_slice(&idx.to_le_bytes());
         }
-    }
-    blocks.push((BlockType::LabelAssignment, label_buf, 0, 0));
+        append_entity_properties(
+            node.id.as_u64(),
+            &node.properties,
+            &mut node_property_columns,
+            &mut strings,
+        );
+        Ok(())
+    })?;
 
-    // Property columns: one block per (property_key, entity_type) pair
-    // Node properties
-    let node_prop_keys = collect_property_keys(nodes.iter().flat_map(|n| n.properties.iter()));
-    for key in &node_prop_keys {
-        let key_idx = strings.intern(key);
-        let col_data = write_property_column(key, nodes.iter(), &mut strings, true);
-        blocks.push((BlockType::PropertyColumn, col_data, key_idx, 0));
-    }
+    // Encode every top-level edge once into its fixed-width row and property
+    // columns for the same reason.
+    let mut edge_buf = Vec::with_capacity(source.edge_count() * 28);
+    let mut edge_property_columns = property_column_builders(edge_property_keys, &mut strings);
+    source.visit_edges(&mut |edge| {
+        edge_buf.extend_from_slice(&edge.id.as_u64().to_le_bytes());
+        edge_buf.extend_from_slice(&edge.src.as_u64().to_le_bytes());
+        edge_buf.extend_from_slice(&edge.dst.as_u64().to_le_bytes());
+        let type_idx = strings.intern(&edge.edge_type);
+        edge_buf.extend_from_slice(&type_idx.to_le_bytes());
+        append_entity_properties(
+            edge.id.as_u64(),
+            &edge.properties,
+            &mut edge_property_columns,
+            &mut strings,
+        );
+        Ok(())
+    })?;
 
-    // Edge properties
-    let edge_prop_keys = collect_property_keys(edges.iter().flat_map(|e| e.properties.iter()));
-    for key in &edge_prop_keys {
-        let key_idx = strings.intern(key);
-        let col_data = write_property_column_edges(key, edges.iter(), &mut strings);
-        blocks.push((BlockType::PropertyColumn, col_data, key_idx, 1));
-    }
+    let mut named_graph_blocks = Vec::with_capacity(source.named_graph_count());
+    source.visit_named_graphs(&mut |name, graph| {
+        let name_idx = strings.intern(name);
+        let graph_data = write_source_blocks(graph, epoch)?;
+        named_graph_blocks.push((BlockType::NamedGraph, graph_data, name_idx, 0));
+        Ok(())
+    })?;
 
-    // Named graphs: each is a self-contained sub-section
-    for graph in named_graphs {
-        let name_idx = strings.intern(&graph.name);
-        let graph_data = write_blocks(&graph.nodes, &graph.edges, &[], epoch)?;
-        blocks.push((BlockType::NamedGraph, graph_data, name_idx, 0));
-    }
-
-    // Re-serialize the string table now that all strings are interned
-    // (property column writing may have added new strings)
-    let final_st_data = strings.serialize();
-    blocks[0].1 = final_st_data;
+    let mut blocks: Vec<(BlockType, Vec<u8>, u32, u32)> = vec![
+        (BlockType::StringTable, strings.serialize(), 0, 0),
+        (BlockType::NodeData, node_buf, 0, 0),
+        (BlockType::EdgeData, edge_buf, 0, 0),
+        (BlockType::LabelAssignment, label_buf, 0, 0),
+    ]; // (type, data, key_idx, sub_type)
+    blocks.extend(node_property_columns.into_iter().map(|column| {
+        let key_index = column.key_index;
+        (BlockType::PropertyColumn, column.finish(), key_index, 0)
+    }));
+    blocks.extend(edge_property_columns.into_iter().map(|column| {
+        let key_index = column.key_index;
+        (BlockType::PropertyColumn, column.finish(), key_index, 1)
+    }));
+    blocks.extend(named_graph_blocks);
 
     // Assemble the final output
     let block_count = blocks.len();
@@ -809,10 +886,10 @@ pub(crate) fn write_blocks_into(
         version: LPG_BLOCK_VERSION,
         flags: 0,
         block_count: block_count as u16,
-        node_count: nodes.len() as u64,
-        edge_count: edges.len() as u64,
+        node_count: source.node_count() as u64,
+        edge_count: source.edge_count() as u64,
         epoch,
-        named_graph_count: named_graphs.len() as u32,
+        named_graph_count: source.named_graph_count() as u32,
         _reserved: [0; 28],
     };
     header.write_to(&mut prologue);
@@ -834,6 +911,37 @@ pub(crate) fn write_blocks_into(
     debug_assert_eq!(written, total_size);
     let _ = written;
     Ok(())
+}
+
+fn write_source_blocks(source: &dyn BlockSource, epoch: u64) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_source_blocks_into(&mut out, source, epoch)?;
+    Ok(out)
+}
+
+fn intern_source_strings(source: &dyn BlockSource, strings: &mut StringTableBuilder) -> Result<()> {
+    source.visit_nodes(&mut |node| {
+        for label in &node.labels {
+            strings.intern(label);
+        }
+        for (key, entries) in &node.properties {
+            strings.intern(key);
+            intern_values_strings(entries, strings);
+        }
+        Ok(())
+    })?;
+    source.visit_edges(&mut |edge| {
+        strings.intern(&edge.edge_type);
+        for (key, entries) in &edge.properties {
+            strings.intern(key);
+            intern_values_strings(entries, strings);
+        }
+        Ok(())
+    })?;
+    source.visit_named_graphs(&mut |name, graph| {
+        strings.intern(name);
+        intern_source_strings(graph, strings)
+    })
 }
 
 fn intern_values_strings(entries: &[(EpochId, Value)], strings: &mut StringTableBuilder) {
@@ -870,85 +978,76 @@ fn intern_value_strings(value: &Value, strings: &mut StringTableBuilder) {
     }
 }
 
-fn collect_property_keys<'a>(
-    props: impl Iterator<Item = &'a (String, Vec<(EpochId, Value)>)>,
-) -> Vec<String> {
-    let mut keys: Vec<String> = props.map(|(k, _)| k.clone()).collect();
-    keys.sort();
-    keys.dedup();
-    keys
+struct PropertyColumnBuilder {
+    key: String,
+    key_index: u32,
+    entry_count: usize,
+    data: Vec<u8>,
 }
 
-/// Writes a property column for node properties.
-///
-/// Format: [entry_count:u32] for each entry [entity_id:u64][version_count:u16]
-///         for each version [epoch:u64][encoded_value]
-fn write_property_column<'a>(
-    key: &str,
-    nodes: impl Iterator<Item = &'a BlockNode>,
-    strings: &mut StringTableBuilder,
-    _is_node: bool,
-) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut entries: Vec<(u64, &[(EpochId, Value)])> = Vec::new();
-
-    for node in nodes {
-        for (k, versions) in &node.properties {
-            if k == key && !versions.is_empty() {
-                entries.push((node.id.as_u64(), versions));
-            }
+impl PropertyColumnBuilder {
+    fn new(key: String, key_index: u32) -> Self {
+        Self {
+            key,
+            key_index,
+            entry_count: 0,
+            data: vec![0; std::mem::size_of::<u32>()],
         }
     }
 
-    // reason: property column entry counts fit u32/u16 within a section
-    #[allow(clippy::cast_possible_truncation)]
-    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (entity_id, versions) in &entries {
-        buf.extend_from_slice(&entity_id.to_le_bytes());
+    fn append(
+        &mut self,
+        entity_id: u64,
+        versions: &[(EpochId, Value)],
+        strings: &mut StringTableBuilder,
+    ) {
+        self.entry_count += 1;
+        self.data.extend_from_slice(&entity_id.to_le_bytes());
         // reason: version count per entity is bounded, fits u16
         #[allow(clippy::cast_possible_truncation)]
-        buf.extend_from_slice(&(versions.len() as u16).to_le_bytes());
-        for (epoch, value) in *versions {
-            buf.extend_from_slice(&epoch.as_u64().to_le_bytes());
-            encode_value(value, strings, &mut buf);
+        self.data
+            .extend_from_slice(&(versions.len() as u16).to_le_bytes());
+        for (epoch, value) in versions {
+            self.data.extend_from_slice(&epoch.as_u64().to_le_bytes());
+            encode_value(value, strings, &mut self.data);
         }
     }
 
-    buf
+    fn finish(mut self) -> Vec<u8> {
+        // reason: property column entry counts fit u32 within a section
+        #[allow(clippy::cast_possible_truncation)]
+        let entry_count = self.entry_count as u32;
+        self.data[..std::mem::size_of::<u32>()].copy_from_slice(&entry_count.to_le_bytes());
+        self.data
+    }
 }
 
-/// Writes a property column for edge properties.
-fn write_property_column_edges<'a>(
-    key: &str,
-    edges: impl Iterator<Item = &'a BlockEdge>,
+fn property_column_builders(
+    keys: std::collections::BTreeSet<String>,
     strings: &mut StringTableBuilder,
-) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut entries: Vec<(u64, &[(EpochId, Value)])> = Vec::new();
+) -> Vec<PropertyColumnBuilder> {
+    keys.into_iter()
+        .map(|key| {
+            let key_index = strings.intern(&key);
+            PropertyColumnBuilder::new(key, key_index)
+        })
+        .collect()
+}
 
-    for edge in edges {
-        for (k, versions) in &edge.properties {
-            if k == key && !versions.is_empty() {
-                entries.push((edge.id.as_u64(), versions));
-            }
+fn append_entity_properties(
+    entity_id: u64,
+    properties: &[(String, Vec<(EpochId, Value)>)],
+    columns: &mut [PropertyColumnBuilder],
+    strings: &mut StringTableBuilder,
+) {
+    for (key, versions) in properties {
+        if versions.is_empty() {
+            continue;
+        }
+        if let Ok(index) = columns.binary_search_by(|column| column.key.as_str().cmp(key)) {
+            columns[index].append(entity_id, versions, strings);
         }
     }
-
-    // reason: property column entry counts fit u32/u16 within a section
-    #[allow(clippy::cast_possible_truncation)]
-    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (entity_id, versions) in &entries {
-        buf.extend_from_slice(&entity_id.to_le_bytes());
-        // reason: version count per entity is bounded, fits u16
-        #[allow(clippy::cast_possible_truncation)]
-        buf.extend_from_slice(&(versions.len() as u16).to_le_bytes());
-        for (epoch, value) in *versions {
-            buf.extend_from_slice(&epoch.as_u64().to_le_bytes());
-            encode_value(value, strings, &mut buf);
-        }
-    }
-
-    buf
 }
 
 // ── Reader ─────────────────────────────────────────────────────────
