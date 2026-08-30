@@ -447,6 +447,13 @@ impl WalManager {
         // Optionally truncate old logs
         self.truncate_old_logs()?;
 
+        // Rotate so post-checkpoint records land in a fresh segment. Without
+        // this, history written after the checkpoint shares the checkpoint's
+        // own segment number, and segment-granular replay-debt checks
+        // (`checkpoint.log_sequence >= newest segment`) silently treat that
+        // history as covered, replaying it on every subsequent open.
+        self.rotate()?;
+
         Ok(())
     }
 
