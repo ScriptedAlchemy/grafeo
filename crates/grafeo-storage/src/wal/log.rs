@@ -5,6 +5,7 @@ use grafeo_common::types::{EpochId, TransactionId};
 use grafeo_common::utils::error::{Error, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -201,10 +202,23 @@ impl WalManager {
     ///
     /// Returns an error if the record cannot be written.
     pub fn log(&self, record: &WalRecord) -> Result<()> {
-        let data = bincode::serde::encode_to_vec(record, bincode::config::standard())
+        // One serialize buffer per thread; a fresh growing Vec per record is
+        // a measurable share of write-path allocation traffic.
+        thread_local! {
+            static ENCODE_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        }
+        ENCODE_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            bincode::serde::encode_into_std_write(
+                record,
+                &mut *buf,
+                bincode::config::standard(),
+            )
             .map_err(|e| Error::Serialization(e.to_string()))?;
-        let force_sync = matches!(record, WalRecord::TransactionCommit { .. });
-        self.write_frame(&data, force_sync)
+            let force_sync = matches!(record, WalRecord::TransactionCommit { .. });
+            self.write_frame(&buf, force_sync)
+        })
     }
 
     /// Writes a pre-serialized frame to the active WAL log.
