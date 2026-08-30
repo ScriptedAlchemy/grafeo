@@ -314,6 +314,19 @@ impl<Id: EntityId> PropertyStorage<Id> {
         result
     }
 
+    /// Visits every current property of an entity without building a map.
+    ///
+    /// The visit order is the column map's iteration order; callers that
+    /// need a deterministic order must sort what they collect.
+    pub fn for_each(&self, id: Id, mut visit: impl FnMut(&PropertyKey, Value)) {
+        let columns = self.columns.read();
+        for (key, col) in columns.iter() {
+            if let Some(value) = col.get(id) {
+                visit(key, value);
+            }
+        }
+    }
+
     /// Gets property values for multiple entities in a single lock acquisition.
     ///
     /// More efficient than calling [`Self::get`] in a loop because it acquires

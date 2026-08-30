@@ -24,6 +24,50 @@ impl LpgStore {
         Some(edge)
     }
 
+    /// Returns the edge's endpoints and shared type name if it is visible at
+    /// the current epoch. Cheaper than [`Self::get_edge`]: no property map is
+    /// materialized.
+    #[must_use]
+    #[cfg(not(feature = "tiered-storage"))]
+    pub fn edge_header(&self, id: EdgeId) -> Option<(NodeId, NodeId, ArcStr)> {
+        let record = {
+            let edges = self.edges.read();
+            let chain = edges.get(&id)?;
+            let record = chain.visible_at(self.current_epoch())?;
+            if record.is_deleted() {
+                return None;
+            }
+            *record
+        };
+        let edge_type = {
+            let id_to_type = self.id_to_edge_type.read();
+            id_to_type.get(record.type_id as usize)?.clone()
+        };
+        Some((record.src, record.dst, edge_type))
+    }
+
+    /// Returns the edge's endpoints and shared type name if it is visible at
+    /// the current epoch. (Tiered storage version)
+    #[must_use]
+    #[cfg(feature = "tiered-storage")]
+    pub fn edge_header(&self, id: EdgeId) -> Option<(NodeId, NodeId, ArcStr)> {
+        let record = {
+            let versions = self.edge_versions.read();
+            let index = versions.get(&id)?;
+            let version_ref = index.visible_at(self.current_epoch())?;
+            let record = self.read_edge_record(&version_ref)?;
+            if record.is_deleted() {
+                return None;
+            }
+            record
+        };
+        let edge_type = {
+            let id_to_type = self.id_to_edge_type.read();
+            id_to_type.get(record.type_id as usize)?.clone()
+        };
+        Some((record.src, record.dst, edge_type))
+    }
+
     /// Builds an `Edge` with properties as they were at a specific epoch.
     #[cfg(feature = "temporal")]
     fn build_edge_at(&self, id: EdgeId, record: &EdgeRecord, epoch: EpochId) -> Option<Edge> {

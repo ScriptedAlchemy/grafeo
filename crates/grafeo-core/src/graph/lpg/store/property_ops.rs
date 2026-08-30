@@ -10,22 +10,26 @@ use std::sync::atomic::Ordering;
 
 impl LpgStore {
     /// Sets a property on a node.
-    #[cfg(not(feature = "tiered-storage"))]
     pub fn set_node_property(&self, id: NodeId, key: &str, value: Value) {
-        let prop_key: PropertyKey = key.into();
+        self.set_node_property_prekeyed(id, key.into(), value);
+    }
 
+    /// Sets a property on a node from an already-interned key, avoiding the
+    /// per-call key copy that the `&str` entry point makes.
+    #[cfg(not(feature = "tiered-storage"))]
+    pub fn set_node_property_prekeyed(&self, id: NodeId, key: PropertyKey, value: Value) {
         // Update property index before setting the property (needs to read old value)
-        self.update_property_index_on_set(id, &prop_key, &value);
+        self.update_property_index_on_set(id, &key, &value);
 
         // Sync text index if applicable
         #[cfg(feature = "text-index")]
-        self.update_text_index_on_set(id, key, &value);
+        self.update_text_index_on_set(id, key.as_str(), &value);
 
         #[cfg(not(feature = "temporal"))]
-        let inserted = self.node_properties.set(id, prop_key, value);
+        let inserted = self.node_properties.set(id, key, value);
         #[cfg(feature = "temporal")]
         self.node_properties
-            .set(id, prop_key, value, self.current_epoch());
+            .set(id, key, value, self.current_epoch());
 
         // Update props_count in record
         #[cfg(not(feature = "temporal"))]
@@ -39,33 +43,50 @@ impl LpgStore {
         }
     }
 
-    /// Sets a property on a node.
+    /// Sets a property on a node from an already-interned key.
     /// (Tiered storage version: properties stored separately, record is immutable)
     #[cfg(feature = "tiered-storage")]
-    pub fn set_node_property(&self, id: NodeId, key: &str, value: Value) {
-        let prop_key: PropertyKey = key.into();
-
+    pub fn set_node_property_prekeyed(&self, id: NodeId, key: PropertyKey, value: Value) {
         // Update property index before setting the property (needs to read old value)
-        self.update_property_index_on_set(id, &prop_key, &value);
+        self.update_property_index_on_set(id, &key, &value);
 
         // Sync text index if applicable
         #[cfg(feature = "text-index")]
-        self.update_text_index_on_set(id, key, &value);
+        self.update_text_index_on_set(id, key.as_str(), &value);
 
         #[cfg(not(feature = "temporal"))]
-        self.node_properties.set(id, prop_key, value);
+        self.node_properties.set(id, key, value);
         #[cfg(feature = "temporal")]
         self.node_properties
-            .set(id, prop_key, value, self.current_epoch());
+            .set(id, key, value, self.current_epoch());
     }
 
     /// Sets a property on an edge.
     pub fn set_edge_property(&self, id: EdgeId, key: &str, value: Value) {
+        self.set_edge_property_prekeyed(id, key.into(), value);
+    }
+
+    /// Sets a property on an edge from an already-interned key.
+    pub fn set_edge_property_prekeyed(&self, id: EdgeId, key: PropertyKey, value: Value) {
         #[cfg(not(feature = "temporal"))]
-        self.edge_properties.set(id, key.into(), value);
+        self.edge_properties.set(id, key, value);
         #[cfg(feature = "temporal")]
         self.edge_properties
-            .set(id, key.into(), value, self.current_epoch());
+            .set(id, key, value, self.current_epoch());
+    }
+
+    /// Visits every current property of a node without building a map.
+    ///
+    /// Iteration order is unspecified; callers needing determinism must sort.
+    pub fn for_each_node_property(&self, id: NodeId, visit: impl FnMut(&PropertyKey, Value)) {
+        self.node_properties.for_each(id, visit);
+    }
+
+    /// Visits every current property of an edge without building a map.
+    ///
+    /// Iteration order is unspecified; callers needing determinism must sort.
+    pub fn for_each_edge_property(&self, id: EdgeId, visit: impl FnMut(&PropertyKey, Value)) {
+        self.edge_properties.for_each(id, visit);
     }
 
     /// Sets a node property at a specific epoch (for snapshot/WAL recovery).
