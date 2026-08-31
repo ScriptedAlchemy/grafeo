@@ -50,7 +50,10 @@ fn main() {
                                 format!("crates/example/src/module_{i}/file.rs").into(),
                             ),
                         ),
-                        ("sequence", Value::Int64(i as i64)),
+                        (
+                            "sequence",
+                            Value::Int64(i64::try_from(i).expect("probe sizes fit i64")),
+                        ),
                         (
                             "payload",
                             Value::String("x".repeat(96).into()),
@@ -70,7 +73,10 @@ fn main() {
                     "RELATES",
                     [
                         ("key", Value::String(format!("relation:{batch}:{i}").into())),
-                        ("ordinal", Value::Int64(i as i64)),
+                        (
+                            "ordinal",
+                            Value::Int64(i64::try_from(i).expect("probe sizes fit i64")),
+                        ),
                     ],
                 )
                 .expect("create edge");

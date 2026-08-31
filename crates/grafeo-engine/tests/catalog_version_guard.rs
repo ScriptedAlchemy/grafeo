@@ -74,9 +74,8 @@ fn store_with_foreign_catalog_version_fails_typed_not_crc() {
         manager.close().unwrap();
     }
 
-    let err = match GrafeoDB::open(&victim) {
-        Ok(_) => panic!("foreign catalog version must fail open"),
-        Err(err) => err,
+    let Err(err) = GrafeoDB::open(&victim) else {
+        panic!("foreign catalog version must fail open")
     };
     let msg = err.to_string();
     assert!(
@@ -106,9 +105,8 @@ fn corrupted_current_version_store_still_reports_crc_mismatch() {
         file.sync_all().unwrap();
     }
 
-    let err = match GrafeoDB::open(&path) {
-        Ok(_) => panic!("corrupted catalog bytes must fail open"),
-        Err(err) => err,
+    let Err(err) = GrafeoDB::open(&path) else {
+        panic!("corrupted catalog bytes must fail open")
     };
     let msg = err.to_string();
     assert!(

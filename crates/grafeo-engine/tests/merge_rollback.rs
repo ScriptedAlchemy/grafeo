@@ -122,6 +122,7 @@ fn test_merge_relationship_create_rolled_back_does_not_orphan_edge() {
     );
 }
 
+#[cfg(feature = "cypher")]
 #[test]
 fn test_merge_two_phase_on_create_failure_rolls_back_node() {
     // When a UNIQUE constraint conflict on an ON CREATE expression
