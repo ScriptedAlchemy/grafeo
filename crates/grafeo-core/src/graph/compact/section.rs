@@ -24,9 +24,25 @@ use crate::statistics::{EdgeTypeStatistics, LabelStatistics, Statistics};
 /// Magic bytes identifying a CompactStore section.
 const MAGIC: [u8; 4] = *b"GCST";
 
-/// Current section format version. Phase 2c bumped this from 2 to 3 to
-/// embed per-block zone maps in the column index for skip pruning.
-const FORMAT_VERSION: u8 = 3;
+/// Current section format version. v4 versions the dictionary-entry
+/// mapping (`dict_value`): in a v4 section, a dictionary entry beginning
+/// with the marker prefix is a typed payload — a `Value::Bytes` hex body
+/// or an escaped string — never a raw user string. The column byte
+/// layout is identical to v3.
+const FORMAT_VERSION: u8 = 4;
+
+/// First version whose dictionaries use the marked-entry mapping.
+///
+/// Older sections stored every dictionary entry as a raw string, so a
+/// legacy entry colliding with the marker prefix must not be trusted as
+/// a marker: the reader escapes it at load instead
+/// ([`ColumnCodec::escape_legacy_dict_markers`]).
+const DICT_MARKERS_SINCE_VERSION: u8 = 4;
+
+/// v3 (Phase 2c) layout: per-block zone maps in the column index for
+/// skip pruning. Same column layout as v4, pre-marker dictionaries.
+/// Files written by published 0.5.42 carry this byte.
+const FORMAT_VERSION_V3: u8 = 3;
 
 /// v2 (Phase 2b) layout: per-block index + bodies, no per-block stats.
 /// Retained as a read-only compat path for one release.
@@ -34,7 +50,7 @@ const FORMAT_VERSION_V2: u8 = 2;
 
 /// v1 layout: flat columns, no blocks. Retained as a read-only compat
 /// path for one release. Files written by 0.5.41 and earlier carry
-/// this byte; 0.5.42+ writers always emit [`FORMAT_VERSION`].
+/// this byte.
 const FORMAT_VERSION_V1: u8 = 1;
 
 /// Wraps a [`CompactStore`] as a container [`Section`].
@@ -102,8 +118,12 @@ impl CompactStoreSection {
     ///
     /// The default [`Section::serialize`] always writes [`FORMAT_VERSION`].
     /// This entry point is kept (test-only outside this crate) so the
-    /// v1 compat reader can be exercised without keeping any externally
-    /// committed v1 fixtures.
+    /// legacy compat readers can be exercised without keeping any
+    /// externally committed fixtures. Legacy versions predate the marked
+    /// dictionary-entry mapping, so a store whose Dict columns carry
+    /// marked entries (any `Value::Bytes` property) is not meaningfully
+    /// representable below [`DICT_MARKERS_SINCE_VERSION`]: the reader
+    /// will escape those entries back into raw strings.
     pub(crate) fn serialize_with_version(
         &self,
         version: u8,
@@ -286,9 +306,11 @@ fn drain_chunk(
 ///
 /// - v1 = flat columns (legacy)
 /// - v2 = per-block index + concatenated bodies, no stats
-/// - v3 = v2 layout + inline per-block zone map per index entry
+/// - v3+ = v2 layout + inline per-block zone map per index entry (v4
+///   shares the byte layout and differs only in dictionary-entry
+///   semantics, marked by the header version byte)
 ///
-/// `block_stats_hint` is consulted only at v3; when `None` or with a
+/// `block_stats_hint` is consulted only at v3+; when `None` or with a
 /// mismatched length, [`ColumnCodec::write_to_v3`] computes the stats
 /// from the column itself.
 fn write_codec(
@@ -349,29 +371,38 @@ impl Section for CompactStoreSection {
 
 /// Reads a single column codec body, dispatching by section version.
 ///
+/// Dictionaries read from sections older than
+/// [`DICT_MARKERS_SINCE_VERSION`] are normalized on the way in: their
+/// entries are raw strings, so any entry colliding with the marker prefix
+/// is escaped before the always-on marker decoding can retype it.
+///
 /// - v1 → [`ColumnCodec::read_from`] (flat layout, no per-block stats)
 /// - v2 → [`ColumnCodec::read_from_v2`] (block index, no stats)
-/// - v3 → [`ColumnCodec::read_from_v3`] (block index + per-block stats)
+/// - v3/v4 → [`ColumnCodec::read_from_v3`] (block index + per-block stats)
 ///
 /// Returns the codec and an `Option<Vec<ZoneMap>>` carrying per-block
-/// stats when the v3 path was taken.
+/// stats when the v3/v4 path was taken.
 fn read_codec(
     data: &Bytes,
     pos: &mut usize,
     version: u8,
 ) -> Result<(ColumnCodec, Option<Vec<ZoneMap>>), String> {
-    match version {
+    let (mut codec, stats) = match version {
         FORMAT_VERSION_V1 => ColumnCodec::read_from(data, pos)
             .map(|c| (c, None))
-            .map_err(|e| e.to_string()),
+            .map_err(|e| e.to_string())?,
         FORMAT_VERSION_V2 => ColumnCodec::read_from_v2(data, pos)
             .map(|c| (c, None))
-            .map_err(|e| e.to_string()),
-        FORMAT_VERSION => ColumnCodec::read_from_v3(data, pos)
+            .map_err(|e| e.to_string())?,
+        FORMAT_VERSION_V3 | FORMAT_VERSION => ColumnCodec::read_from_v3(data, pos)
             .map(|(c, stats)| (c, Some(stats)))
-            .map_err(|e| e.to_string()),
-        _ => Err(format!("unsupported CompactStore version {version}")),
+            .map_err(|e| e.to_string())?,
+        _ => return Err(format!("unsupported CompactStore version {version}")),
+    };
+    if version < DICT_MARKERS_SINCE_VERSION {
+        codec.escape_legacy_dict_markers();
     }
+    Ok((codec, stats))
 }
 
 fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, String> {
@@ -404,9 +435,12 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
     pos += 4;
     let version = data[pos];
     pos += 1;
-    if version != FORMAT_VERSION && version != FORMAT_VERSION_V2 && version != FORMAT_VERSION_V1 {
+    if !matches!(
+        version,
+        FORMAT_VERSION | FORMAT_VERSION_V3 | FORMAT_VERSION_V2 | FORMAT_VERSION_V1
+    ) {
         return Err(format!(
-            "unsupported CompactStore section version {version} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION})"
+            "unsupported CompactStore section version {version} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION_V3}, {FORMAT_VERSION})"
         ));
     }
     let flags = data[pos];
@@ -836,7 +870,12 @@ mod tests {
         let section =
             CompactStoreSection::new(Arc::new(from_graph_store_preserving_ids(&store).unwrap()));
 
-        for version in [FORMAT_VERSION_V1, FORMAT_VERSION_V2, FORMAT_VERSION] {
+        for version in [
+            FORMAT_VERSION_V1,
+            FORMAT_VERSION_V2,
+            FORMAT_VERSION_V3,
+            FORMAT_VERSION,
+        ] {
             let via_vec = section.serialize_with_version(version).unwrap();
             let mut via_sink = Vec::new();
             section
@@ -847,6 +886,73 @@ mod tests {
                 "version {version}: sink and Vec bytes must be identical"
             );
         }
+    }
+
+    /// A pre-v4 dictionary stores every entry as a raw string, including
+    /// one that collides with the v4 marker prefix. Loading such a
+    /// section must hand back exactly the original string — never retype
+    /// it as a `Value::Bytes` payload — and equality lookups (which
+    /// encode the query through the marker-aware path) must keep finding
+    /// the row.
+    #[test]
+    fn legacy_marker_colliding_string_survives_reopen() {
+        // Same byte length as the raw colliding string, so it can be
+        // spliced over in the serialized section. The builder would
+        // escape the colliding string at build time (that is v4
+        // behavior), so a faithful legacy fixture has to be forged in
+        // the serialized bytes, the way a pre-marker writer laid it out.
+        let placeholder = "Xgfo1:b:00";
+        let tricky = "\u{0}gfo1:b:00";
+        assert_eq!(placeholder.len(), tricky.len());
+
+        let store = LpgStore::new().unwrap();
+        let id = store.create_node(&["Item"]);
+        store.set_node_property(id, "s", Value::from(placeholder));
+
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let section = CompactStoreSection::new(Arc::new(compact));
+        let mut bytes = section
+            .serialize_with_version(FORMAT_VERSION_V3)
+            .expect("serialize legacy section");
+
+        // The string is stored in several places — the dictionary entry and
+        // the zone-map min/max copies — and a legacy writer would have the
+        // raw form in all of them.
+        let mut search_from = 0;
+        let mut replaced = 0;
+        while let Some(found) = bytes[search_from..]
+            .windows(placeholder.len())
+            .position(|w| w == placeholder.as_bytes())
+        {
+            let at = search_from + found;
+            bytes[at..at + tricky.len()].copy_from_slice(tricky.as_bytes());
+            search_from = at + tricky.len();
+            replaced += 1;
+        }
+        assert!(
+            replaced >= 1,
+            "placeholder entry not found in serialized section"
+        );
+        let crc_pos = bytes.len() - 4;
+        let crc = crc32fast::hash(&bytes[..crc_pos]);
+        bytes[crc_pos..].copy_from_slice(&crc.to_le_bytes());
+
+        let mut section2 = CompactStoreSection::empty();
+        section2.deserialize(&bytes).expect("deserialize legacy");
+        let restored = section2.store().unwrap();
+
+        assert_eq!(
+            restored.get_node_property(id, &PropertyKey::new("s")),
+            Some(Value::from(tricky)),
+            "legacy raw string was retyped instead of escaped"
+        );
+        assert_eq!(
+            restored
+                .find_nodes_by_property("s", &Value::from(tricky))
+                .len(),
+            1,
+            "equality lookup lost the legacy raw string"
+        );
     }
 
     #[test]

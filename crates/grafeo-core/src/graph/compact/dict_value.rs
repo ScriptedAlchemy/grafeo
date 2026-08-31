@@ -7,14 +7,20 @@
 //! by real applications carry serialized byte payloads on most nodes, so the
 //! `Dict` fallback must round-trip them exactly.
 //!
-//! The mapping stays inside the existing string dictionary, so **no section
-//! format change is needed**: a `Value::Bytes` entry is stored as a marked
-//! hex string, and a genuine string that happens to begin with the marker
-//! prefix is escaped with a second marker. The marker begins with a NUL byte,
-//! which no meaningful user string starts with, so in practice escaping never
-//! fires — but the escape keeps the mapping bijective rather than merely
-//! unlikely to collide. Stores written before this change contain no marked
-//! entries and decode exactly as before.
+//! The mapping stays inside the existing string dictionary: a `Value::Bytes`
+//! entry is stored as a marked hex string, and a genuine string that happens
+//! to begin with the marker prefix is escaped with a second marker. The
+//! marker begins with a NUL byte, which no meaningful user string starts
+//! with, so in practice escaping never fires — but the escape keeps the
+//! mapping bijective rather than merely unlikely to collide.
+//!
+//! Whether a dictionary entry *is* marked is decided by the section format
+//! version, not by the entry bytes alone: sections older than the marker
+//! format stored every entry as a raw string, so a legacy entry that
+//! collides with the marker prefix must not be reinterpreted as a payload.
+//! The section loader normalizes such entries through
+//! [`escape_legacy_entry`] before the store serves them, after which the
+//! always-on decoding below is unambiguous for every store in memory.
 
 use arcstr::ArcStr;
 use std::sync::Arc;
@@ -73,12 +79,27 @@ pub(crate) fn encode_dict_entry(value: &Value) -> String {
     }
 }
 
+/// Escapes a raw legacy dictionary entry that collides with the marker
+/// prefix.
+///
+/// Sections written before the marker mapping stored every entry as a raw
+/// string. Rewriting a colliding entry into the escape form makes
+/// [`decode_dict_entry`] return exactly the original string, and keeps
+/// equality lookups — which encode the query through
+/// [`encode_dict_entry`] — finding it. Returns `None` for the entire
+/// population of realistic entries, which do not begin with a NUL byte.
+pub(crate) fn escape_legacy_entry(entry: &str) -> Option<String> {
+    entry
+        .starts_with(DICT_MARKER_PREFIX)
+        .then(|| format!("{DICT_STRING_ESCAPE_MARKER}{entry}"))
+}
+
 /// Decodes one dictionary entry back into the `Value` it encodes.
 ///
-/// Unmarked entries — the entire population of stores written before the
-/// marker existed — decode as strings exactly as before. A marked entry that
-/// fails its own decoding (impossible for entries this module wrote) is
-/// returned as the literal string rather than dropped.
+/// Unmarked entries decode as strings exactly as before the marker
+/// existed. A marked entry that fails its own decoding (impossible for
+/// entries this module wrote) is returned as the literal string rather
+/// than dropped.
 pub(crate) fn decode_dict_entry(entry: &str) -> Value {
     if let Some(hex) = entry.strip_prefix(DICT_BYTES_MARKER) {
         if let Some(bytes) = decode_hex(hex) {
@@ -134,5 +155,25 @@ mod tests {
             decode_dict_entry(&entry),
             Value::String(ArcStr::from(entry.as_str()))
         );
+    }
+
+    #[test]
+    fn legacy_colliding_entry_escapes_to_the_original_string() {
+        let raw = format!("{DICT_BYTES_MARKER}00");
+        let escaped = escape_legacy_entry(&raw).expect("colliding entry must escape");
+        // Decoding hands back the raw legacy string, not a Bytes payload.
+        assert_eq!(
+            decode_dict_entry(&escaped),
+            Value::String(ArcStr::from(raw.as_str()))
+        );
+        // The escaped form is exactly what the current encoder produces for
+        // that string, so equality lookups keep finding the row.
+        assert_eq!(
+            escaped,
+            encode_dict_entry(&Value::String(ArcStr::from(raw.as_str())))
+        );
+
+        assert_eq!(escape_legacy_entry("plain"), None);
+        assert_eq!(escape_legacy_entry(""), None);
     }
 }

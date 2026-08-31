@@ -898,6 +898,22 @@ impl ColumnCodec {
         }
     }
 
+    /// Escapes dictionary entries that predate the marked-entry mapping.
+    ///
+    /// Sections older than the marker format (`dict_value`) stored every
+    /// dictionary entry as a raw string, so an entry that collides with the
+    /// marker prefix would otherwise be misread as a typed payload — and an
+    /// equality query for the same string, encoded through the marker-aware
+    /// path, would no longer find it. The section loader calls this once per
+    /// legacy column; codes, nulls, and non-colliding entries are untouched,
+    /// and realistic dictionaries (no entry starts with a NUL byte) are not
+    /// even reallocated.
+    pub(crate) fn escape_legacy_dict_markers(&mut self) {
+        if let Self::Dict(dict) = self {
+            dict.remap_entries(super::dict_value::escape_legacy_entry);
+        }
+    }
+
     /// Deserializes a codec from a byte buffer at the given offset.
     ///
     /// Returns the decoded codec and advances `pos` past the consumed bytes.
