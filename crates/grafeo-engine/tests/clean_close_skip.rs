@@ -195,6 +195,58 @@ fn close_after_vector_index_build_still_checkpoints() {
 }
 
 #[test]
+fn close_after_direct_store_mutation_still_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_store(dir.path());
+    let baseline = header_iteration(&path);
+
+    // A property rewrite through the raw store handle bypasses the WAL and
+    // is count-neutral: no record, no epoch bump, no row-count change. Only
+    // the vended-handle signal can force the checkpoint that saves it.
+    let db = open_db(&path);
+    let store = db.store();
+    let id = store.node_ids()[0];
+    store.set_node_property(id, "title", "rewritten-behind-the-wal".into());
+    db.close().expect("close after direct mutation");
+
+    assert!(
+        header_iteration(&path) > baseline,
+        "a WAL-bypassing direct-store mutation must force a checkpoint on close"
+    );
+
+    let db = open_db(&path);
+    let result = db
+        .execute("MATCH (d:Doc {title: 'rewritten-behind-the-wal'}) RETURN count(d) AS total")
+        .unwrap();
+    assert_eq!(
+        result.scalar::<i64>().unwrap(),
+        1,
+        "the direct-store mutation was lost by a skipped close checkpoint"
+    );
+    db.close().expect("close after verification");
+}
+
+#[test]
+fn close_after_vending_a_store_handle_checkpoints_conservatively() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_store(dir.path());
+    let baseline = header_iteration(&path);
+
+    // The engine cannot see whether the caller wrote through the escaped
+    // handle, so vending one at all disqualifies the skip. (A store-level
+    // mutation generation could refine this; until it exists, conservatism
+    // is the contract.)
+    let db = open_db(&path);
+    let _count = db.store().node_count();
+    db.close().expect("close after read-only handle use");
+
+    assert!(
+        header_iteration(&path) > baseline,
+        "an escaped write-capable handle must disqualify the close-skip"
+    );
+}
+
+#[test]
 fn close_after_named_graph_management_still_checkpoints() {
     let dir = tempfile::tempdir().unwrap();
     let path = seeded_store(dir.path());

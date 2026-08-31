@@ -153,6 +153,16 @@ pub struct GrafeoDB {
     /// create/drop). Cleared by a successful full checkpoint. `close()`
     /// consults this before treating the container as already current.
     container_stale: std::sync::atomic::AtomicBool,
+    /// Set once a caller obtains an interface that can mutate the built-in
+    /// store behind the database's back: [`store()`](Self::store) hands out
+    /// the concrete `LpgStore`, [`graph_store_mut()`](Self::graph_store_mut)
+    /// the mutable trait object. Writes through either bypass the WAL and
+    /// `container_stale`, and a count-neutral one (a property or label
+    /// update) moves no epoch or row-count watermark, so no other signal
+    /// records it. Never cleared: a checkpoint proves the container caught
+    /// up at that instant, not that the escaped handle stopped writing, so
+    /// `close()` keeps checkpointing for the rest of this database's life.
+    store_handle_vended: std::sync::atomic::AtomicBool,
     /// Shared registry of spilled vector storages.
     /// Used by the search path to create `SpillableVectorAccessor` instances.
     #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
@@ -692,6 +702,7 @@ impl GrafeoDB {
             #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
             checkpoint_timer: parking_lot::Mutex::new(None),
             container_stale: std::sync::atomic::AtomicBool::new(sidecar_wal_replayed),
+            store_handle_vended: std::sync::atomic::AtomicBool::new(false),
             #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
             vector_spill_storages: None,
             external_read_store: None,
@@ -852,6 +863,7 @@ impl GrafeoDB {
             checkpoint_timer: parking_lot::Mutex::new(None),
             // External stores have no container; fail closed if ever read.
             container_stale: std::sync::atomic::AtomicBool::new(true),
+            store_handle_vended: std::sync::atomic::AtomicBool::new(false),
             #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
             vector_spill_storages: None,
             external_read_store: Some(Arc::clone(&store) as Arc<dyn GraphStoreSearch>),
@@ -947,6 +959,7 @@ impl GrafeoDB {
             checkpoint_timer: parking_lot::Mutex::new(None),
             // External stores have no container; fail closed if ever read.
             container_stale: std::sync::atomic::AtomicBool::new(true),
+            store_handle_vended: std::sync::atomic::AtomicBool::new(false),
             #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
             vector_spill_storages: None,
             external_read_store: Some(store),
@@ -2313,9 +2326,15 @@ impl GrafeoDB {
     ///
     /// For code that only needs read/write graph operations, prefer
     /// [`graph_store()`](Self::graph_store) which returns the trait interface.
+    ///
+    /// Mutations through this handle bypass the WAL, so once it is handed
+    /// out the database stops treating the on-disk container as current and
+    /// `close()` always writes a full checkpoint.
     #[cfg(feature = "lpg")]
     #[must_use]
     pub fn store(&self) -> &Arc<LpgStore> {
+        self.store_handle_vended
+            .store(true, std::sync::atomic::Ordering::Release);
         self.lpg_store()
     }
 
@@ -2456,6 +2475,10 @@ impl GrafeoDB {
     ///
     /// Returns `None` for read-only databases created via
     /// [`with_read_store()`](Self::with_read_store).
+    ///
+    /// Mutations through this handle bypass the WAL, so once it is handed
+    /// out the database stops treating the on-disk container as current and
+    /// `close()` always writes a full checkpoint.
     #[must_use]
     pub fn graph_store_mut(&self) -> Option<Arc<dyn GraphStoreMut>> {
         if self.external_read_store.is_some() {
@@ -2463,6 +2486,8 @@ impl GrafeoDB {
         } else {
             #[cfg(feature = "lpg")]
             {
+                self.store_handle_vended
+                    .store(true, std::sync::atomic::Ordering::Release);
                 Some(Arc::clone(self.lpg_store()) as Arc<dyn GraphStoreMut>)
             }
             #[cfg(not(feature = "lpg"))]
@@ -2602,20 +2627,22 @@ impl GrafeoDB {
                 wal.sync()?;
             }
             // A close needs a checkpoint only when the container is behind
-            // the live state. Three authorities prove it is not: the WAL
+            // the live state. Four authorities prove it is not: the WAL
             // recorded no mutations (none appended in this process, none
             // replayed at open, no WAL-bypassing DB-level mutation flagged
-            // `container_stale`), the store is not in layered/compacted mode,
-            // and the live store still matches the epoch and row-count
-            // watermarks the active header captured at the last checkpoint.
-            // When all hold, every section's bytes in the container are
-            // exactly what a checkpoint would serialize again, and the
-            // unconditional `Explicit` rewrite this replaces was corpus-scale
-            // work — the entire accumulated store re-serialized and
-            // rewritten — to change nothing. Any doubt (WAL disabled,
-            // external store, watermark drift) falls back to the full
-            // checkpoint, and the WAL-records safety valve below still
-            // guards against a skipped write that left records behind.
+            // `container_stale`), no direct-store write handle escaped
+            // (`store()` / `graph_store_mut()` mutations bypass the WAL and,
+            // when count-neutral, every watermark), the store is not in
+            // layered/compacted mode, and the live store still matches the
+            // epoch and row-count watermarks the active header captured at
+            // the last checkpoint. When all hold, every section's bytes in
+            // the container are exactly what a checkpoint would serialize
+            // again, and the unconditional `Explicit` rewrite this replaces
+            // was corpus-scale work — the entire accumulated store
+            // re-serialized and rewritten — to change nothing. Any doubt
+            // (WAL disabled, external store, watermark drift) falls back to
+            // the full checkpoint, and the WAL-records safety valve below
+            // still guards against a skipped write that left records behind.
             #[cfg(all(feature = "wal", feature = "lpg", feature = "compact-store"))]
             let layered = self.layered_store.is_some();
             #[cfg(all(feature = "wal", feature = "lpg", not(feature = "compact-store")))]
@@ -2623,6 +2650,7 @@ impl GrafeoDB {
             #[cfg(all(feature = "wal", feature = "lpg"))]
             let container_is_current = !layered
                 && !self.container_stale.load(Ordering::Acquire)
+                && !self.store_handle_vended.load(Ordering::Acquire)
                 && self
                     .wal
                     .as_ref()
