@@ -615,6 +615,7 @@ impl GraphStore for LayeredStore {
 
     fn neighbors(&self, node: NodeId, direction: Direction) -> Vec<NodeId> {
         let deleted_nodes = self.deleted_from_base_nodes.read();
+        let deleted_edges = self.deleted_from_base_edges.read();
 
         let mut results = Vec::new();
 
@@ -623,9 +624,22 @@ impl GraphStore for LayeredStore {
         // properties but not its adjacency, so the base still holds the
         // only record of edges written before `compact()`.
         if !deleted_nodes.contains(&node) {
-            for nid in self.base.load().neighbors(node, direction) {
-                if !deleted_nodes.contains(&nid) {
-                    results.push(nid);
+            if deleted_edges.is_empty() {
+                for nid in self.base.load().neighbors(node, direction) {
+                    if !deleted_nodes.contains(&nid) {
+                        results.push(nid);
+                    }
+                }
+            } else {
+                // A pre-`compact()` edge deleted afterwards is tombstoned by
+                // id in `deleted_from_base_edges`, and the base adjacency
+                // alone carries no edge ids to check against, so derive the
+                // neighbors from the same filtered edge list `edges_from`
+                // serves.
+                for (target, eid) in self.base.load().edges_from(node, direction) {
+                    if !deleted_nodes.contains(&target) && !deleted_edges.contains(&eid) {
+                        results.push(target);
+                    }
                 }
             }
         }
@@ -2166,6 +2180,62 @@ mod tests {
     }
 
     #[test]
+    fn test_deleted_base_edge_excluded_from_neighbors() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let first = persons[0];
+
+        let edges = layered.edges_from(first, Direction::Outgoing);
+        assert_eq!(edges.len(), 1);
+        let (city, eid) = edges[0];
+
+        assert!(layered.delete_edge(eid));
+
+        // The endpoint node still exists, but no live edge reaches it, so
+        // it must not appear as a neighbor in either direction.
+        assert!(layered.get_node(city).is_some());
+        assert!(
+            !layered.neighbors(first, Direction::Outgoing).contains(&city),
+            "tombstoned base edge must not surface its target in neighbors()"
+        );
+        assert!(
+            !layered.neighbors(city, Direction::Incoming).contains(&first),
+            "tombstoned base edge must not surface its source in neighbors()"
+        );
+    }
+
+    #[test]
+    fn test_promoted_node_deleted_base_edge_excluded_from_neighbors() {
+        // Promote a base node, then delete one of its pre-compaction edges.
+        // The base adjacency is (correctly) still consulted for the promoted
+        // node, so only the edge tombstone can keep the endpoint out.
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let first = persons[0];
+
+        layered.set_node_property(first, "touched", Value::Bool(true));
+
+        let edges = layered.edges_from(first, Direction::Outgoing);
+        assert_eq!(edges.len(), 1);
+        let (city, eid) = edges[0];
+        assert!(layered.delete_edge(eid));
+
+        assert!(
+            !layered.neighbors(first, Direction::Outgoing).contains(&city),
+            "deleted pre-compaction edge of a promoted node must not appear in neighbors()"
+        );
+        assert_eq!(layered.edges_from(first, Direction::Outgoing).len(), 0);
+
+        // A live edge created afterwards restores exactly that neighbor.
+        let replacement = layered.create_edge(first, city, "LIVES_IN");
+        assert!(layered.get_edge(replacement).is_some());
+        assert!(
+            layered.neighbors(first, Direction::Outgoing).contains(&city),
+            "a live overlay edge to the same target must still surface it"
+        );
+    }
+
+    #[test]
     fn test_node_count_reflects_deletions() {
         let layered = build_test_layered();
         assert_eq!(layered.node_count(), 3);
@@ -3001,9 +3071,9 @@ mod tests {
         layered.set_node_property(paris, "name", Value::from("Paris"));
         let _ = layered.create_edge(first, paris, "VISITS");
 
-        // Neighbors should include BOTH the original Amsterdam and the new Paris.
-        // Once the node is dirty, base neighbors are not re-read (ensure_in_overlay
-        // copied them), so both endpoints come from the overlay.
+        // Neighbors should include BOTH the original Amsterdam (still served
+        // by the base adjacency: promotion copies the node, not its edges)
+        // and the new Paris (served by the overlay).
         let outgoing = layered.neighbors(first, Direction::Outgoing);
         assert!(
             outgoing.contains(&paris),
