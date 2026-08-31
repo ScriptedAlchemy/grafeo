@@ -266,6 +266,15 @@ impl<T> VersionChain<T> {
     /// Garbage collects old versions that are no longer visible to any transaction.
     ///
     /// Keeps versions that might still be visible to transactions at or after `min_epoch`.
+    ///
+    /// A pre-`min_epoch` version whose `deleted_epoch` is also strictly below
+    /// `min_epoch` is invisible to every active and future reader (visibility
+    /// requires `deleted_epoch > viewing_epoch`), so it is dropped rather than
+    /// kept as the baseline: retaining it would pin a deleted entity's payload
+    /// for the life of the store. The bound is strict because an uncommitted
+    /// delete carries the deleting transaction's own epoch, which is at least
+    /// `min_epoch` while that transaction is active — a rollback can therefore
+    /// still unmark it, and it is never collected here.
     pub fn gc(&mut self, min_epoch: EpochId) {
         if self.versions.is_empty() {
             return;
@@ -278,9 +287,17 @@ impl<T> VersionChain<T> {
             if version.info.created_epoch.as_u64() >= min_epoch.as_u64() {
                 keep_count = i + 1;
             } else if !found_old_visible {
-                // Keep the first (most recent) old version
+                // The first (most recent) old version is the baseline every
+                // reader at or after `min_epoch` resolves — keep it unless a
+                // settled deletion made it permanently invisible.
                 found_old_visible = true;
-                keep_count = i + 1;
+                let dead = version
+                    .info
+                    .deleted_epoch
+                    .is_some_and(|deleted| deleted.as_u64() < min_epoch.as_u64());
+                if !dead {
+                    keep_count = i + 1;
+                }
             }
         }
 
@@ -1047,6 +1064,40 @@ mod tests {
         assert_eq!(chain.visible_at(EpochId::new(4)), Some(&"v1"));
         assert_eq!(chain.visible_at(EpochId::new(5)), Some(&"v2"));
         assert_eq!(chain.visible_at(EpochId::new(10)), Some(&"v2"));
+    }
+
+    #[test]
+    fn test_gc_drops_a_baseline_deleted_before_the_horizon() {
+        let mut chain = VersionChain::with_initial("v1", EpochId::new(1), TransactionId::new(1));
+        chain.mark_deleted(EpochId::new(2), TransactionId::new(2));
+
+        // No reader at or after epoch 5 can ever see the deleted version;
+        // retaining it as the baseline would pin the payload forever.
+        chain.gc(EpochId::new(5));
+
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn test_gc_keeps_a_baseline_deleted_at_the_horizon() {
+        // A delete carrying the horizon epoch may belong to the oldest
+        // active transaction, which can still roll it back.
+        let mut chain = VersionChain::with_initial("v1", EpochId::new(1), TransactionId::new(1));
+        chain.mark_deleted(EpochId::new(5), TransactionId::new(2));
+
+        chain.gc(EpochId::new(5));
+
+        assert_eq!(chain.version_count(), 1);
+    }
+
+    #[test]
+    fn test_gc_keeps_a_live_baseline() {
+        let mut chain = VersionChain::with_initial("v1", EpochId::new(1), TransactionId::new(1));
+
+        chain.gc(EpochId::new(5));
+
+        assert_eq!(chain.version_count(), 1);
+        assert_eq!(chain.visible_at(EpochId::new(5)), Some(&"v1"));
     }
 
     #[test]
