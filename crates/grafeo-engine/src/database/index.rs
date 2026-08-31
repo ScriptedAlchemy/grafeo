@@ -54,6 +54,17 @@ impl super::GrafeoDB {
     /// Returns `true` if the index existed and was removed.
     pub fn drop_property_index(&self, property: &str) -> bool {
         let removed = self.lpg_store().drop_property_index(property);
+        // After a compaction the property is indexed in both layers: the
+        // overlay copy above, and the compact base's own hash index that
+        // `create_property_index` (or a compacted reopen) enabled. Drop
+        // both, or lookups keep using the base index and
+        // `has_property_index()` keeps reporting it.
+        #[cfg(feature = "compact-store")]
+        let removed = self.layered_store.as_ref().is_some_and(|layered| {
+            layered
+                .base_store_arc()
+                .disable_property_index(&grafeo_common::types::PropertyKey::new(property))
+        }) || removed;
         if removed {
             // Not WAL-logged; the persisted index state is behind.
             self.mark_container_stale();

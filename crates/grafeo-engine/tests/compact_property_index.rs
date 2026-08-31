@@ -163,6 +163,44 @@ fn overlay_rows_are_not_hidden_by_the_base_index() {
     );
 }
 
+/// Dropping an index after a compaction must reach BOTH layers: the
+/// overlay `LpgStore` and the compact base's own hash index. The drop
+/// used to remove only the overlay copy, so the store kept reporting —
+/// and serving — an index the caller had just dropped.
+#[test]
+fn dropping_an_index_reaches_the_compact_base() {
+    let mut db = GrafeoDB::new_in_memory();
+    db.create_property_index("key");
+    {
+        let session = db.session();
+        for i in 0..ROWS {
+            session
+                .create_node_with_props(&["Row"], [("key", Value::from(format!("k-{i}")))])
+                .unwrap();
+        }
+    }
+    db.compact().expect("compact");
+    assert!(
+        db.graph_store().has_property_index("key"),
+        "the compacted base must carry the index before the drop"
+    );
+
+    assert!(
+        db.drop_property_index("key"),
+        "an existing index must report as removed"
+    );
+    assert!(
+        !db.graph_store().has_property_index("key"),
+        "the compact base still owns the index after the drop"
+    );
+    // A second drop has nothing left to remove.
+    assert!(!db.drop_property_index("key"));
+
+    // Lookups fall back to the column scan with identical answers.
+    assert_eq!(lookup(&db, "k-0").len(), 1);
+    assert!(lookup(&db, "k-nope").is_empty());
+}
+
 /// A compacted database used to write no catalog section at all, so
 /// closing one dropped its schema definitions and index names on the
 /// floor. Both must come back.

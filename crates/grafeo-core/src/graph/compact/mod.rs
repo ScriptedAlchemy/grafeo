@@ -373,6 +373,16 @@ impl CompactStore {
         }
     }
 
+    /// Drops the hash index for `key`, returning whether one existed.
+    ///
+    /// The inverse of [`Self::enable_property_indexes`]: the engine calls
+    /// this when an index is dropped after a compaction, so
+    /// `has_property_index` stops reporting the property as indexed and
+    /// lookups fall back to the column scan.
+    pub fn disable_property_index(&self, key: &PropertyKey) -> bool {
+        self.property_value_indexes.write().remove(key).is_some()
+    }
+
     /// Returns the property names currently served from a hash index.
     #[must_use]
     pub fn indexed_property_keys(&self) -> Vec<PropertyKey> {
