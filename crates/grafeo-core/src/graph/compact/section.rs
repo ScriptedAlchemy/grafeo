@@ -808,6 +808,7 @@ mod tests {
     use crate::graph::lpg::LpgStore;
     use crate::graph::traits::GraphStore;
     use grafeo_common::types::Value;
+    use grafeo_common::utils::hash::FxHashSet;
 
     /// Builds a store big enough that the streaming encoder has to drain
     /// its scratch buffer several times, so the chunk boundaries — and
@@ -856,6 +857,93 @@ mod tests {
         let mut restored = CompactStoreSection::empty();
         restored.deserialize(&via_sink).expect("deserialize");
         assert_eq!(restored.store().unwrap().node_count(), 8_192);
+    }
+
+    #[test]
+    fn preserved_edge_ids_keep_native_endpoints_after_reopen() {
+        let source = LpgStore::new().unwrap();
+        let from = source.create_node(&["Entity"]);
+        let lower_target = source.create_node(&["Entity"]);
+        let higher_target = source.create_node(&["Entity"]);
+        let higher_edge = source.create_edge(from, higher_target, "RELATES_TO");
+        let lower_edge = source.create_edge(from, lower_target, "RELATES_TO");
+        source.set_edge_property(higher_edge, "rank", Value::Int64(2));
+        source.set_edge_property(lower_edge, "rank", Value::Int64(1));
+
+        let section =
+            CompactStoreSection::new(Arc::new(from_graph_store_preserving_ids(&source).unwrap()));
+        for version in [
+            FORMAT_VERSION_V1,
+            FORMAT_VERSION_V2,
+            FORMAT_VERSION_V3,
+            FORMAT_VERSION,
+        ] {
+            let bytes = section.serialize_with_version(version).expect("serialize");
+            let mut restored = CompactStoreSection::empty();
+            restored.deserialize(&bytes).expect("deserialize");
+            let compact = restored.store().expect("restored store");
+
+            let higher = compact.get_edge(higher_edge).unwrap();
+            assert_eq!((higher.src, higher.dst), (from, higher_target));
+            assert_eq!(
+                higher.properties.get(&PropertyKey::new("rank")),
+                Some(&Value::Int64(2)),
+            );
+            let lower = compact.get_edge(lower_edge).unwrap();
+            assert_eq!((lower.src, lower.dst), (from, lower_target));
+            assert_eq!(
+                lower.properties.get(&PropertyKey::new("rank")),
+                Some(&Value::Int64(1)),
+            );
+        }
+    }
+
+    #[test]
+    fn generation_scale_reopen_preserves_edge_endpoints_and_traversal() {
+        const SOURCE_COUNT: usize = 7_500;
+        const TARGET_COUNT: usize = 22_500;
+
+        let source = LpgStore::new().unwrap();
+        let sources: Vec<_> = (0..SOURCE_COUNT)
+            .map(|_| source.create_node(&["Source"]))
+            .collect();
+        let targets: Vec<_> = (0..TARGET_COUNT)
+            .map(|_| source.create_node(&["Target"]))
+            .collect();
+        let mut expected_by_source = Vec::with_capacity(SOURCE_COUNT);
+        for (index, &from) in sources.iter().enumerate() {
+            let lower_target = targets[index * 2];
+            let higher_target = targets[index * 2 + 1];
+            let higher_edge = source.create_edge(from, higher_target, "RELATES_TO");
+            let lower_edge = source.create_edge(from, lower_target, "RELATES_TO");
+            expected_by_source.push([(higher_target, higher_edge), (lower_target, lower_edge)]);
+        }
+        assert_eq!(
+            source.node_count() + source.edge_count(),
+            45_000,
+            "fixture must retain the audited generation scale",
+        );
+
+        let section =
+            CompactStoreSection::new(Arc::new(from_graph_store_preserving_ids(&source).unwrap()));
+        let bytes = section.serialize().expect("serialize");
+        let mut restored = CompactStoreSection::empty();
+        restored.deserialize(&bytes).expect("deserialize");
+        let compact = restored.store().expect("restored store");
+
+        for (&from, expected) in sources.iter().zip(&expected_by_source) {
+            for &(target, edge_id) in expected {
+                let edge = compact.get_edge(edge_id).expect("preserved edge resolves");
+                assert_eq!((edge.src, edge.dst), (from, target));
+            }
+        }
+        for (&from, expected) in sources.iter().zip(expected_by_source) {
+            let actual: FxHashSet<_> = compact
+                .edges_from(from, crate::graph::Direction::Outgoing)
+                .into_iter()
+                .collect();
+            assert_eq!(actual, FxHashSet::from_iter(expected));
+        }
     }
 
     /// Byte identity has to hold at every format version the writer can

@@ -1194,8 +1194,9 @@ pub fn from_graph_store_preserving_ids(
         }
     }
 
-    // Sort each group by (src_offset, dst_offset) to match CSR construction order,
-    // then build the edge_id_map from the resulting positions.
+    // Match CompactStoreBuilder's stable source-only sort exactly. Sorting by
+    // destination here would reorder equal-source edges relative to the CSR,
+    // attaching each preserved EdgeId to another edge's native endpoints.
     let num_rel_tables = compact.rel_tables_by_id.len();
     let mut edge_id_map: FxHashMap<grafeo_common::types::EdgeId, (u16, u64)> = FxHashMap::default();
     let mut edge_offset_to_id: Vec<Vec<grafeo_common::types::EdgeId>> =
@@ -1205,8 +1206,7 @@ pub fn from_graph_store_preserving_ids(
         let Some(&rel_table_id) = rel_key_to_id.get(&key) else {
             continue;
         };
-        // Sort by (src_offset, dst_offset) to match CSR order.
-        entries.sort_by_key(|&(_, src, dst)| (src, dst));
+        entries.sort_by_key(|&(_, src, _dst)| src);
 
         let rev = &mut edge_offset_to_id[rel_table_id as usize];
         for (csr_pos, (original_eid, _src, _dst)) in entries.iter().enumerate() {
