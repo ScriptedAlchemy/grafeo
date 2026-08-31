@@ -1109,6 +1109,28 @@ fn append_entity_properties(
 
 // ── Reader ─────────────────────────────────────────────────────────
 
+fn checked_block_range(entry: &BlockDirEntry, data_len: usize) -> Result<std::ops::Range<usize>> {
+    let start = entry.offset as usize;
+    let length = entry.length as usize;
+    let end = start.checked_add(length).ok_or_else(|| {
+        Error::Serialization(format!(
+            "LPG block range overflows the address space: offset {} + length {}",
+            entry.offset, entry.length
+        ))
+    })?;
+    if end > data_len {
+        return Err(Error::Serialization(format!(
+            "LPG block extends past end of data: range {start}..{end}, data length {data_len}"
+        )));
+    }
+    Ok(start..end)
+}
+
+fn checked_block_data<'a>(data: &'a [u8], entry: &BlockDirEntry) -> Result<&'a [u8]> {
+    let range = checked_block_range(entry, data.len())?;
+    Ok(&data[range])
+}
+
 /// Reads block-based LPG section data and populates the store.
 pub(crate) fn read_blocks(
     data: &[u8],
@@ -1150,14 +1172,10 @@ pub(crate) fn read_blocks(
 
     // Verify checksums and extract blocks
     for (i, entry) in dir_entries.iter().enumerate() {
-        let start = entry.offset as usize;
-        let end = start + entry.length as usize;
-        if end > data.len() {
-            return Err(Error::Serialization(format!(
-                "block {i} extends past end of data"
-            )));
-        }
-        let actual_crc = crc32fast::hash(&data[start..end]);
+        let block = checked_block_data(data, entry).map_err(|error| {
+            Error::Serialization(format!("block {i} has an invalid range: {error}"))
+        })?;
+        let actual_crc = crc32fast::hash(block);
         if actual_crc != entry.checksum {
             return Err(Error::Serialization(format!(
                 "block {i} CRC mismatch: expected {:08x}, got {actual_crc:08x}",
@@ -1171,7 +1189,7 @@ pub(crate) fn read_blocks(
         .iter()
         .find(|e| e.block_type == BlockType::StringTable as u8)
         .ok_or_else(|| Error::Serialization("missing string table block".to_string()))?;
-    let st_data = &data[st_entry.offset as usize..(st_entry.offset + st_entry.length) as usize];
+    let st_data = checked_block_data(data, st_entry)?;
     let strings = StringTableReader::new(st_data)
         .ok_or_else(|| Error::Serialization("invalid string table".to_string()))?;
     let strings = ArcStringTable::new(&strings)?;
@@ -1184,7 +1202,7 @@ pub(crate) fn read_blocks(
         .iter()
         .find(|e| e.block_type == BlockType::NodeData as u8)
     {
-        let block = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
+        let block = checked_block_data(data, entry)?;
         let mut pos = 0;
         while pos + 8 <= block.len() {
             let id = NodeId::new(u64::from_le_bytes(block[pos..pos + 8].try_into().unwrap()));
@@ -1205,7 +1223,7 @@ pub(crate) fn read_blocks(
         .iter()
         .find(|e| e.block_type == BlockType::EdgeData as u8)
     {
-        let block = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
+        let block = checked_block_data(data, entry)?;
         let mut pos = 0;
         while pos + 28 <= block.len() {
             let id = EdgeId::new(u64::from_le_bytes(block[pos..pos + 8].try_into().unwrap()));
@@ -1237,7 +1255,7 @@ pub(crate) fn read_blocks(
         .iter()
         .find(|e| e.block_type == BlockType::LabelAssignment as u8)
     {
-        let block = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
+        let block = checked_block_data(data, entry)?;
         let mut pos = 0;
         ensure_remaining(block, pos, 4)?;
         let node_count = u32::from_le_bytes(block[pos..pos + 4].try_into().unwrap()) as usize;
@@ -1278,7 +1296,7 @@ pub(crate) fn read_blocks(
         if entry.block_type != BlockType::PropertyColumn as u8 {
             continue;
         }
-        let block = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
+        let block = checked_block_data(data, entry)?;
         let key_name = strings.get(entry.key_string_index).ok_or_else(|| {
             Error::Serialization(format!(
                 "invalid property key string index {}",
@@ -1327,7 +1345,7 @@ pub(crate) fn read_blocks(
         if entry.block_type != BlockType::NamedGraph as u8 {
             continue;
         }
-        let block = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
+        let block = checked_block_data(data, entry)?;
         let graph_name = strings.get(entry.key_string_index).ok_or_else(|| {
             Error::Serialization(format!(
                 "invalid graph name string index {}",
@@ -1615,7 +1633,7 @@ mod tests {
         let _header = SectionHeader::read_from(&data).unwrap();
         let dir_start = HEADER_SIZE;
         let st_entry = BlockDirEntry::read_from(&data[dir_start..]).unwrap();
-        let st_data = &data[st_entry.offset as usize..(st_entry.offset + st_entry.length) as usize];
+        let st_data = checked_block_data(&data, &st_entry).unwrap();
         let strings = StringTableReader::new(st_data).unwrap();
 
         // "Person" should only appear once in the string table
@@ -1677,6 +1695,24 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("CRC mismatch"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn block_range_accepts_offsets_crossing_the_u32_boundary() {
+        let entry = BlockDirEntry {
+            block_type: BlockType::PropertyColumn as u8,
+            _reserved: [0; 3],
+            offset: u32::MAX - 1,
+            length: 4,
+            checksum: 0,
+            key_string_index: 0,
+            sub_type: 0,
+        };
+
+        let range = checked_block_range(&entry, u32::MAX as usize + 4).unwrap();
+
+        assert_eq!(range.start, u32::MAX as usize - 1);
+        assert_eq!(range.end, u32::MAX as usize + 3);
     }
 
     #[test]
