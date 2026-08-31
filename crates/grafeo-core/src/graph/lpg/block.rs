@@ -34,7 +34,16 @@ use grafeo_common::utils::error::{Error, Result};
 pub const LPG_BLOCK_MAGIC: [u8; 4] = *b"LPGB";
 
 /// Current block format version.
-pub const LPG_BLOCK_VERSION: u8 = 1;
+pub const LPG_BLOCK_VERSION: u8 = 2;
+
+/// First version whose directory entries carry 64-bit offsets and lengths.
+///
+/// Version 1 packed `offset` and `length` as `u32`, so any section larger
+/// than 4 GiB silently truncated on write and produced a structurally
+/// corrupt container (issue observed as an `offset + length` overflow panic
+/// while opening an 8.6 GiB store). Version 2 widens both fields; version 1
+/// sections remain readable.
+const LPG_BLOCK_VERSION_WIDE_OFFSETS: u8 = 2;
 
 // ── Block types ────────────────────────────────────────────────────
 
@@ -83,7 +92,9 @@ pub enum ValueTag {
 
 /// A directory entry describing a single block within the section.
 ///
-/// 24 bytes, packed sequentially after the section header.
+/// Version 2 entries are 32 bytes with 64-bit `offset` and `length`; version 1
+/// entries were 24 bytes with 32-bit fields, which silently truncated once a
+/// section crossed 4 GiB.
 #[derive(Debug, Clone, Copy)]
 pub struct BlockDirEntry {
     /// Block type.
@@ -91,9 +102,9 @@ pub struct BlockDirEntry {
     /// Reserved for future use.
     pub _reserved: [u8; 3],
     /// Byte offset from the start of the section.
-    pub offset: u32,
+    pub offset: u64,
     /// Length of the block in bytes.
-    pub length: u32,
+    pub length: u64,
     /// CRC-32 of the block data.
     pub checksum: u32,
     /// For PropertyColumn: index into string table for the property key.
@@ -105,7 +116,16 @@ pub struct BlockDirEntry {
 }
 
 impl BlockDirEntry {
-    const SIZE: usize = 24;
+    const SIZE: usize = 32;
+    const V1_SIZE: usize = 24;
+
+    fn size_for_version(version: u8) -> usize {
+        if version >= LPG_BLOCK_VERSION_WIDE_OFFSETS {
+            Self::SIZE
+        } else {
+            Self::V1_SIZE
+        }
+    }
 
     fn write_to(&self, buf: &mut Vec<u8>) {
         buf.push(self.block_type);
@@ -124,8 +144,24 @@ impl BlockDirEntry {
         Some(Self {
             block_type: data[0],
             _reserved: [data[1], data[2], data[3]],
-            offset: u32::from_le_bytes(data[4..8].try_into().ok()?),
-            length: u32::from_le_bytes(data[8..12].try_into().ok()?),
+            offset: u64::from_le_bytes(data[4..12].try_into().ok()?),
+            length: u64::from_le_bytes(data[12..20].try_into().ok()?),
+            checksum: u32::from_le_bytes(data[20..24].try_into().ok()?),
+            key_string_index: u32::from_le_bytes(data[24..28].try_into().ok()?),
+            sub_type: u32::from_le_bytes(data[28..32].try_into().ok()?),
+        })
+    }
+
+    /// Reads a version-1 entry, widening the 32-bit offset and length.
+    fn read_from_v1(data: &[u8]) -> Option<Self> {
+        if data.len() < Self::V1_SIZE {
+            return None;
+        }
+        Some(Self {
+            block_type: data[0],
+            _reserved: [data[1], data[2], data[3]],
+            offset: u64::from(u32::from_le_bytes(data[4..8].try_into().ok()?)),
+            length: u64::from(u32::from_le_bytes(data[8..12].try_into().ok()?)),
             checksum: u32::from_le_bytes(data[12..16].try_into().ok()?),
             key_string_index: u32::from_le_bytes(data[16..20].try_into().ok()?),
             sub_type: u32::from_le_bytes(data[20..24].try_into().ok()?),
@@ -914,12 +950,8 @@ pub(crate) fn write_source_blocks_into(
         dir_entries.push(BlockDirEntry {
             block_type: *block_type as u8,
             _reserved: [0; 3],
-            // reason: section offsets and block sizes fit u32
-            #[allow(clippy::cast_possible_truncation)]
-            offset: data_offset as u32,
-            // reason: block data offset and length bounded by block capacity (64 KB)
-            #[allow(clippy::cast_possible_truncation)]
-            length: block_data.len() as u32,
+            offset: data_offset as u64,
+            length: block_data.len() as u64,
             checksum,
             key_string_index: *key_idx,
             sub_type: *sub_type,
@@ -1110,20 +1142,23 @@ fn append_entity_properties(
 // ── Reader ─────────────────────────────────────────────────────────
 
 fn checked_block_range(entry: &BlockDirEntry, data_len: usize) -> Result<std::ops::Range<usize>> {
-    let start = entry.offset as usize;
-    let length = entry.length as usize;
-    let end = start.checked_add(length).ok_or_else(|| {
+    // The 64-bit sum is checked before any usize conversion so a corrupt
+    // entry surfaces as a typed error on every target width.
+    let end = entry.offset.checked_add(entry.length).ok_or_else(|| {
         Error::Serialization(format!(
             "LPG block range overflows the address space: offset {} + length {}",
             entry.offset, entry.length
         ))
     })?;
-    if end > data_len {
+    if end > data_len as u64 {
         return Err(Error::Serialization(format!(
-            "LPG block extends past end of data: range {start}..{end}, data length {data_len}"
+            "LPG block extends past end of data: range {}..{end}, data length {data_len}",
+            entry.offset
         )));
     }
-    Ok(start..end)
+    // reason: both bounds were validated against data_len, which fits usize
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(entry.offset as usize..end as usize)
 }
 
 fn checked_block_data<'a>(data: &'a [u8], entry: &BlockDirEntry) -> Result<&'a [u8]> {
@@ -1152,8 +1187,9 @@ pub(crate) fn read_blocks(
     }
 
     let block_count = header.block_count as usize;
+    let entry_size = BlockDirEntry::size_for_version(header.version);
     let dir_start = HEADER_SIZE;
-    let dir_end = dir_start + block_count * BlockDirEntry::SIZE;
+    let dir_end = dir_start + block_count * entry_size;
 
     if data.len() < dir_end {
         return Err(Error::Serialization(
@@ -1162,15 +1198,20 @@ pub(crate) fn read_blocks(
     }
 
     // Parse directory
+    let wide_offsets = header.version >= LPG_BLOCK_VERSION_WIDE_OFFSETS;
     let mut dir_entries = Vec::with_capacity(block_count);
     for i in 0..block_count {
-        let entry_start = dir_start + i * BlockDirEntry::SIZE;
-        let entry = BlockDirEntry::read_from(&data[entry_start..])
-            .ok_or_else(|| Error::Serialization(format!("invalid block directory entry {i}")))?;
+        let entry_start = dir_start + i * entry_size;
+        let entry = if wide_offsets {
+            BlockDirEntry::read_from(&data[entry_start..])
+        } else {
+            BlockDirEntry::read_from_v1(&data[entry_start..])
+        }
+        .ok_or_else(|| Error::Serialization(format!("invalid block directory entry {i}")))?;
         dir_entries.push(entry);
     }
 
-    // Verify checksums and extract blocks
+    // Verify bounds and checksums
     for (i, entry) in dir_entries.iter().enumerate() {
         let block = checked_block_data(data, entry).map_err(|error| {
             Error::Serialization(format!("block {i} has an invalid range: {error}"))
@@ -1641,6 +1682,79 @@ mod tests {
         assert_eq!(strings.get(0), Some("Person"));
     }
 
+    /// Repacks a version-2 section as version 1 (24-byte directory entries
+    /// with 32-bit offsets), the shape every store written before the wide-
+    /// offset format carries on disk.
+    fn downgrade_to_v1(data: &[u8]) -> Vec<u8> {
+        let header = SectionHeader::read_from(data).unwrap();
+        let n = header.block_count as usize;
+        let old_dir_end = HEADER_SIZE + n * BlockDirEntry::SIZE;
+        let shift = n * (BlockDirEntry::SIZE - BlockDirEntry::V1_SIZE);
+        let mut out = Vec::with_capacity(data.len() - shift);
+        out.extend_from_slice(&data[..HEADER_SIZE]);
+        out[4] = 1;
+        for i in 0..n {
+            let entry =
+                BlockDirEntry::read_from(&data[HEADER_SIZE + i * BlockDirEntry::SIZE..]).unwrap();
+            out.push(entry.block_type);
+            out.extend_from_slice(&entry._reserved);
+            let offset = u32::try_from(entry.offset - shift as u64).unwrap();
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&u32::try_from(entry.length).unwrap().to_le_bytes());
+            out.extend_from_slice(&entry.checksum.to_le_bytes());
+            out.extend_from_slice(&entry.key_string_index.to_le_bytes());
+            out.extend_from_slice(&entry.sub_type.to_le_bytes());
+        }
+        out.extend_from_slice(&data[old_dir_end..]);
+        out
+    }
+
+    #[test]
+    fn test_reads_version_one_sections() {
+        let nodes = vec![BlockNode {
+            id: NodeId::new(1),
+            labels: vec!["Person".into()],
+            properties: vec![(
+                "name".into(),
+                smallvec::smallvec![(EpochId::new(1), Value::String("Alix".into()))],
+            )],
+        }];
+        let v1 = downgrade_to_v1(&write_blocks(&nodes, &[], &[], 9).unwrap());
+
+        read_blocks(&v1, &mut |decoded, edges, graphs, epoch| {
+            assert_eq!(epoch, 9);
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(decoded[0].labels, vec!["Person"]);
+            assert_eq!(decoded[0].properties.len(), 1);
+            assert!(edges.is_empty());
+            assert!(graphs.is_empty());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_directory_entry_past_section_end_is_a_typed_error() {
+        let mut data = write_blocks(&[], &[], &[], 0).unwrap();
+        // First entry's length field (bytes 12..20 of the 32-byte entry).
+        let len_at = HEADER_SIZE + 12;
+        data[len_at..len_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let result = read_blocks(&data, &mut |_, _, _, _| Ok(()));
+        assert!(matches!(result, Err(Error::Serialization(_))), "{result:?}");
+    }
+
+    #[test]
+    fn test_directory_entry_offset_overflow_is_a_typed_error() {
+        let mut data = write_blocks(&[], &[], &[], 0).unwrap();
+        let off_at = HEADER_SIZE + 4;
+        data[off_at..off_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        data[off_at + 8..off_at + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let result = read_blocks(&data, &mut |_, _, _, _| Ok(()));
+        assert!(matches!(result, Err(Error::Serialization(_))), "{result:?}");
+    }
+
     #[test]
     fn test_named_graph_round_trip() {
         let nodes = vec![BlockNode {
@@ -1702,7 +1816,7 @@ mod tests {
         let entry = BlockDirEntry {
             block_type: BlockType::PropertyColumn as u8,
             _reserved: [0; 3],
-            offset: u32::MAX - 1,
+            offset: u64::from(u32::MAX) - 1,
             length: 4,
             checksum: 0,
             key_string_index: 0,
