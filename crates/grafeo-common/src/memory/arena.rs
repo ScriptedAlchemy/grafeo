@@ -22,6 +22,13 @@ use crate::types::EpochId;
 /// Default chunk size for arena allocations (1 MB).
 const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 
+/// Alignment of every chunk's base pointer.
+///
+/// [`Arena::alloc_value_with_offset`] relies on this floor: a value whose
+/// alignment is at most `CHUNK_BASE_ALIGN` starts a fresh chunk at offset 0,
+/// so its worst-case aligned extent is just its size.
+const CHUNK_BASE_ALIGN: usize = 16;
+
 /// Errors from arena allocation operations.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -89,7 +96,8 @@ impl Chunk {
         if capacity > u32::MAX as usize {
             return Err(AllocError::OutOfMemory);
         }
-        let layout = Layout::from_size_align(capacity, 16).map_err(|_| AllocError::OutOfMemory)?;
+        let layout = Layout::from_size_align(capacity, CHUNK_BASE_ALIGN)
+            .map_err(|_| AllocError::OutOfMemory)?;
         // SAFETY: We're allocating a valid layout
         let ptr = unsafe { alloc(layout) };
         let ptr = NonNull::new(ptr).ok_or(AllocError::OutOfMemory)?;
@@ -161,7 +169,8 @@ impl Chunk {
 
 impl Drop for Chunk {
     fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.capacity, 16).expect("Invalid layout");
+        let layout =
+            Layout::from_size_align(self.capacity, CHUNK_BASE_ALIGN).expect("Invalid layout");
         // SAFETY: We allocated this memory with the same layout
         unsafe { dealloc(self.ptr.as_ptr(), layout) };
     }
@@ -369,25 +378,35 @@ impl Arena {
     ///
     /// # Errors
     ///
-    /// Returns `AllocError::InsufficientSpace` if the value is too large to sit
-    /// inside a single chunk, or if the epoch has exhausted the 4 GiB flat
-    /// address space. Returns `AllocError::InvalidAlignment` if `T`'s alignment
-    /// does not divide the chunk size, because a flat address only preserves
-    /// alignment when the stride is a multiple of it.
+    /// Returns `AllocError::InsufficientSpace` if the value is larger than a
+    /// whole chunk — an allocation may not straddle two chunks — or if the
+    /// epoch has exhausted the 4 GiB flat address space. A value that exactly
+    /// fills a chunk is accepted. Returns `AllocError::InvalidAlignment` if
+    /// `T`'s alignment exceeds [`CHUNK_BASE_ALIGN`] or does not divide the
+    /// chunk size: past the base-pointer guarantee, a value's in-chunk offset
+    /// would depend on where the system allocator happened to place the
+    /// chunk, and a flat address only preserves alignment when the stride is
+    /// a multiple of it.
     /// Returns `AllocError::OutOfMemory` if a new chunk cannot be allocated.
     #[cfg(feature = "tiered-storage")]
     pub fn alloc_value_with_offset<T>(&self, value: T) -> Result<(u32, &mut T), AllocError> {
         let size = std::mem::size_of::<T>();
         let align = std::mem::align_of::<T>();
 
-        if self.chunk_size == 0 || size.saturating_add(align) > self.chunk_size {
-            // A value that cannot fit a chunk has nowhere to go: an allocation
-            // may not straddle two chunks, or the flat address would not
-            // describe it.
-            return Err(AllocError::InsufficientSpace);
-        }
-        if !self.chunk_size.is_multiple_of(align) {
+        // The flat address must stay readable through `read_at`, which
+        // asserts the in-chunk offset is a multiple of `T`'s alignment. A
+        // chunk's base pointer is only `CHUNK_BASE_ALIGN`-aligned, so a
+        // stricter alignment would make the offset depend on where the
+        // system allocator placed the chunk — reject it as a typed error
+        // instead of handing out an address that may panic on read.
+        if align > CHUNK_BASE_ALIGN || !self.chunk_size.is_multiple_of(align) {
             return Err(AllocError::InvalidAlignment(align));
+        }
+        // An allocation may not straddle two chunks, so a value has somewhere
+        // to go exactly when an empty chunk can hold it: the base is at least
+        // `align`-aligned, so it starts at offset 0 and an exact fit is legal.
+        if self.chunk_size == 0 || size > self.chunk_size {
+            return Err(AllocError::InsufficientSpace);
         }
 
         loop {
@@ -1121,6 +1140,62 @@ mod tiered_storage_tests {
 
         let result = arena.alloc_value_with_offset([0u8; 128]);
         assert!(matches!(result, Err(AllocError::InsufficientSpace)));
+
+        // One byte over is still one byte over.
+        let result = arena.alloc_value_with_offset([0u8; 65]);
+        assert!(matches!(result, Err(AllocError::InsufficientSpace)));
+    }
+
+    #[test]
+    fn test_alloc_value_with_offset_exact_chunk_fill() {
+        // A value that exactly fills a chunk fits a fresh chunk at offset 0.
+        // The old precheck added the full alignment to the size and rejected
+        // it as InsufficientSpace.
+        let arena = Arena::with_chunk_size(EpochId::INITIAL, 64).unwrap();
+
+        let (first, _) = arena.alloc_value_with_offset([7u8; 64]).unwrap();
+        assert_eq!(first, 0);
+
+        // The next exact fill lands in a second chunk, one stride in.
+        let (second, _) = arena.alloc_value_with_offset([9u8; 64]).unwrap();
+        assert_eq!(second, 64);
+        assert_eq!(arena.stats().chunk_count, 2);
+
+        // SAFETY: both offsets were returned by alloc_value_with_offset for these types
+        unsafe {
+            assert_eq!(*arena.read_at::<[u8; 64]>(first), [7u8; 64]);
+            assert_eq!(*arena.read_at::<[u8; 64]>(second), [9u8; 64]);
+        }
+    }
+
+    #[test]
+    fn test_alloc_value_with_offset_alignment_beyond_chunk_base() {
+        // Alignment past the chunk base guarantee cannot be honored by a
+        // flat address (the in-chunk offset would depend on where the system
+        // allocator placed the chunk), so it is a typed error — never a
+        // sometimes-works allocation whose read_at can panic.
+        #[repr(align(64))]
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        struct Aligned64([u8; 64]);
+
+        let arena = Arena::with_chunk_size(EpochId::INITIAL, 128).unwrap();
+        let result = arena.alloc_value_with_offset(Aligned64([1u8; 64]));
+        assert!(matches!(result, Err(AllocError::InvalidAlignment(64))));
+
+        // Alignment exactly at the base guarantee still gets exact fits.
+        #[repr(align(16))]
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        struct Aligned16([u8; 64]);
+
+        let arena = Arena::with_chunk_size(EpochId::INITIAL, 64).unwrap();
+        let (offset, _) = arena
+            .alloc_value_with_offset(Aligned16([3u8; 64]))
+            .unwrap();
+        assert_eq!(offset, 0);
+        // SAFETY: offset was returned by alloc_value_with_offset for this type and arena
+        unsafe {
+            assert_eq!(arena.read_at::<Aligned16>(offset).0, [3u8; 64]);
+        }
     }
 
     #[test]
