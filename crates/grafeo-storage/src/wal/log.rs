@@ -31,6 +31,12 @@ pub struct CheckpointMetadata {
 /// Name of the checkpoint metadata file.
 const CHECKPOINT_METADATA_FILE: &str = "checkpoint.meta";
 
+/// Maximum WAL bytes accumulated before the buffered writer emits a segment.
+///
+/// Commit, batch-sync, explicit flush, and rotation boundaries drain earlier.
+/// The frame encoding inside each segment remains unchanged.
+const WAL_WRITE_BUFFER_BYTES: usize = 256 * 1024;
+
 /// Durability mode for the WAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityMode {
@@ -210,12 +216,8 @@ impl WalManager {
         ENCODE_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
-            bincode::serde::encode_into_std_write(
-                record,
-                &mut *buf,
-                bincode::config::standard(),
-            )
-            .map_err(|e| Error::Serialization(e.to_string()))?;
+            bincode::serde::encode_into_std_write(record, &mut *buf, bincode::config::standard())
+                .map_err(|e| Error::Serialization(e.to_string()))?;
             let force_sync = matches!(record, WalRecord::TransactionCommit { .. });
             self.write_frame(&buf, force_sync)
         })
@@ -326,8 +328,9 @@ impl WalManager {
 
             let needs_rotation = log_file.size >= self.config.max_log_size;
 
-            // Decide whether we need to fsync based on durability mode.
-            // Always flush the BufWriter so data reaches the OS page cache.
+            // Decide whether this record closes a durability group. Mutation
+            // frames stay in the bounded BufWriter until a commit or batch
+            // threshold, allowing the writer to emit coalesced segments.
             let needs_sync = match &self.config.durability {
                 DurabilityMode::Sync => {
                     if force_sync {
@@ -346,9 +349,6 @@ impl WalManager {
                 DurabilityMode::Adaptive { .. } | DurabilityMode::NoSync => false,
             };
 
-            // Flush the BufWriter while holding the lock (pushes data to OS).
-            log_file.writer.flush()?;
-
             // Snapshot the record count while holding the lock so we can
             // subtract exactly this amount after sync, preserving any
             // concurrent increments that arrive between lock release and sync.
@@ -357,6 +357,14 @@ impl WalManager {
             } else {
                 0
             };
+
+            // A commit always publishes its complete group to the file, even
+            // when Batch/Adaptive/NoSync intentionally defer the durability
+            // barrier. This preserves commit visibility to backups and live
+            // crash-image copies without restoring per-mutation writes.
+            if force_sync || needs_sync {
+                log_file.writer.flush()?;
+            }
 
             // Clone the file handle for out-of-lock sync if needed.
             let sync_file = if needs_sync {
@@ -522,7 +530,7 @@ impl WalManager {
             .open(&new_path)?;
 
         let new_log = LogFile {
-            writer: BufWriter::new(file),
+            writer: BufWriter::with_capacity(WAL_WRITE_BUFFER_BYTES, file),
             size: 0,
             path: new_path,
         };
@@ -697,7 +705,7 @@ impl WalManager {
             let size = file.metadata()?.len();
 
             *guard = Some(LogFile {
-                writer: BufWriter::new(file),
+                writer: BufWriter::with_capacity(WAL_WRITE_BUFFER_BYTES, file),
                 size,
                 path,
             });
