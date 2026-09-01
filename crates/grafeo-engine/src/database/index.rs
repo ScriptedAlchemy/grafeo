@@ -34,13 +34,42 @@ impl super::GrafeoDB {
     /// ```
     pub fn create_property_index(&self, property: &str) {
         self.lpg_store().create_property_index(property);
+        // Not WAL-logged; the persisted index state is behind.
+        self.mark_container_stale();
+        // After a compaction most rows live in the columnar base, which
+        // keeps its own hash index; without this the "indexed" lookup
+        // would still scan every base column.
+        #[cfg(feature = "compact-store")]
+        if let Some(ref layered) = self.layered_store {
+            layered
+                .base_store_arc()
+                .enable_property_indexes(std::iter::once(grafeo_common::types::PropertyKey::new(
+                    property,
+                )));
+        }
     }
 
     /// Drops an index on a node property.
     ///
     /// Returns `true` if the index existed and was removed.
     pub fn drop_property_index(&self, property: &str) -> bool {
-        self.lpg_store().drop_property_index(property)
+        let removed = self.lpg_store().drop_property_index(property);
+        // After a compaction the property is indexed in both layers: the
+        // overlay copy above, and the compact base's own hash index that
+        // `create_property_index` (or a compacted reopen) enabled. Drop
+        // both, or lookups keep using the base index and
+        // `has_property_index()` keeps reporting it.
+        #[cfg(feature = "compact-store")]
+        let removed = self.layered_store.as_ref().is_some_and(|layered| {
+            layered
+                .base_store_arc()
+                .disable_property_index(&grafeo_common::types::PropertyKey::new(property))
+        }) || removed;
+        if removed {
+            // Not WAL-logged; the persisted index state is behind.
+            self.mark_container_stale();
+        }
+        removed
     }
 
     /// Returns `true` if the property has an index.
@@ -113,6 +142,10 @@ impl super::GrafeoDB {
     ) -> Result<()> {
         use grafeo_common::types::{PropertyKey, Value};
         use grafeo_core::index::vector::DistanceMetric;
+
+        // The vector-index section is persisted but this build is not
+        // WAL-logged; the container can no longer be treated as current.
+        self.mark_container_stale();
 
         let metric = match metric {
             Some(m) => DistanceMetric::from_str(m).ok_or_else(|| {
@@ -234,6 +267,66 @@ impl super::GrafeoDB {
         Ok(())
     }
 
+    /// Number of vectors a vector index covers, or `None` if there is no
+    /// such index.
+    ///
+    /// The count a caller most often wants after a reopen: it separates
+    /// an index that was restored from its persisted topology from one
+    /// that came back registered but empty.
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_len(&self, label: &str, property: &str) -> Option<usize> {
+        self.lpg_store()
+            .get_vector_index(label, property)
+            .map(|index| index.len())
+    }
+
+    /// Estimated heap bytes a vector index's topology occupies, or
+    /// `None` if there is no such index.
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_heap_bytes(&self, label: &str, property: &str) -> Option<usize> {
+        self.lpg_store()
+            .get_vector_index(label, property)
+            .map(|index| index.heap_memory_bytes())
+    }
+
+    /// Stamps an opaque binding token on an existing vector index.
+    ///
+    /// The engine never interprets the token. It persists beside the
+    /// index in the catalog section, so a process that reopens the file
+    /// can compare what it finds against the identity it expects and
+    /// decide whether the restored topology still describes its rows.
+    ///
+    /// Typical tokens are whatever identity the caller already has: a
+    /// generation digest, a content hash, a snapshot id. Callers that
+    /// mutate the indexed rows are responsible for re-stamping, exactly
+    /// as they would be for any other derived artifact.
+    ///
+    /// Returns `false` when no index exists for the pair.
+    #[cfg(feature = "vector-index")]
+    pub fn set_vector_index_binding(&self, label: &str, property: &str, binding: &str) -> bool {
+        if self.lpg_store().get_vector_index(label, property).is_none() {
+            return false;
+        }
+        self.lpg_store()
+            .set_vector_index_binding(label, property, binding);
+        // Not WAL-logged; the persisted index state is behind.
+        self.mark_container_stale();
+        true
+    }
+
+    /// Reads the binding token stamped on a vector index, if any.
+    ///
+    /// Survives a close and reopen: the token rides the catalog section
+    /// alongside the index definition it describes. A restored index with
+    /// no token was written before the caller started stamping them.
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_binding(&self, label: &str, property: &str) -> Option<String> {
+        self.lpg_store().vector_index_binding(label, property)
+    }
+
     /// Parses a quantization string into a [`QuantizationType`].
     #[cfg(feature = "vector-index")]
     fn parse_quantization(
@@ -292,6 +385,8 @@ impl super::GrafeoDB {
     pub fn drop_vector_index(&self, label: &str, property: &str) -> bool {
         let removed = self.lpg_store().remove_vector_index(label, property);
         if removed {
+            // Not WAL-logged; the persisted vector-index section is behind.
+            self.mark_container_stale();
             grafeo_info!("Vector index dropped: :{label}({property})");
         }
         removed
@@ -377,6 +472,10 @@ impl super::GrafeoDB {
         use grafeo_common::types::{PropertyKey, Value};
         use grafeo_core::index::text::{BM25Config, InvertedIndex};
 
+        // The text-index section is persisted but this build is not
+        // WAL-logged; the container can no longer be treated as current.
+        self.mark_container_stale();
+
         let mut index = InvertedIndex::new(BM25Config::default());
         let prop_key = PropertyKey::new(property);
 
@@ -399,7 +498,12 @@ impl super::GrafeoDB {
     /// Returns `true` if the index existed and was removed.
     #[cfg(feature = "text-index")]
     pub fn drop_text_index(&self, label: &str, property: &str) -> bool {
-        self.lpg_store().remove_text_index(label, property)
+        let removed = self.lpg_store().remove_text_index(label, property);
+        if removed {
+            // Not WAL-logged; the persisted text-index section is behind.
+            self.mark_container_stale();
+        }
+        removed
     }
 
     /// Rebuilds a text index by re-scanning all matching nodes.

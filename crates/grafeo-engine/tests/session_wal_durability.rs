@@ -175,6 +175,7 @@ mod session_wal_durability {
     /// Cypher path is the durability oracle: the same shape of write through
     /// `db.execute_language(..., "cypher", ...)` MUST survive reopen.
     /// If this test ever fails, the bug is broader than #327.
+    #[cfg(feature = "cypher")]
     #[test]
     fn cypher_create_node_with_props_survives_reopen() {
         let dir = tempfile::tempdir().expect("create temp dir");

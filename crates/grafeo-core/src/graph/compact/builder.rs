@@ -893,11 +893,7 @@ pub fn from_graph_store(
                     InferredType::Dict => {
                         let str_values: Vec<String> = values
                             .iter()
-                            .map(|v| match v {
-                                Value::Null => String::new(),
-                                Value::String(s) => s.to_string(),
-                                other => format!("{other}"),
-                            })
+                            .map(super::dict_value::encode_dict_entry)
                             .collect();
                         let str_refs: Vec<&str> = str_values.iter().map(String::as_str).collect();
                         let mut dict_builder = DictionaryBuilder::new();
@@ -905,7 +901,18 @@ pub fn from_graph_store(
                             dict_builder.add(s);
                         }
                         let dict = dict_builder.build();
-                        let zone_map = compute_zone_map_strings(&str_refs);
+                        // A marked entry (Bytes payload or escaped string)
+                        // stores an encoded form; min/max bounds over encoded
+                        // forms must not be compared against raw query values,
+                        // so those columns carry no zone-map statistics.
+                        let has_marked = str_refs
+                            .iter()
+                            .any(|s| s.starts_with(super::dict_value::DICT_MARKER_PREFIX));
+                        let zone_map = if has_marked {
+                            ZoneMap::new()
+                        } else {
+                            compute_zone_map_strings(&str_refs)
+                        };
                         t.zone_maps.push((key.clone(), zone_map));
                         t.columns.push((key.clone(), ColumnCodec::Dict(dict)));
                         t.record_len(str_values.len());
@@ -1050,11 +1057,7 @@ pub fn from_graph_store(
                             InferredType::Dict => {
                                 let str_values: Vec<String> = values
                                     .iter()
-                                    .map(|v| match v {
-                                        Value::Null => String::new(),
-                                        Value::String(s) => s.to_string(),
-                                        other => format!("{other}"),
-                                    })
+                                    .map(super::dict_value::encode_dict_entry)
                                     .collect();
                                 let mut dict_builder = DictionaryBuilder::new();
                                 for s in &str_values {
@@ -1191,8 +1194,9 @@ pub fn from_graph_store_preserving_ids(
         }
     }
 
-    // Sort each group by (src_offset, dst_offset) to match CSR construction order,
-    // then build the edge_id_map from the resulting positions.
+    // Match CompactStoreBuilder's stable source-only sort exactly. Sorting by
+    // destination here would reorder equal-source edges relative to the CSR,
+    // attaching each preserved EdgeId to another edge's native endpoints.
     let num_rel_tables = compact.rel_tables_by_id.len();
     let mut edge_id_map: FxHashMap<grafeo_common::types::EdgeId, (u16, u64)> = FxHashMap::default();
     let mut edge_offset_to_id: Vec<Vec<grafeo_common::types::EdgeId>> =
@@ -1202,8 +1206,7 @@ pub fn from_graph_store_preserving_ids(
         let Some(&rel_table_id) = rel_key_to_id.get(&key) else {
             continue;
         };
-        // Sort by (src_offset, dst_offset) to match CSR order.
-        entries.sort_by_key(|&(_, src, dst)| (src, dst));
+        entries.sort_by_key(|&(_, src, _dst)| src);
 
         let rev = &mut edge_offset_to_id[rel_table_id as usize];
         for (csr_pos, (original_eid, _src, _dst)) in entries.iter().enumerate() {

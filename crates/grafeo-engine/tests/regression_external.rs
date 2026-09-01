@@ -3557,6 +3557,7 @@ mod order_by_aliased_property {
 // PropertyAccess on a non-entity column.
 // ============================================================================
 
+#[cfg(feature = "cypher")]
 mod order_by_relationship_traversal_218 {
     use super::*;
 

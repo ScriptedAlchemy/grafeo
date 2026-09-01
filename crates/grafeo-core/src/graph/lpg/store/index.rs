@@ -119,16 +119,37 @@ impl LpgStore {
     pub(super) fn update_property_index_on_remove(&self, node_id: NodeId, key: &PropertyKey) {
         let indexes = self.property_indexes.read();
         if let Some(index) = indexes.get(key) {
-            // Get old value to remove from index
-            if let Some(old_value) = self.node_properties.get(node_id, key) {
-                let old_hv = HashableValue::new(old_value);
-                if let Some(mut nodes) = index.get_mut(&old_hv) {
-                    nodes.remove(&node_id);
-                    if nodes.is_empty() {
-                        drop(nodes);
-                        index.remove(&old_hv);
-                    }
-                }
+            Self::unindex(index, node_id, self.node_properties.get(node_id, key));
+        }
+    }
+
+    /// Removes a node from every property index it appears in.
+    ///
+    /// Called on the delete paths, before the node's properties are torn
+    /// down: without it a deleted node stays in the index and
+    /// [`find_nodes_by_property`](Self::find_nodes_by_property) keeps
+    /// handing out its id, which callers then have to re-validate.
+    pub(super) fn remove_node_from_property_indexes(&self, node_id: NodeId) {
+        let indexes = self.property_indexes.read();
+        for (key, index) in indexes.iter() {
+            Self::unindex(index, node_id, self.node_properties.get(node_id, key));
+        }
+    }
+
+    /// Drops `node_id` from `index` under `value`, and drops the bucket
+    /// once it is empty.
+    fn unindex(
+        index: &DashMap<HashableValue, FxHashSet<NodeId>>,
+        node_id: NodeId,
+        value: Option<Value>,
+    ) {
+        let Some(value) = value else { return };
+        let hv = HashableValue::new(value);
+        if let Some(mut nodes) = index.get_mut(&hv) {
+            nodes.remove(&node_id);
+            if nodes.is_empty() {
+                drop(nodes);
+                index.remove(&hv);
             }
         }
     }
@@ -154,7 +175,44 @@ impl LpgStore {
     #[cfg(feature = "vector-index")]
     pub fn remove_vector_index(&self, label: &str, property: &str) -> bool {
         let key = format!("{label}:{property}");
+        self.vector_index_bindings.write().remove(&key);
         self.vector_indexes.write().remove(&key).is_some()
+    }
+
+    /// Stamps an opaque binding token on a vector index.
+    ///
+    /// The store never interprets the token; it persists it beside the
+    /// index in the catalog section so that a caller reopening the file
+    /// can tell a restored topology that still matches its data from one
+    /// that has drifted. Overwrites any previous token for the pair.
+    #[cfg(feature = "vector-index")]
+    pub fn set_vector_index_binding(&self, label: &str, property: &str, binding: &str) {
+        let key = format!("{label}:{property}");
+        self.vector_index_bindings
+            .write()
+            .insert(key, binding.to_string());
+    }
+
+    /// Reads back the binding token stamped on a vector index, if any.
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_binding(&self, label: &str, property: &str) -> Option<String> {
+        let key = format!("{label}:{property}");
+        self.vector_index_bindings.read().get(&key).cloned()
+    }
+
+    /// Returns every binding token as `(key, token)` pairs.
+    ///
+    /// Keys are in `"label:property"` format, matching
+    /// [`vector_index_entries`](Self::vector_index_entries).
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_binding_entries(&self) -> Vec<(String, String)> {
+        self.vector_index_bindings
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Returns all vector index entries as `(key, index)` pairs.

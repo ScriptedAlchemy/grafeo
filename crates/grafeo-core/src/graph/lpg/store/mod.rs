@@ -202,6 +202,12 @@ pub(super) struct LabelRegistry {
     id_to_name: Vec<ArcStr>,
 }
 
+#[derive(Default)]
+pub(super) struct TransactionVersionWrites {
+    pub(super) nodes: FxHashSet<NodeId>,
+    pub(super) edges: FxHashSet<EdgeId>,
+}
+
 impl LabelRegistry {
     fn new() -> Self {
         Self {
@@ -330,6 +336,12 @@ pub struct LpgStore {
     #[cfg(not(feature = "tiered-storage"))]
     pub(super) edges: RwLock<FxHashMap<EdgeId, VersionChain<EdgeRecord>>>,
 
+    /// Entity version chains carrying an uncommitted version per transaction.
+    /// Commit and rollback consume this write set instead of scanning every
+    /// chain in the graph.
+    pub(super) pending_version_writes:
+        parking_lot::Mutex<FxHashMap<TransactionId, TransactionVersionWrites>>,
+
     // === Tiered Storage Fields (feature-gated) ===
     //
     // Lock ordering for arena access:
@@ -417,6 +429,21 @@ pub struct LpgStore {
     #[cfg(feature = "vector-index")]
     pub(super) vector_indexes: RwLock<FxHashMap<String, Arc<VectorIndexKind>>>,
 
+    /// Caller-supplied binding tokens: "label:property" -> opaque token.
+    ///
+    /// A vector index is only as trustworthy as the data it was built over,
+    /// and the store cannot know what "the same data" means to its embedder.
+    /// So the caller stamps whatever identity it already has - a generation
+    /// digest, a content hash, a snapshot id - and reads it back after a
+    /// reopen to decide whether the restored topology still describes the
+    /// rows. The store treats the token as opaque and never interprets it.
+    ///
+    /// Rides the catalog section, so it is written and restored atomically
+    /// with the index it describes.
+    /// Lock order: 7 (same level as vector_indexes, disjoint map)
+    #[cfg(feature = "vector-index")]
+    pub(super) vector_index_bindings: RwLock<FxHashMap<String, String>>,
+
     /// Text indexes: "label:property" -> inverted index with BM25 scoring.
     ///
     /// Created via [`GrafeoDB::create_text_index`](grafeo_engine::GrafeoDB::create_text_index).
@@ -498,6 +525,7 @@ impl LpgStore {
             nodes: RwLock::new(FxHashMap::default()),
             #[cfg(not(feature = "tiered-storage"))]
             edges: RwLock::new(FxHashMap::default()),
+            pending_version_writes: parking_lot::Mutex::new(FxHashMap::default()),
             #[cfg(feature = "tiered-storage")]
             arena_allocator: Arc::new(ArenaAllocator::new()?),
             #[cfg(feature = "tiered-storage")]
@@ -518,6 +546,8 @@ impl LpgStore {
             property_indexes: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "vector-index")]
             vector_indexes: RwLock::new(FxHashMap::default()),
+            #[cfg(feature = "vector-index")]
+            vector_index_bindings: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "text-index")]
             text_indexes: RwLock::new(FxHashMap::default()),
             next_node_id: AtomicU64::new(0),
@@ -587,6 +617,24 @@ impl LpgStore {
         self.next_edge_id.store(id, Ordering::Release);
     }
 
+    /// Raises the next node ID counter to `id`, leaving it alone if it is
+    /// already at or above that value.
+    ///
+    /// Used when adopting an existing overlay under a compact base: the
+    /// overlay may already have allocated past the base's high-water mark
+    /// and must not be wound back.
+    #[doc(hidden)]
+    pub fn raise_next_node_id(&self, id: u64) {
+        self.next_node_id.fetch_max(id, Ordering::AcqRel);
+    }
+
+    /// Raises the next edge ID counter. See
+    /// [`raise_next_node_id`](Self::raise_next_node_id).
+    #[doc(hidden)]
+    pub fn raise_next_edge_id(&self, id: u64) {
+        self.next_edge_id.fetch_max(id, Ordering::AcqRel);
+    }
+
     /// Removes all data from the store, resetting it to an empty state.
     ///
     /// Acquires locks in the documented ordering to prevent deadlocks.
@@ -618,12 +666,15 @@ impl LpgStore {
         self.property_indexes.write().clear();
         #[cfg(feature = "vector-index")]
         self.vector_indexes.write().clear();
+        #[cfg(feature = "vector-index")]
+        self.vector_index_bindings.write().clear();
         #[cfg(feature = "text-index")]
         self.text_indexes.write().clear();
 
         // Nested: Properties and adjacency
         self.node_properties.clear();
         self.edge_properties.clear();
+        self.pending_version_writes.lock().clear();
         self.forward_adj.clear();
         if let Some(ref backward) = self.backward_adj {
             backward.clear();

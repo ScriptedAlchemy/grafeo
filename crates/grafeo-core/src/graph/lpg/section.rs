@@ -9,82 +9,161 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use grafeo_common::storage::section::{Section, SectionType};
-use grafeo_common::types::{EpochId, Value};
-use grafeo_common::utils::error::Result;
+use grafeo_common::types::{EdgeId, EpochId, NodeId};
+use grafeo_common::utils::error::{Error, Result};
 
-use super::block::{self, BlockEdge, BlockNamedGraph, BlockNode};
+use super::block::{self, BlockEdge, BlockNode, BlockSource};
 use crate::graph::lpg::LpgStore;
 
 /// Current LPG section format version (v2 = block-based).
 const LPG_SECTION_VERSION: u8 = 2;
 
-// ── Collection helpers ──────────────────────────────────────────────
+// ── Streaming source ────────────────────────────────────────────────
 
-fn collect_block_nodes(store: &LpgStore) -> Vec<BlockNode> {
-    let mut nodes: Vec<BlockNode> = store
-        .all_nodes()
-        .map(|n| {
-            #[cfg(feature = "temporal")]
-            let mut properties: Vec<(String, Vec<(EpochId, Value)>)> = store
-                .node_property_history(n.id)
-                .into_iter()
-                .map(|(k, entries)| (k.to_string(), entries))
-                .collect();
-
-            #[cfg(not(feature = "temporal"))]
-            let mut properties: Vec<(String, Vec<(EpochId, Value)>)> = n
-                .properties
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), vec![(EpochId::new(0), v)]))
-                .collect();
-
-            properties.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-            let mut labels: Vec<String> = n.labels.iter().map(|l| l.to_string()).collect();
-            labels.sort();
-
-            BlockNode {
-                id: n.id,
-                labels,
-                properties,
-            }
-        })
-        .collect();
-    nodes.sort_by_key(|n| n.id);
-    nodes
+struct LpgStoreBlockSource {
+    store: Arc<LpgStore>,
+    node_ids: Vec<NodeId>,
+    edge_ids: Vec<EdgeId>,
+    named_graphs: Vec<(String, Arc<LpgStore>)>,
 }
 
-fn collect_block_edges(store: &LpgStore) -> Vec<BlockEdge> {
-    let mut edges: Vec<BlockEdge> = store
-        .all_edges()
-        .map(|e| {
-            #[cfg(feature = "temporal")]
-            let mut properties: Vec<(String, Vec<(EpochId, Value)>)> = store
-                .edge_property_history(e.id)
+impl LpgStoreBlockSource {
+    fn new(store: Arc<LpgStore>) -> Self {
+        let node_ids = store.node_ids();
+        let mut edge_ids = store.visible_edge_ids();
+        edge_ids.sort_unstable();
+        let named_graphs = store
+            .graph_names()
+            .into_iter()
+            .filter_map(|name| store.graph(&name).map(|graph| (name, graph)))
+            .collect();
+        Self {
+            store,
+            node_ids,
+            edge_ids,
+            named_graphs,
+        }
+    }
+
+    /// Refills `out` with the node's current labels and properties.
+    ///
+    /// Reads labels and property columns directly (shared `ArcStr` handles,
+    /// no per-node property map), so the caller can reuse one scratch
+    /// [`BlockNode`] across the whole visit.
+    fn materialize_node_into(&self, id: NodeId, out: &mut BlockNode) -> Result<()> {
+        if !self.store.node_visible(id) {
+            return Err(Error::Internal(
+                "LPG node disappeared while checkpointing".to_owned(),
+            ));
+        }
+        out.id = id;
+        out.labels.clear();
+        out.properties.clear();
+
+        self.store.collect_node_labels(id, &mut out.labels);
+        out.labels.sort_unstable();
+
+        #[cfg(feature = "temporal")]
+        out.properties.extend(
+            self.store
+                .node_property_history(id)
                 .into_iter()
-                .map(|(k, entries)| (k.to_string(), entries))
-                .collect();
+                .map(|(key, entries)| (key, entries.into())),
+        );
 
-            #[cfg(not(feature = "temporal"))]
-            let mut properties: Vec<(String, Vec<(EpochId, Value)>)> = e
-                .properties
+        #[cfg(not(feature = "temporal"))]
+        self.store.for_each_node_property(id, |key, value| {
+            out.properties
+                .push((key.clone(), smallvec::smallvec![(EpochId::new(0), value)]));
+        });
+
+        out.properties
+            .sort_by(|(left, _), (right, _)| left.cmp(right));
+        Ok(())
+    }
+
+    /// Edge counterpart of [`Self::materialize_node_into`].
+    fn materialize_edge_into(&self, id: EdgeId, out: &mut BlockEdge) -> Result<()> {
+        let (src, dst, edge_type) = self.store.edge_header(id).ok_or_else(|| {
+            Error::Internal("LPG edge disappeared while checkpointing".to_owned())
+        })?;
+        out.id = id;
+        out.src = src;
+        out.dst = dst;
+        out.edge_type = edge_type;
+        out.properties.clear();
+
+        #[cfg(feature = "temporal")]
+        out.properties.extend(
+            self.store
+                .edge_property_history(id)
                 .into_iter()
-                .map(|(k, v)| (k.to_string(), vec![(EpochId::new(0), v)]))
-                .collect();
+                .map(|(key, entries)| (key, entries.into())),
+        );
 
-            properties.sort_by(|(a, _), (b, _)| a.cmp(b));
+        #[cfg(not(feature = "temporal"))]
+        self.store.for_each_edge_property(id, |key, value| {
+            out.properties
+                .push((key.clone(), smallvec::smallvec![(EpochId::new(0), value)]));
+        });
 
-            BlockEdge {
-                id: e.id,
-                src: e.src,
-                dst: e.dst,
-                edge_type: e.edge_type.to_string(),
-                properties,
-            }
-        })
-        .collect();
-    edges.sort_by_key(|e| e.id);
-    edges
+        out.properties
+            .sort_by(|(left, _), (right, _)| left.cmp(right));
+        Ok(())
+    }
+}
+
+impl BlockSource for LpgStoreBlockSource {
+    fn node_count(&self) -> usize {
+        self.node_ids.len()
+    }
+
+    fn edge_count(&self) -> usize {
+        self.edge_ids.len()
+    }
+
+    fn named_graph_count(&self) -> usize {
+        self.named_graphs.len()
+    }
+
+    fn visit_nodes(&self, visitor: &mut dyn FnMut(&BlockNode) -> Result<()>) -> Result<()> {
+        let mut scratch = BlockNode {
+            id: NodeId::new(0),
+            labels: Vec::new(),
+            properties: Vec::new(),
+        };
+        for id in &self.node_ids {
+            self.materialize_node_into(*id, &mut scratch)?;
+            visitor(&scratch)?;
+        }
+        Ok(())
+    }
+
+    fn visit_edges(&self, visitor: &mut dyn FnMut(&BlockEdge) -> Result<()>) -> Result<()> {
+        let mut scratch = BlockEdge {
+            id: EdgeId::new(0),
+            src: NodeId::new(0),
+            dst: NodeId::new(0),
+            edge_type: arcstr::ArcStr::new(),
+            properties: Vec::new(),
+        };
+        for id in &self.edge_ids {
+            self.materialize_edge_into(*id, &mut scratch)?;
+            visitor(&scratch)?;
+        }
+        Ok(())
+    }
+
+    fn visit_named_graphs(
+        &self,
+        visitor: &mut dyn FnMut(&str, &dyn BlockSource) -> Result<()>,
+    ) -> Result<()> {
+        for (name, store) in &self.named_graphs {
+            let source = Self::new(Arc::clone(store));
+            visitor(name, &source)?;
+        }
+        Ok(())
+    }
 }
 
 fn populate_store(store: &LpgStore, nodes: &[BlockNode], edges: &[BlockEdge]) -> Result<()> {
@@ -94,11 +173,11 @@ fn populate_store(store: &LpgStore, nodes: &[BlockNode], edges: &[BlockEdge]) ->
         for (key, entries) in &node.properties {
             #[cfg(feature = "temporal")]
             for (epoch, value) in entries {
-                store.set_node_property_at_epoch(node.id, key, value.clone(), *epoch);
+                store.set_node_property_at_epoch(node.id, key.as_str(), value.clone(), *epoch);
             }
             #[cfg(not(feature = "temporal"))]
             if let Some((_, value)) = entries.last() {
-                store.set_node_property(node.id, key, value.clone());
+                store.set_node_property_prekeyed(node.id, key.clone(), value.clone());
             }
         }
     }
@@ -107,11 +186,11 @@ fn populate_store(store: &LpgStore, nodes: &[BlockNode], edges: &[BlockEdge]) ->
         for (key, entries) in &edge.properties {
             #[cfg(feature = "temporal")]
             for (epoch, value) in entries {
-                store.set_edge_property_at_epoch(edge.id, key, value.clone(), *epoch);
+                store.set_edge_property_at_epoch(edge.id, key.as_str(), value.clone(), *epoch);
             }
             #[cfg(not(feature = "temporal"))]
             if let Some((_, value)) = entries.last() {
-                store.set_edge_property(edge.id, key, value.clone());
+                store.set_edge_property_prekeyed(edge.id, key.clone(), value.clone());
             }
         }
     }
@@ -161,28 +240,24 @@ impl Section for LpgStoreSection {
     }
 
     fn serialize(&self) -> Result<Vec<u8>> {
-        let nodes = collect_block_nodes(&self.store);
-        let edges = collect_block_edges(&self.store);
+        let mut out = Vec::new();
+        self.serialize_into(&mut out)?;
+        Ok(out)
+    }
 
-        let named_graphs: Vec<BlockNamedGraph> = self
-            .store
-            .graph_names()
-            .into_iter()
-            .filter_map(|name| {
-                self.store.graph(&name).map(|graph_store| BlockNamedGraph {
-                    name,
-                    nodes: collect_block_nodes(&graph_store),
-                    edges: collect_block_edges(&graph_store),
-                })
-            })
-            .collect();
+    /// Streams the block-format encoding straight into `sink`.
+    ///
+    /// Both entry points share this encoder, so the `Vec` and sink forms
+    /// cannot produce different bytes.
+    fn serialize_into(&self, sink: &mut dyn std::io::Write) -> Result<()> {
+        let source = LpgStoreBlockSource::new(Arc::clone(&self.store));
 
         #[cfg(feature = "temporal")]
         let epoch = self.store.current_epoch().as_u64();
         #[cfg(not(feature = "temporal"))]
         let epoch = 0u64;
 
-        block::write_blocks(&nodes, &edges, &named_graphs, epoch)
+        block::write_source_blocks_into(sink, &source, epoch)
     }
 
     fn deserialize(&mut self, data: &[u8]) -> Result<()> {
@@ -255,6 +330,122 @@ mod tests {
 
         assert_eq!(section2.store().node_count(), 2);
         assert_eq!(section2.store().edge_count(), 1);
+    }
+
+    /// The sink path and the `Vec` path must produce identical bytes:
+    /// a container written through either one has to be readable by the
+    /// same deserializer, and a divergence would only show up as a CRC
+    /// failure on a much later open.
+    #[test]
+    fn lpg_section_sink_and_vec_paths_are_byte_identical() {
+        let store = Arc::new(LpgStore::new().unwrap());
+        // Enough shape to exercise every block kind: labels, node and
+        // edge property columns, string interning, and a named graph.
+        for i in 0..256 {
+            let id = store.create_node(&["Person", "Indexed"]);
+            store.set_node_property(id, "name", Value::String(arcstr::format!("person-{i}")));
+            store.set_node_property(id, "age", Value::Int64(i));
+            store.set_node_property(id, "active", Value::Bool(i % 2 == 0));
+        }
+        for i in 1..256u64 {
+            let e = store.create_edge(NodeId::new(i), NodeId::new(i + 1), "KNOWS");
+            store.set_edge_property(e, "weight", Value::Float64(i as f64));
+        }
+        store.create_graph("social").unwrap();
+        if let Some(g) = store.graph("social") {
+            let n = g.create_node(&["Friend"]);
+            g.set_node_property(n, "nick", Value::String("gus".into()));
+        }
+
+        let section = LpgStoreSection::new(Arc::clone(&store));
+        let via_vec = section.serialize().expect("serialize");
+        let mut via_sink = Vec::new();
+        section
+            .serialize_into(&mut via_sink)
+            .expect("serialize_into");
+
+        assert_eq!(
+            via_sink.len(),
+            via_vec.len(),
+            "sink and Vec paths must write the same number of bytes"
+        );
+        assert!(
+            via_sink == via_vec,
+            "sink and Vec paths must write identical bytes"
+        );
+
+        // And the sink bytes are actually loadable.
+        let reloaded = Arc::new(LpgStore::new().unwrap());
+        let mut section2 = LpgStoreSection::new(Arc::clone(&reloaded));
+        section2.deserialize(&via_sink).expect("deserialize");
+        assert_eq!(reloaded.node_count(), 256);
+        assert_eq!(reloaded.edge_count(), 255);
+    }
+
+    #[test]
+    fn live_store_stream_matches_the_canonical_block_encoding() {
+        let store = Arc::new(LpgStore::new().unwrap());
+        let first = store.create_node(&["Person", "Indexed"]);
+        let second = store.create_node(&["Person"]);
+        store.set_node_property(first, "name", Value::String("alix".into()));
+        store.set_node_property(first, "active", Value::Bool(true));
+        let edge = store.create_edge(first, second, "KNOWS");
+        store.set_edge_property(edge, "weight", Value::Float64(0.75));
+        store.create_graph("social").unwrap();
+        let named_store = store.graph("social").unwrap();
+        let friend = named_store.create_node(&["Friend"]);
+        named_store.set_node_property(friend, "nick", Value::String("gus".into()));
+
+        let streamed = LpgStoreSection::new(store).serialize().unwrap();
+        let canonical = block::write_blocks(
+            &[
+                BlockNode {
+                    id: first,
+                    labels: vec!["Indexed".into(), "Person".into()],
+                    properties: vec![
+                        (
+                            "active".into(),
+                            smallvec::smallvec![(EpochId::new(0), Value::Bool(true))],
+                        ),
+                        (
+                            "name".into(),
+                            smallvec::smallvec![(EpochId::new(0), Value::String("alix".into()))],
+                        ),
+                    ],
+                },
+                BlockNode {
+                    id: second,
+                    labels: vec!["Person".into()],
+                    properties: vec![],
+                },
+            ],
+            &[BlockEdge {
+                id: edge,
+                src: first,
+                dst: second,
+                edge_type: "KNOWS".into(),
+                properties: vec![(
+                    "weight".into(),
+                    smallvec::smallvec![(EpochId::new(0), Value::Float64(0.75))],
+                )],
+            }],
+            &[block::BlockNamedGraph {
+                name: "social".into(),
+                nodes: vec![BlockNode {
+                    id: friend,
+                    labels: vec!["Friend".into()],
+                    properties: vec![(
+                        "nick".into(),
+                        smallvec::smallvec![(EpochId::new(0), Value::String("gus".into()))],
+                    )],
+                }],
+                edges: vec![],
+            }],
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(streamed, canonical);
     }
 
     #[test]

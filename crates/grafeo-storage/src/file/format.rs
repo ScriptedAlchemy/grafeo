@@ -105,6 +105,15 @@ pub struct DbHeader {
     pub edge_count: u64,
     /// Milliseconds since UNIX epoch when this header was written.
     pub timestamp_ms: u64,
+    /// Absolute byte offset of this generation's section directory page.
+    ///
+    /// `0` means the legacy fixed directory location (12 KiB): header slots
+    /// written before checkpoints became out-of-place are zero-padded, so
+    /// decoding them with this field present yields `0`. Checkpoints written
+    /// by current code place each generation's directory page inside that
+    /// generation's own region and record its offset here, which is what
+    /// lets a checkpoint avoid overwriting the previous generation in place.
+    pub directory_offset: u64,
 }
 
 impl DbHeader {
@@ -118,6 +127,7 @@ impl DbHeader {
         node_count: 0,
         edge_count: 0,
         timestamp_ms: 0,
+        directory_offset: 0,
     };
 
     /// Returns `true` if this header has never been written (iteration == 0).

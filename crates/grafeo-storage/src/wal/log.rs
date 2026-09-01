@@ -5,6 +5,7 @@ use grafeo_common::types::{EpochId, TransactionId};
 use grafeo_common::utils::error::{Error, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,12 @@ pub struct CheckpointMetadata {
 
 /// Name of the checkpoint metadata file.
 const CHECKPOINT_METADATA_FILE: &str = "checkpoint.meta";
+
+/// Maximum WAL bytes accumulated before the buffered writer emits a segment.
+///
+/// Commit, batch-sync, explicit flush, and rotation boundaries drain earlier.
+/// The frame encoding inside each segment remains unchanged.
+const WAL_WRITE_BUFFER_BYTES: usize = 256 * 1024;
 
 /// Durability mode for the WAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,10 +208,19 @@ impl WalManager {
     ///
     /// Returns an error if the record cannot be written.
     pub fn log(&self, record: &WalRecord) -> Result<()> {
-        let data = bincode::serde::encode_to_vec(record, bincode::config::standard())
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-        let force_sync = matches!(record, WalRecord::TransactionCommit { .. });
-        self.write_frame(&data, force_sync)
+        // One serialize buffer per thread; a fresh growing Vec per record is
+        // a measurable share of write-path allocation traffic.
+        thread_local! {
+            static ENCODE_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        }
+        ENCODE_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            bincode::serde::encode_into_std_write(record, &mut *buf, bincode::config::standard())
+                .map_err(|e| Error::Serialization(e.to_string()))?;
+            let force_sync = matches!(record, WalRecord::TransactionCommit { .. });
+            self.write_frame(&buf, force_sync)
+        })
     }
 
     /// Writes a pre-serialized frame to the active WAL log.
@@ -312,8 +328,9 @@ impl WalManager {
 
             let needs_rotation = log_file.size >= self.config.max_log_size;
 
-            // Decide whether we need to fsync based on durability mode.
-            // Always flush the BufWriter so data reaches the OS page cache.
+            // Decide whether this record closes a durability group. Mutation
+            // frames stay in the bounded BufWriter until a commit or batch
+            // threshold, allowing the writer to emit coalesced segments.
             let needs_sync = match &self.config.durability {
                 DurabilityMode::Sync => {
                     if force_sync {
@@ -332,9 +349,6 @@ impl WalManager {
                 DurabilityMode::Adaptive { .. } | DurabilityMode::NoSync => false,
             };
 
-            // Flush the BufWriter while holding the lock (pushes data to OS).
-            log_file.writer.flush()?;
-
             // Snapshot the record count while holding the lock so we can
             // subtract exactly this amount after sync, preserving any
             // concurrent increments that arrive between lock release and sync.
@@ -343,6 +357,14 @@ impl WalManager {
             } else {
                 0
             };
+
+            // A commit always publishes its complete group to the file, even
+            // when Batch/Adaptive/NoSync intentionally defer the durability
+            // barrier. This preserves commit visibility to backups and live
+            // crash-image copies without restoring per-mutation writes.
+            if force_sync || needs_sync {
+                log_file.writer.flush()?;
+            }
 
             // Clone the file handle for out-of-lock sync if needed.
             let sync_file = if needs_sync {
@@ -433,6 +455,13 @@ impl WalManager {
         // Optionally truncate old logs
         self.truncate_old_logs()?;
 
+        // Rotate so post-checkpoint records land in a fresh segment. Without
+        // this, history written after the checkpoint shares the checkpoint's
+        // own segment number, and segment-granular replay-debt checks
+        // (`checkpoint.log_sequence >= newest segment`) silently treat that
+        // history as covered, replaying it on every subsequent open.
+        self.rotate()?;
+
         Ok(())
     }
 
@@ -501,7 +530,7 @@ impl WalManager {
             .open(&new_path)?;
 
         let new_log = LogFile {
-            writer: BufWriter::new(file),
+            writer: BufWriter::with_capacity(WAL_WRITE_BUFFER_BYTES, file),
             size: 0,
             path: new_path,
         };
@@ -676,7 +705,7 @@ impl WalManager {
             let size = file.metadata()?.len();
 
             *guard = Some(LogFile {
-                writer: BufWriter::new(file),
+                writer: BufWriter::with_capacity(WAL_WRITE_BUFFER_BYTES, file),
                 size,
                 path,
             });
