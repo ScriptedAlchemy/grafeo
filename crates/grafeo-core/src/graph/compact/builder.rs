@@ -68,6 +68,29 @@ pub enum CompactStoreError {
         /// Maximum allowed table count.
         max: u16,
     },
+    /// A node table received more rows than a `u32` offset can address.
+    #[error("node table {table:?} exceeds the u32 row limit")]
+    TableRowOverflow {
+        /// Label key of the overfull table.
+        table: String,
+    },
+    /// A node was pushed without any label; compact tables are keyed by label.
+    #[error("node {0} has no label")]
+    UnlabeledNode(u64),
+    /// The same node id was pushed twice.
+    #[error("duplicate node id {0}")]
+    DuplicateNodeId(u64),
+    /// The same edge id was pushed twice.
+    #[error("duplicate edge id {0}")]
+    DuplicateEdgeId(u64),
+    /// An edge names an endpoint that was never pushed as a node.
+    #[error("edge {edge} references unknown node {node}")]
+    UnknownEndpoint {
+        /// The edge id.
+        edge: u64,
+        /// The missing endpoint's node id.
+        node: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +212,19 @@ impl NodeTableBuilder {
         self
     }
 
+    /// Adds a column whose codec is inferred from its row values (the
+    /// `from_graph_store` type mapping), with the zone map that codec
+    /// supports.
+    fn inferred_column(&mut self, key: &PropertyKey, values: &[Value]) -> &mut Self {
+        let (codec, zone_map) = encode_inferred_column(values);
+        self.record_len(values.len());
+        if let Some(zone_map) = zone_map {
+            self.zone_maps.push((key.clone(), zone_map));
+        }
+        self.columns.push((key.clone(), codec));
+        self
+    }
+
     /// Records the row count from the first column and validates subsequent ones.
     fn record_len(&mut self, col_len: usize) {
         match self.len {
@@ -249,6 +285,15 @@ impl RelTableBuilder {
         let bp = BitPackedInts::pack_with_bits(values, bits);
         self.properties
             .push((PropertyKey::new(name), ColumnCodec::BitPacked(bp)));
+        self
+    }
+
+    /// Adds an edge property column whose codec is inferred from its row
+    /// values (the `from_graph_store` type mapping). Edge columns carry no
+    /// zone maps.
+    fn inferred_column(&mut self, key: &PropertyKey, values: &[Value]) -> &mut Self {
+        let (codec, _zone_map) = encode_inferred_column(values);
+        self.properties.push((key.clone(), codec));
         self
     }
 }
@@ -816,108 +861,7 @@ pub fn from_graph_store(
             // Ensure row count is set even when there are no properties.
             t.record_len(node_count);
             for (key, values) in props_map {
-                let inferred = infer_type_from_values(values);
-                match inferred {
-                    InferredType::BitPacked => {
-                        let u64_values: Vec<u64> = values
-                            .iter()
-                            .map(|v| match v {
-                                // reason: ID encoding: i64 <-> u64 for bit-packed storage
-                                #[allow(clippy::cast_sign_loss)]
-                                Value::Int64(n) => *n as u64,
-                                _ => 0,
-                            })
-                            .collect();
-                        let bp = BitPackedInts::pack(&u64_values);
-                        let zone_map = compute_zone_map_u64(&u64_values);
-                        t.zone_maps.push((key.clone(), zone_map));
-                        t.columns.push((key.clone(), ColumnCodec::BitPacked(bp)));
-                        t.record_len(u64_values.len());
-                    }
-                    InferredType::RawI64 => {
-                        let i64_values: Vec<i64> = values
-                            .iter()
-                            .map(|v| match v {
-                                Value::Int64(n) => *n,
-                                _ => 0,
-                            })
-                            .collect();
-                        let zone_map = compute_zone_map_i64(&i64_values);
-                        t.zone_maps.push((key.clone(), zone_map));
-                        t.columns
-                            .push((key.clone(), ColumnCodec::raw_i64(i64_values)));
-                        t.record_len(values.len());
-                    }
-                    InferredType::Float64 => {
-                        let f64_values: Vec<f64> = values
-                            .iter()
-                            .map(|v| match v {
-                                Value::Float64(f) => *f,
-                                Value::Int64(n) => *n as f64,
-                                _ => 0.0,
-                            })
-                            .collect();
-                        t.columns
-                            .push((key.clone(), ColumnCodec::float64(f64_values)));
-                        t.record_len(values.len());
-                    }
-                    InferredType::Float32Vector { dimensions } => {
-                        let mut flat: Vec<f32> =
-                            Vec::with_capacity(values.len() * dimensions as usize);
-                        for v in values {
-                            match v {
-                                Value::Vector(vec) => flat.extend_from_slice(vec),
-                                _ => {
-                                    flat.extend(std::iter::repeat_n(
-                                        0.0f32,
-                                        usize::from(dimensions),
-                                    ));
-                                }
-                            }
-                        }
-                        t.columns
-                            .push((key.clone(), ColumnCodec::float32_vector(flat, dimensions)));
-                        t.record_len(values.len());
-                    }
-                    InferredType::Bitmap => {
-                        let bool_values: Vec<bool> = values
-                            .iter()
-                            .map(|v| matches!(v, Value::Bool(true)))
-                            .collect();
-                        let bv = BitVector::from_bools(&bool_values);
-                        let zone_map = compute_zone_map_bool(&bool_values);
-                        t.zone_maps.push((key.clone(), zone_map));
-                        t.columns.push((key.clone(), ColumnCodec::Bitmap(bv)));
-                        t.record_len(bool_values.len());
-                    }
-                    InferredType::Dict => {
-                        let str_values: Vec<String> = values
-                            .iter()
-                            .map(super::dict_value::encode_dict_entry)
-                            .collect();
-                        let str_refs: Vec<&str> = str_values.iter().map(String::as_str).collect();
-                        let mut dict_builder = DictionaryBuilder::new();
-                        for s in &str_refs {
-                            dict_builder.add(s);
-                        }
-                        let dict = dict_builder.build();
-                        // A marked entry (Bytes payload or escaped string)
-                        // stores an encoded form; min/max bounds over encoded
-                        // forms must not be compared against raw query values,
-                        // so those columns carry no zone-map statistics.
-                        let has_marked = str_refs
-                            .iter()
-                            .any(|s| s.starts_with(super::dict_value::DICT_MARKER_PREFIX));
-                        let zone_map = if has_marked {
-                            ZoneMap::new()
-                        } else {
-                            compute_zone_map_strings(&str_refs)
-                        };
-                        t.zone_maps.push((key.clone(), zone_map));
-                        t.columns.push((key.clone(), ColumnCodec::Dict(dict)));
-                        t.record_len(str_values.len());
-                    }
-                }
+                t.inferred_column(key, values);
             }
             t
         });
@@ -991,82 +935,7 @@ pub fn from_graph_store(
                 // Add edge property columns.
                 if let Some(props) = edge_props {
                     for (key, values) in props {
-                        let inferred = infer_type_from_values(values);
-                        match inferred {
-                            InferredType::BitPacked => {
-                                let u64_values: Vec<u64> = values
-                                    .iter()
-                                    .map(|v| match v {
-                                        // reason: ID encoding: i64 <-> u64 for bit-packed storage
-                                        #[allow(clippy::cast_sign_loss)]
-                                        Value::Int64(n) => *n as u64,
-                                        _ => 0,
-                                    })
-                                    .collect();
-                                let bp = BitPackedInts::pack(&u64_values);
-                                r.properties.push((key.clone(), ColumnCodec::BitPacked(bp)));
-                            }
-                            InferredType::RawI64 => {
-                                let i64_values: Vec<i64> = values
-                                    .iter()
-                                    .map(|v| match v {
-                                        Value::Int64(n) => *n,
-                                        _ => 0,
-                                    })
-                                    .collect();
-                                r.properties
-                                    .push((key.clone(), ColumnCodec::raw_i64(i64_values)));
-                            }
-                            InferredType::Float64 => {
-                                let f64_values: Vec<f64> = values
-                                    .iter()
-                                    .map(|v| match v {
-                                        Value::Float64(f) => *f,
-                                        Value::Int64(n) => *n as f64,
-                                        _ => 0.0,
-                                    })
-                                    .collect();
-                                r.properties
-                                    .push((key.clone(), ColumnCodec::float64(f64_values)));
-                            }
-                            InferredType::Float32Vector { dimensions } => {
-                                let mut flat: Vec<f32> =
-                                    Vec::with_capacity(values.len() * dimensions as usize);
-                                for v in values {
-                                    match v {
-                                        Value::Vector(vec) => flat.extend_from_slice(vec),
-                                        _ => flat.extend(std::iter::repeat_n(
-                                            0.0f32,
-                                            usize::from(dimensions),
-                                        )),
-                                    }
-                                }
-                                r.properties.push((
-                                    key.clone(),
-                                    ColumnCodec::float32_vector(flat, dimensions),
-                                ));
-                            }
-                            InferredType::Bitmap => {
-                                let bool_values: Vec<bool> = values
-                                    .iter()
-                                    .map(|v| matches!(v, Value::Bool(true)))
-                                    .collect();
-                                let bv = BitVector::from_bools(&bool_values);
-                                r.properties.push((key.clone(), ColumnCodec::Bitmap(bv)));
-                            }
-                            InferredType::Dict => {
-                                let str_values: Vec<String> = values
-                                    .iter()
-                                    .map(super::dict_value::encode_dict_entry)
-                                    .collect();
-                                let mut dict_builder = DictionaryBuilder::new();
-                                for s in &str_values {
-                                    dict_builder.add(s);
-                                }
-                                let dict = dict_builder.build();
-                                r.properties.push((key.clone(), ColumnCodec::Dict(dict)));
-                            }
-                        }
+                        r.inferred_column(key, values);
                     }
                 }
 
@@ -1225,6 +1094,407 @@ pub fn from_graph_store_preserving_ids(
         edge_offset_to_id,
     );
     Ok(compact)
+}
+
+/// Encodes one property column from its row values with the codec
+/// [`infer_type_from_values`] selects, plus the zone map that codec supports
+/// (`None` for float and vector columns, which carry no zone statistics).
+///
+/// This is the single definition of the `from_graph_store` type mapping;
+/// the whole-store conversion and the incremental builder both encode
+/// through it, so a store built either way holds byte-identical columns.
+fn encode_inferred_column(values: &[Value]) -> (ColumnCodec, Option<ZoneMap>) {
+    match infer_type_from_values(values) {
+        InferredType::BitPacked => {
+            let u64_values: Vec<u64> = values
+                .iter()
+                .map(|v| match v {
+                    // reason: ID encoding: i64 <-> u64 for bit-packed storage
+                    #[allow(clippy::cast_sign_loss)]
+                    Value::Int64(n) => *n as u64,
+                    _ => 0,
+                })
+                .collect();
+            let zone_map = compute_zone_map_u64(&u64_values);
+            (
+                ColumnCodec::BitPacked(BitPackedInts::pack(&u64_values)),
+                Some(zone_map),
+            )
+        }
+        InferredType::RawI64 => {
+            let i64_values: Vec<i64> = values
+                .iter()
+                .map(|v| match v {
+                    Value::Int64(n) => *n,
+                    _ => 0,
+                })
+                .collect();
+            let zone_map = compute_zone_map_i64(&i64_values);
+            (ColumnCodec::raw_i64(i64_values), Some(zone_map))
+        }
+        InferredType::Float64 => {
+            let f64_values: Vec<f64> = values
+                .iter()
+                .map(|v| match v {
+                    Value::Float64(f) => *f,
+                    Value::Int64(n) => *n as f64,
+                    _ => 0.0,
+                })
+                .collect();
+            (ColumnCodec::float64(f64_values), None)
+        }
+        InferredType::Float32Vector { dimensions } => {
+            let mut flat: Vec<f32> = Vec::with_capacity(values.len() * dimensions as usize);
+            for v in values {
+                match v {
+                    Value::Vector(vec) => flat.extend_from_slice(vec),
+                    _ => flat.extend(std::iter::repeat_n(0.0f32, usize::from(dimensions))),
+                }
+            }
+            (ColumnCodec::float32_vector(flat, dimensions), None)
+        }
+        InferredType::Bitmap => {
+            let bool_values: Vec<bool> = values
+                .iter()
+                .map(|v| matches!(v, Value::Bool(true)))
+                .collect();
+            let zone_map = compute_zone_map_bool(&bool_values);
+            (
+                ColumnCodec::Bitmap(BitVector::from_bools(&bool_values)),
+                Some(zone_map),
+            )
+        }
+        InferredType::Dict => {
+            let str_values: Vec<String> = values
+                .iter()
+                .map(super::dict_value::encode_dict_entry)
+                .collect();
+            let str_refs: Vec<&str> = str_values.iter().map(String::as_str).collect();
+            let mut dict_builder = DictionaryBuilder::new();
+            for s in &str_refs {
+                dict_builder.add(s);
+            }
+            let dict = dict_builder.build();
+            // A marked entry (Bytes payload or escaped string) stores an
+            // encoded form; min/max bounds over encoded forms must not be
+            // compared against raw query values, so those columns carry no
+            // zone-map statistics.
+            let has_marked = str_refs
+                .iter()
+                .any(|s| s.starts_with(super::dict_value::DICT_MARKER_PREFIX));
+            let zone_map = if has_marked {
+                ZoneMap::new()
+            } else {
+                compute_zone_map_strings(&str_refs)
+            };
+            (ColumnCodec::Dict(dict), Some(zone_map))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Incremental construction from a row stream
+// ---------------------------------------------------------------------------
+
+/// Builds a [`CompactStore`] with preserved ids from a stream of nodes and
+/// edges, without first materializing them in a live [`LpgStore`].
+///
+/// The result is what [`from_graph_store_preserving_ids`] would build from a
+/// store holding the same rows: the same label grouping (multi-label nodes
+/// under the sorted, `|`-joined label key), the same inferred column codecs
+/// and zone maps, the same source-sorted CSR order, and the same
+/// `NodeId`/`EdgeId` maps. Node tables and relationship tables are numbered
+/// in order of first appearance in the stream, so identical input in
+/// identical order builds an identical store, and the caller — not a hash
+/// map walk — fixes that order.
+///
+/// Every node must be pushed before an edge refers to it; a relationship
+/// table exists only once its first edge arrives. Row values are held in
+/// column form until [`finish`](Self::finish) encodes them, so the peak
+/// footprint is one columnar copy of the rows plus the finished store,
+/// never a live LPG.
+///
+/// [`LpgStore`]: crate::graph::lpg::LpgStore
+#[derive(Default)]
+pub struct IncrementalCompactStoreBuilder {
+    node_tables: Vec<PendingNodeTable>,
+    node_table_index: FxHashMap<ArcStr, usize>,
+    /// Pushed node id -> (node table index, offset within the table).
+    node_positions: FxHashMap<grafeo_common::types::NodeId, (usize, u32)>,
+    rel_tables: Vec<PendingRelTable>,
+    rel_table_index: FxHashMap<(ArcStr, usize, usize), usize>,
+    edge_ids: FxHashSet<grafeo_common::types::EdgeId>,
+}
+
+/// Row values for one node table, collected before encoding.
+struct PendingNodeTable {
+    label_key: ArcStr,
+    node_ids: Vec<grafeo_common::types::NodeId>,
+    /// Property key -> value per row, null-padded so every column spans
+    /// every row pushed so far.
+    columns: FxHashMap<PropertyKey, Vec<Value>>,
+}
+
+/// Row values for one relationship table, collected before encoding.
+struct PendingRelTable {
+    edge_type: ArcStr,
+    src_table: usize,
+    dst_table: usize,
+    /// (edge id, source offset, destination offset) in push order.
+    edges: Vec<(grafeo_common::types::EdgeId, u32, u32)>,
+    columns: FxHashMap<PropertyKey, Vec<Value>>,
+}
+
+/// Appends one row's properties to null-padded columns holding `row` rows.
+fn push_row_properties<'a>(
+    columns: &mut FxHashMap<PropertyKey, Vec<Value>>,
+    row: usize,
+    properties: impl IntoIterator<Item = (&'a PropertyKey, &'a Value)>,
+) {
+    for (key, value) in properties {
+        let column = columns
+            .entry(key.clone())
+            .or_insert_with(|| vec![Value::Null; row]);
+        column.resize(row, Value::Null);
+        column.push(value.clone());
+    }
+    for column in columns.values_mut() {
+        column.resize(row + 1, Value::Null);
+    }
+}
+
+impl IncrementalCompactStoreBuilder {
+    /// Creates an empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Nodes pushed so far.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.node_positions.len()
+    }
+
+    /// Edges pushed so far.
+    #[must_use]
+    pub fn edge_count(&self) -> usize {
+        self.edge_ids.len()
+    }
+
+    /// Adds a node with its labels and properties.
+    ///
+    /// # Errors
+    ///
+    /// - [`CompactStoreError::UnlabeledNode`] if `labels` is empty: a
+    ///   compact table is keyed by label, so an unlabeled node has no table.
+    /// - [`CompactStoreError::DuplicateNodeId`] if `id` was already pushed.
+    pub fn push_node<'a>(
+        &mut self,
+        id: grafeo_common::types::NodeId,
+        labels: impl IntoIterator<Item = &'a str>,
+        properties: impl IntoIterator<Item = (&'a PropertyKey, &'a Value)>,
+    ) -> Result<(), CompactStoreError> {
+        let mut sorted: Vec<&str> = labels.into_iter().collect();
+        let label_key: ArcStr = match sorted.as_slice() {
+            [] => return Err(CompactStoreError::UnlabeledNode(id.0)),
+            [single] => ArcStr::from(*single),
+            _ => {
+                sorted.sort_unstable();
+                sorted.dedup();
+                ArcStr::from(sorted.join("|"))
+            }
+        };
+        if self.node_positions.contains_key(&id) {
+            return Err(CompactStoreError::DuplicateNodeId(id.0));
+        }
+
+        let table_index = match self.node_table_index.get(&label_key) {
+            Some(&index) => index,
+            None => {
+                let index = self.node_tables.len();
+                self.node_table_index.insert(label_key.clone(), index);
+                self.node_tables.push(PendingNodeTable {
+                    label_key,
+                    node_ids: Vec::new(),
+                    columns: FxHashMap::default(),
+                });
+                index
+            }
+        };
+        let table = &mut self.node_tables[table_index];
+        let row = table.node_ids.len();
+        let offset = u32::try_from(row).map_err(|_| CompactStoreError::TableRowOverflow {
+            table: table.label_key.to_string(),
+        })?;
+        table.node_ids.push(id);
+        push_row_properties(&mut table.columns, row, properties);
+        self.node_positions.insert(id, (table_index, offset));
+        Ok(())
+    }
+
+    /// Adds an edge between two nodes pushed earlier.
+    ///
+    /// # Errors
+    ///
+    /// - [`CompactStoreError::UnknownEndpoint`] if `src` or `dst` was not
+    ///   pushed as a node.
+    /// - [`CompactStoreError::DuplicateEdgeId`] if `id` was already pushed.
+    pub fn push_edge<'a>(
+        &mut self,
+        id: grafeo_common::types::EdgeId,
+        edge_type: &str,
+        src: grafeo_common::types::NodeId,
+        dst: grafeo_common::types::NodeId,
+        properties: impl IntoIterator<Item = (&'a PropertyKey, &'a Value)>,
+    ) -> Result<(), CompactStoreError> {
+        let &(src_table, src_offset) =
+            self.node_positions
+                .get(&src)
+                .ok_or(CompactStoreError::UnknownEndpoint {
+                    edge: id.0,
+                    node: src.0,
+                })?;
+        let &(dst_table, dst_offset) =
+            self.node_positions
+                .get(&dst)
+                .ok_or(CompactStoreError::UnknownEndpoint {
+                    edge: id.0,
+                    node: dst.0,
+                })?;
+        if !self.edge_ids.insert(id) {
+            return Err(CompactStoreError::DuplicateEdgeId(id.0));
+        }
+
+        let key = (ArcStr::from(edge_type), src_table, dst_table);
+        let table_index = match self.rel_table_index.get(&key) {
+            Some(&index) => index,
+            None => {
+                let index = self.rel_tables.len();
+                self.rel_tables.push(PendingRelTable {
+                    edge_type: key.0.clone(),
+                    src_table,
+                    dst_table,
+                    edges: Vec::new(),
+                    columns: FxHashMap::default(),
+                });
+                self.rel_table_index.insert(key, index);
+                index
+            }
+        };
+        let table = &mut self.rel_tables[table_index];
+        let row = table.edges.len();
+        table.edges.push((id, src_offset, dst_offset));
+        push_row_properties(&mut table.columns, row, properties);
+        Ok(())
+    }
+
+    /// Encodes the collected rows into an immutable [`CompactStore`] whose
+    /// id maps name every pushed node and edge.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`CompactStoreBuilder::build`] errors (e.g. more than
+    /// 32,768 node tables or relationship tables).
+    pub fn finish(self) -> Result<CompactStore, CompactStoreError> {
+        let mut builder = CompactStoreBuilder::new();
+        for table in &self.node_tables {
+            builder = builder.node_table(table.label_key.as_str(), |t| {
+                t.record_len(table.node_ids.len());
+                for (key, values) in &table.columns {
+                    t.inferred_column(key, values);
+                }
+                t
+            });
+        }
+
+        // Relationship tables take the builder's sequential ids in push
+        // order; the source-sorted (stable) order below is the forward CSR
+        // order `CompactStoreBuilder::build` produces, so each edge id maps
+        // to the position its endpoints occupy.
+        let mut edge_id_map: FxHashMap<grafeo_common::types::EdgeId, (u16, u64)> =
+            FxHashMap::default();
+        edge_id_map.reserve(self.edge_ids.len());
+        let mut edge_offset_to_id: Vec<Vec<grafeo_common::types::EdgeId>> =
+            Vec::with_capacity(self.rel_tables.len());
+        for (index, table) in self.rel_tables.into_iter().enumerate() {
+            let rel_table_id =
+                u16::try_from(index).map_err(|_| CompactStoreError::TableCountOverflow {
+                    kind: "relationship",
+                    count: index,
+                    max: MAX_TABLE_ID,
+                })?;
+            let PendingRelTable {
+                edge_type,
+                src_table,
+                dst_table,
+                edges,
+                columns,
+            } = table;
+            // Property columns are indexed by CSR position, so they are
+            // permuted into the same order as the edges they describe.
+            let mut order: Vec<usize> = (0..edges.len()).collect();
+            order.sort_by_key(|&row| edges[row].1);
+            let pairs: Vec<(u32, u32)> = order
+                .iter()
+                .map(|&row| (edges[row].1, edges[row].2))
+                .collect();
+            let ids: Vec<grafeo_common::types::EdgeId> =
+                order.iter().map(|&row| edges[row].0).collect();
+            for (position, id) in ids.iter().enumerate() {
+                edge_id_map.insert(*id, (rel_table_id, position as u64));
+            }
+            edge_offset_to_id.push(ids);
+            let columns: FxHashMap<PropertyKey, Vec<Value>> = columns
+                .into_iter()
+                .map(|(key, mut values)| {
+                    let permuted = order
+                        .iter()
+                        .map(|&row| std::mem::replace(&mut values[row], Value::Null))
+                        .collect();
+                    (key, permuted)
+                })
+                .collect();
+
+            let src_label = self.node_tables[src_table].label_key.as_str();
+            let dst_label = self.node_tables[dst_table].label_key.as_str();
+            builder = builder.rel_table(edge_type.as_str(), src_label, dst_label, |r| {
+                r.edges(pairs).backward(true);
+                for (key, values) in &columns {
+                    r.inferred_column(key, values);
+                }
+                r
+            });
+        }
+
+        let mut compact = builder.build()?;
+
+        let mut node_id_map: FxHashMap<grafeo_common::types::NodeId, (u16, u64)> =
+            FxHashMap::default();
+        node_id_map.reserve(self.node_positions.len());
+        let mut node_offset_to_id: Vec<Vec<grafeo_common::types::NodeId>> =
+            Vec::with_capacity(self.node_tables.len());
+        for (index, table) in self.node_tables.into_iter().enumerate() {
+            let table_id =
+                u16::try_from(index).map_err(|_| CompactStoreError::TableCountOverflow {
+                    kind: "node",
+                    count: index,
+                    max: MAX_TABLE_ID,
+                })?;
+            for (offset, id) in table.node_ids.iter().enumerate() {
+                node_id_map.insert(*id, (table_id, offset as u64));
+            }
+            node_offset_to_id.push(table.node_ids);
+        }
+
+        compact.set_id_maps(
+            node_id_map,
+            edge_id_map,
+            node_offset_to_id,
+            edge_offset_to_id,
+        );
+        Ok(compact)
+    }
 }
 
 /// Infers the columnar encoding type from a slice of [`Value`]s.
@@ -2704,5 +2974,396 @@ mod tests {
             let rec = compact.get_edge(eid).unwrap();
             assert_eq!(rec.edge_type.as_str(), "LINK");
         }
+    }
+
+    // -------------------------------------------------------------------
+    // IncrementalCompactStoreBuilder
+    // -------------------------------------------------------------------
+
+    use grafeo_common::types::{EdgeId, NodeId};
+
+    /// One row of the mixed fixture: every codec the type mapping selects,
+    /// sparse keys, multi-label nodes, and edges pushed out of source order.
+    struct FixtureRow {
+        id: u64,
+        labels: &'static [&'static str],
+        properties: Vec<(PropertyKey, Value)>,
+    }
+
+    fn fixture_nodes() -> Vec<FixtureRow> {
+        let key = PropertyKey::new;
+        vec![
+            FixtureRow {
+                id: 10,
+                labels: &["Person"],
+                properties: vec![
+                    (key("name"), Value::from("Alix")),
+                    (key("age"), Value::Int64(41)),
+                    (key("score"), Value::Float64(1.5)),
+                    (key("active"), Value::Bool(true)),
+                ],
+            },
+            FixtureRow {
+                id: 11,
+                labels: &["Person"],
+                properties: vec![
+                    (key("name"), Value::from("Gus")),
+                    (key("age"), Value::Int64(-7)),
+                    (key("blob"), Value::Bytes(vec![0, 1, 2, 255].into())),
+                ],
+            },
+            FixtureRow {
+                id: 12,
+                labels: &["City", "Place"],
+                properties: vec![(key("name"), Value::from("Lyon"))],
+            },
+            FixtureRow {
+                id: 13,
+                labels: &["Person"],
+                properties: vec![(key("active"), Value::Bool(false))],
+            },
+            FixtureRow {
+                id: 14,
+                labels: &["Place", "City"],
+                properties: vec![
+                    (key("name"), Value::from("Oslo")),
+                    (key("population"), Value::Int64(700_000)),
+                ],
+            },
+        ]
+    }
+
+    /// `(edge id, type, src, dst, properties)`, deliberately not sorted by
+    /// source so the CSR order differs from push order. Every edge carries a
+    /// property: the numeric codecs have no null representation, and
+    /// `from_graph_store` leaves a table's columns short when its last edges
+    /// carry none, so a trailing property-less edge reads back `{}` there and
+    /// `{key: 0}` here — a codec limit, not a builder difference.
+    fn fixture_edges() -> Vec<(u64, &'static str, u64, u64, Vec<(PropertyKey, Value)>)> {
+        let key = PropertyKey::new;
+        vec![
+            (
+                100,
+                "LIVES_IN",
+                13,
+                12,
+                vec![(key("weight"), Value::Float64(1.0))],
+            ),
+            (
+                101,
+                "KNOWS",
+                10,
+                11,
+                vec![(key("since"), Value::Int64(2020))],
+            ),
+            (
+                102,
+                "LIVES_IN",
+                10,
+                14,
+                vec![
+                    (key("weight"), Value::Float64(0.5)),
+                    (key("note"), Value::from("sparse")),
+                ],
+            ),
+            (
+                103,
+                "KNOWS",
+                11,
+                10,
+                vec![(key("since"), Value::Int64(2021))],
+            ),
+            (
+                104,
+                "LIVES_IN",
+                11,
+                12,
+                vec![(key("weight"), Value::Float64(0.25))],
+            ),
+            (
+                105,
+                "KNOWS",
+                13,
+                13,
+                vec![(key("since"), Value::Int64(2022))],
+            ),
+        ]
+    }
+
+    fn fixture_lpg() -> crate::graph::lpg::LpgStore {
+        let store = crate::graph::lpg::LpgStore::new().unwrap();
+        for row in fixture_nodes() {
+            store
+                .create_node_with_id(NodeId(row.id), row.labels)
+                .unwrap();
+            for (key, value) in row.properties {
+                store.set_node_property(NodeId(row.id), key.as_str(), value);
+            }
+        }
+        for (id, edge_type, src, dst, properties) in fixture_edges() {
+            store
+                .create_edge_with_id(EdgeId(id), NodeId(src), NodeId(dst), edge_type)
+                .unwrap();
+            for (key, value) in properties {
+                store.set_edge_property(EdgeId(id), key.as_str(), value);
+            }
+        }
+        store
+    }
+
+    fn fixture_incremental() -> CompactStore {
+        let mut builder = IncrementalCompactStoreBuilder::new();
+        for row in fixture_nodes() {
+            builder
+                .push_node(
+                    NodeId(row.id),
+                    row.labels.iter().copied(),
+                    row.properties.iter().map(|(k, v)| (k, v)),
+                )
+                .unwrap();
+        }
+        for (id, edge_type, src, dst, properties) in fixture_edges() {
+            builder
+                .push_edge(
+                    EdgeId(id),
+                    edge_type,
+                    NodeId(src),
+                    NodeId(dst),
+                    properties.iter().map(|(k, v)| (k, v)),
+                )
+                .unwrap();
+        }
+        assert_eq!(builder.node_count(), 5);
+        assert_eq!(builder.edge_count(), 6);
+        builder.finish().unwrap()
+    }
+
+    fn section_bytes(store: CompactStore) -> Vec<u8> {
+        use grafeo_common::storage::Section;
+        super::super::section::CompactStoreSection::new(std::sync::Arc::new(store))
+            .serialize()
+            .unwrap()
+    }
+
+    /// The incremental build decodes every node and edge exactly as the
+    /// whole-store conversion of the same rows does, under the original ids.
+    #[test]
+    fn incremental_builder_matches_from_graph_store_preserving_ids() {
+        let lpg = fixture_lpg();
+        let reference = from_graph_store_preserving_ids(&lpg).unwrap();
+        let incremental = fixture_incremental();
+
+        assert_eq!(incremental.node_count(), reference.node_count());
+        assert_eq!(incremental.edge_count(), reference.edge_count());
+        let mut labels = incremental.all_labels();
+        labels.sort();
+        let mut reference_labels = reference.all_labels();
+        reference_labels.sort();
+        assert_eq!(labels, reference_labels);
+        assert_eq!(incremental.max_node_id(), reference.max_node_id());
+        assert_eq!(incremental.max_edge_id(), reference.max_edge_id());
+
+        for row in fixture_nodes() {
+            let id = NodeId(row.id);
+            let got = incremental.get_node(id).expect("node resolves");
+            let want = reference.get_node(id).expect("reference node resolves");
+            let mut got_labels: Vec<_> = got.labels.iter().map(|l| l.to_string()).collect();
+            got_labels.sort();
+            let mut want_labels: Vec<_> = want.labels.iter().map(|l| l.to_string()).collect();
+            want_labels.sort();
+            assert_eq!(got_labels, want_labels, "labels of node {}", row.id);
+            let got_props: std::collections::BTreeMap<_, _> = got
+                .properties
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            let want_props: std::collections::BTreeMap<_, _> = want
+                .properties
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            assert_eq!(got_props, want_props, "properties of node {}", row.id);
+            // The reference decodes the original values through the same
+            // codecs, so this also pins the type mapping against the input.
+            for (key, value) in &row.properties {
+                let decoded = got_props.get(key.as_str()).expect("pushed key present");
+                match value {
+                    Value::Bytes(bytes) => assert_eq!(decoded, &Value::Bytes(bytes.clone())),
+                    Value::Bool(b) => assert_eq!(decoded, &Value::Bool(*b)),
+                    Value::Int64(n) => assert_eq!(decoded, &Value::Int64(*n)),
+                    Value::Float64(f) => assert_eq!(decoded, &Value::Float64(*f)),
+                    Value::String(s) => assert_eq!(decoded, &Value::String(s.clone())),
+                    other => panic!("fixture has no {other:?} rows"),
+                }
+            }
+        }
+
+        for (id, edge_type, src, dst, properties) in fixture_edges() {
+            let got = incremental.get_edge(EdgeId(id)).expect("edge resolves");
+            let want = reference
+                .get_edge(EdgeId(id))
+                .expect("reference edge resolves");
+            assert_eq!(got.edge_type.as_str(), edge_type);
+            assert_eq!((got.src, got.dst), (NodeId(src), NodeId(dst)));
+            assert_eq!((got.src, got.dst), (want.src, want.dst));
+            let got_props: std::collections::BTreeMap<_, _> = got
+                .properties
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            let want_props: std::collections::BTreeMap<_, _> = want
+                .properties
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            assert_eq!(got_props, want_props, "properties of edge {id}");
+            for (key, value) in &properties {
+                assert_eq!(got_props.get(key.as_str()), Some(value));
+            }
+            // Backward adjacency resolves the same edge from its target.
+            let incoming: Vec<EdgeId> = incremental
+                .edges_from(NodeId(dst), crate::graph::Direction::Incoming)
+                .into_iter()
+                .map(|(_, eid)| eid)
+                .collect();
+            assert!(
+                incoming.contains(&EdgeId(id)),
+                "edge {id} reachable backward"
+            );
+        }
+    }
+
+    /// Identical rows in identical order serialize to identical bytes, and a
+    /// different push order does not lose or reorder any row's identity.
+    #[test]
+    fn incremental_builder_is_byte_deterministic() {
+        let first = section_bytes(fixture_incremental());
+        let second = section_bytes(fixture_incremental());
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+
+        // Reversed edge order: same rows, same ids, same CSR (source-sorted,
+        // stable), so every id still resolves to its own endpoints.
+        let mut builder = IncrementalCompactStoreBuilder::new();
+        for row in fixture_nodes() {
+            builder
+                .push_node(
+                    NodeId(row.id),
+                    row.labels.iter().copied(),
+                    row.properties.iter().map(|(k, v)| (k, v)),
+                )
+                .unwrap();
+        }
+        for (id, edge_type, src, dst, properties) in fixture_edges().into_iter().rev() {
+            builder
+                .push_edge(
+                    EdgeId(id),
+                    edge_type,
+                    NodeId(src),
+                    NodeId(dst),
+                    properties.iter().map(|(k, v)| (k, v)),
+                )
+                .unwrap();
+        }
+        let reversed = builder.finish().unwrap();
+        for (id, _, src, dst, _) in fixture_edges() {
+            let edge = reversed.get_edge(EdgeId(id)).unwrap();
+            assert_eq!((edge.src, edge.dst), (NodeId(src), NodeId(dst)));
+        }
+    }
+
+    #[test]
+    fn incremental_builder_rejects_duplicate_node_ids() {
+        let mut builder = IncrementalCompactStoreBuilder::new();
+        builder
+            .push_node(NodeId(1), ["A"], std::iter::empty())
+            .unwrap();
+        let err = builder
+            .push_node(NodeId(1), ["B"], std::iter::empty())
+            .unwrap_err();
+        assert!(
+            matches!(err, CompactStoreError::DuplicateNodeId(1)),
+            "{err}"
+        );
+        // The refused push left no trace: one node, one table.
+        assert_eq!(builder.node_count(), 1);
+        let store = builder.finish().unwrap();
+        assert_eq!(store.all_labels(), vec!["A".to_string()]);
+    }
+
+    #[test]
+    fn incremental_builder_rejects_duplicate_edge_ids() {
+        let mut builder = IncrementalCompactStoreBuilder::new();
+        builder
+            .push_node(NodeId(1), ["A"], std::iter::empty())
+            .unwrap();
+        builder
+            .push_node(NodeId(2), ["A"], std::iter::empty())
+            .unwrap();
+        builder
+            .push_edge(EdgeId(7), "R", NodeId(1), NodeId(2), std::iter::empty())
+            .unwrap();
+        let err = builder
+            .push_edge(EdgeId(7), "R", NodeId(2), NodeId(1), std::iter::empty())
+            .unwrap_err();
+        assert!(
+            matches!(err, CompactStoreError::DuplicateEdgeId(7)),
+            "{err}"
+        );
+        let store = builder.finish().unwrap();
+        assert_eq!(store.edge_count(), 1);
+        let edge = store.get_edge(EdgeId(7)).unwrap();
+        assert_eq!((edge.src, edge.dst), (NodeId(1), NodeId(2)));
+    }
+
+    #[test]
+    fn incremental_builder_rejects_edges_to_unknown_nodes() {
+        let mut builder = IncrementalCompactStoreBuilder::new();
+        builder
+            .push_node(NodeId(1), ["A"], std::iter::empty())
+            .unwrap();
+        let err = builder
+            .push_edge(EdgeId(7), "R", NodeId(1), NodeId(9), std::iter::empty())
+            .unwrap_err();
+        assert!(
+            matches!(err, CompactStoreError::UnknownEndpoint { edge: 7, node: 9 }),
+            "{err}"
+        );
+        let err = builder
+            .push_edge(EdgeId(8), "R", NodeId(9), NodeId(1), std::iter::empty())
+            .unwrap_err();
+        assert!(
+            matches!(err, CompactStoreError::UnknownEndpoint { edge: 8, node: 9 }),
+            "{err}"
+        );
+        // A refused edge does not reserve its id or create its table.
+        assert_eq!(builder.edge_count(), 0);
+        builder
+            .push_node(NodeId(9), ["A"], std::iter::empty())
+            .unwrap();
+        builder
+            .push_edge(EdgeId(7), "R", NodeId(1), NodeId(9), std::iter::empty())
+            .unwrap();
+        let store = builder.finish().unwrap();
+        assert_eq!(store.edge_count(), 1);
+        assert_eq!(store.rel_tables_for_type("R").len(), 1);
+    }
+
+    #[test]
+    fn incremental_builder_rejects_unlabeled_nodes() {
+        let mut builder = IncrementalCompactStoreBuilder::new();
+        let err = builder
+            .push_node(NodeId(1), std::iter::empty(), std::iter::empty())
+            .unwrap_err();
+        assert!(matches!(err, CompactStoreError::UnlabeledNode(1)), "{err}");
+        assert_eq!(builder.node_count(), 0);
+    }
+
+    #[test]
+    fn incremental_builder_empty_finishes_to_empty_store() {
+        let store = IncrementalCompactStoreBuilder::new().finish().unwrap();
+        assert_eq!(store.node_count(), 0);
+        assert_eq!(store.edge_count(), 0);
+        assert!(store.max_node_id().is_none());
     }
 }

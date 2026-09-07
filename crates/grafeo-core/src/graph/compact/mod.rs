@@ -34,7 +34,10 @@ mod tests;
 /// Zone maps for skip-pruning predicate evaluation.
 pub mod zone_map;
 
-pub use builder::{CompactStoreBuilder, from_graph_store, from_graph_store_preserving_ids};
+pub use builder::{
+    CompactStoreBuilder, IncrementalCompactStoreBuilder, from_graph_store,
+    from_graph_store_preserving_ids,
+};
 
 use std::sync::Arc;
 

@@ -184,8 +184,8 @@ impl CompactStoreSection {
         for nt in &store.node_tables_by_id {
             write_str(&mut buf, nt.label());
             write_len(&mut buf, nt.len());
-            let columns = nt.columns();
             let zone_maps = nt.zone_maps();
+            let columns = sorted_by_key(nt.columns());
             write_len(&mut buf, columns.len());
             for (key, codec) in columns {
                 write_str(&mut buf, key.as_str());
@@ -223,7 +223,7 @@ impl CompactStoreSection {
                 buf.push(0);
             }
             drain_chunk(&mut buf, sink, &mut crc, false)?;
-            let properties = rt.properties();
+            let properties = sorted_by_key(rt.properties());
             write_len(&mut buf, properties.len());
             for (key, codec) in properties {
                 write_str(&mut buf, key.as_str());
@@ -254,9 +254,17 @@ impl CompactStoreSection {
         if !store.preserves_ids() {
             return Ok(());
         }
+        // Ascending id order: the maps hash with a per-instance random
+        // seed, so their walk order would make two writes of the same store
+        // differ byte for byte.
         if let Some(ref node_map) = store.node_id_map {
-            write_len(buf, node_map.len());
-            for (&nid, &(tid, off)) in node_map {
+            let mut entries: Vec<(NodeId, u16, u64)> = node_map
+                .iter()
+                .map(|(&nid, &(tid, off))| (nid, tid, off))
+                .collect();
+            entries.sort_unstable_by_key(|&(nid, _, _)| nid);
+            write_len(buf, entries.len());
+            for (nid, tid, off) in entries {
                 write_u64(buf, nid.as_u64());
                 write_u16(buf, tid);
                 write_u64(buf, off);
@@ -264,8 +272,13 @@ impl CompactStoreSection {
             }
         }
         if let Some(ref edge_map) = store.edge_id_map {
-            write_len(buf, edge_map.len());
-            for (&eid, &(rtid, pos)) in edge_map {
+            let mut entries: Vec<(EdgeId, u16, u64)> = edge_map
+                .iter()
+                .map(|(&eid, &(rtid, pos))| (eid, rtid, pos))
+                .collect();
+            entries.sort_unstable_by_key(|&(eid, _, _)| eid);
+            write_len(buf, entries.len());
+            for (eid, rtid, pos) in entries {
                 write_u64(buf, eid.as_u64());
                 write_u16(buf, rtid);
                 write_u64(buf, pos);
@@ -274,6 +287,19 @@ impl CompactStoreSection {
         }
         Ok(())
     }
+}
+
+/// A table's columns in ascending key order.
+///
+/// The column maps hash with a per-instance random seed, so writing them in
+/// walk order would make two serializations of the same store differ byte
+/// for byte; the reader rebuilds a map, so any order decodes identically.
+fn sorted_by_key(
+    columns: &FxHashMap<PropertyKey, ColumnCodec>,
+) -> Vec<(&PropertyKey, &ColumnCodec)> {
+    let mut sorted: Vec<(&PropertyKey, &ColumnCodec)> = columns.iter().collect();
+    sorted.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+    sorted
 }
 
 /// Target scratch size before a drain. Large enough that a per-row
