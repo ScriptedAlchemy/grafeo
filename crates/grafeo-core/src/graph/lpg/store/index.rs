@@ -75,14 +75,21 @@ impl LpgStore {
         self.property_indexes.read().contains_key(&key)
     }
 
-    /// Returns the names of all indexed properties.
+    /// Returns the names of all indexed properties, sorted.
+    ///
+    /// The catalog snapshot persists this list verbatim, so it is ordered
+    /// rather than left in hash-map iteration order: two stores with the same
+    /// indexes serialize the same catalog bytes.
     #[must_use]
     pub fn property_index_keys(&self) -> Vec<String> {
-        self.property_indexes
+        let mut keys: Vec<String> = self
+            .property_indexes
             .read()
             .keys()
             .map(|k| k.to_string())
-            .collect()
+            .collect();
+        keys.sort_unstable();
+        keys
     }
 
     /// Updates property indexes when a property is set.

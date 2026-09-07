@@ -237,11 +237,17 @@ fn written_container_reopens_writable_and_read_only_with_every_row() {
 
 #[test]
 fn identical_rows_write_identical_sections() {
+    // Enough property indexes that hash-map iteration order would almost
+    // surely differ from insertion order; the catalog must persist them in
+    // one canonical order regardless of how the caller listed them.
+    let indexes: Vec<String> = (0..12).map(|i| format!("index_{i}")).collect();
+    let mut reversed = indexes.clone();
+    reversed.reverse();
     let dir = tempfile::TempDir::new().unwrap();
     let first = dir.path().join("first.grafeo");
     let second = dir.path().join("second.grafeo");
-    write_fixture(&first);
-    write_fixture(&second);
+    GrafeoDB::write_compact_container(&first, fixture_store(), indexes).unwrap();
+    GrafeoDB::write_compact_container(&second, fixture_store(), reversed).unwrap();
     let first = section_payloads(&first);
     assert!(first.values().all(|bytes| !bytes.is_empty()));
     assert_eq!(first, section_payloads(&second));
