@@ -979,6 +979,96 @@ impl GrafeoDB {
         })
     }
 
+    /// Writes `store` as a complete single-file database container at `path`,
+    /// without a live database.
+    ///
+    /// The file holds exactly what [`close`](Self::close) writes for a
+    /// compacted database — the compact base, an empty LPG overlay, and a
+    /// catalog naming `property_indexes` — produced through the same
+    /// streaming section writer, so [`GrafeoDB::open`] (writable or
+    /// [`Config::read_only`]) reopens it as a layered database whose base is
+    /// `store`, with those property indexes rebuilt. Pair it with
+    /// [`IncrementalCompactStoreBuilder`] to build a database from a row
+    /// stream with one columnar copy in memory instead of an LPG plus its
+    /// compaction, and one container write instead of a WAL plus a
+    /// checkpoint.
+    ///
+    /// Durability is the section writer's: the sections stream to the file,
+    /// the file is synced, then the header is flipped and synced. A process
+    /// that dies before the flip leaves the empty container `create` wrote
+    /// first, which opens as an empty database; one that dies after it
+    /// leaves the finished container. No interruption yields a partially
+    /// populated one, so a caller that needs "complete or absent" writes to
+    /// a staging path and renames the finished file into place. `path` must
+    /// not exist; the write claims it exclusively and releases it before
+    /// returning. The result is validated by reopening the container
+    /// read-only and checking that the header and section directory
+    /// round-trip with the three sections written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `path` exists or on any I/O or serialization
+    /// failure.
+    ///
+    /// [`IncrementalCompactStoreBuilder`]: grafeo_core::graph::compact::IncrementalCompactStoreBuilder
+    #[cfg(all(feature = "grafeo-file", feature = "compact-store", feature = "lpg"))]
+    pub fn write_compact_container(
+        path: impl AsRef<Path>,
+        store: Arc<grafeo_core::graph::compact::CompactStore>,
+        property_indexes: impl IntoIterator<Item = String>,
+    ) -> Result<()> {
+        use grafeo_common::storage::{Section, SectionType};
+        use grafeo_common::utils::error::StorageError;
+        use grafeo_core::graph::GraphStore;
+        use grafeo_core::graph::compact::section::CompactStoreSection;
+        use grafeo_core::graph::lpg::LpgStoreSection;
+
+        let path = path.as_ref();
+        let node_count = store.node_count() as u64;
+        let edge_count = store.edge_count() as u64;
+
+        let overlay = Arc::new(LpgStore::new().map_err(|e| Error::Internal(e.to_string()))?);
+        for key in property_indexes {
+            overlay.create_property_index(&key);
+        }
+        let base_section = CompactStoreSection::new(store);
+        let overlay_section = LpgStoreSection::new(Arc::clone(&overlay));
+        let catalog_section =
+            catalog_section::CatalogSection::new(Arc::new(Catalog::new()), overlay, || 0);
+        let sections: [&dyn Section; 3] = [&base_section, &overlay_section, &catalog_section];
+
+        {
+            let fm = GrafeoFileManager::create(path)?;
+            fm.write_sections_streaming(&sections, 0, 0, node_count, edge_count)?;
+        }
+
+        let reopened = GrafeoFileManager::open_read_only(path)?;
+        let header = reopened.active_header();
+        let directory = reopened.read_section_directory()?.ok_or_else(|| {
+            Error::Storage(StorageError::Corruption(
+                "written compact container has no section directory".into(),
+            ))
+        })?;
+        let expected = [
+            SectionType::CompactStore,
+            SectionType::LpgStore,
+            SectionType::Catalog,
+        ];
+        if header.node_count != node_count
+            || header.edge_count != edge_count
+            || directory.len() != expected.len()
+            || expected.iter().any(|kind| directory.find(*kind).is_none())
+        {
+            return Err(Error::Storage(StorageError::Corruption(format!(
+                "written compact container did not round-trip: header {}/{} rows, {} sections",
+                header.node_count,
+                header.edge_count,
+                directory.len()
+            ))));
+        }
+        Ok(())
+    }
+
     /// Compacts the database into a two-layer store: columnar base + mutable overlay.
     ///
     /// Takes a snapshot of all nodes and edges from the current store, builds

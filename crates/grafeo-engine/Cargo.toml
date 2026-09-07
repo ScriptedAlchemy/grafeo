@@ -149,3 +149,8 @@ harness = false
 [[bench]]
 name = "topk_e2e"
 harness = false
+
+[[bench]]
+name = "compact_container_build"
+harness = false
+required-features = ["lpg", "grafeo-file", "compact-store"]
