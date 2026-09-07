@@ -19,6 +19,7 @@ use super::node_table::NodeTable;
 use super::rel_table::RelTable;
 use super::schema::{ColumnDef, ColumnType, EdgeSchema, TableSchema};
 use super::zone_map::ZoneMap;
+use crate::codec::BitVector;
 use crate::statistics::{EdgeTypeStatistics, LabelStatistics, Statistics};
 
 /// Magic bytes identifying a CompactStore section.
@@ -29,7 +30,20 @@ const MAGIC: [u8; 4] = *b"GCST";
 /// with the marker prefix is a typed payload — a `Value::Bytes` hex body
 /// or an escaped string — never a raw user string. The column byte
 /// layout is identical to v3.
-const FORMAT_VERSION: u8 = 4;
+///
+/// v5 adds a per-column null mask (flag byte + [`BitVector`]) ahead of
+/// each node and edge column body, so a row the builder padded because
+/// its node never had the property reads back as absent instead of as
+/// `0`, `""`, or `false`. Column bodies are unchanged from v3/v4.
+const FORMAT_VERSION: u8 = 5;
+
+/// First version that stores per-column null masks. Columns read from an
+/// older section have no mask, so their padded rows still decode as the
+/// padding value, exactly as they always did.
+const NULL_MASKS_SINCE_VERSION: u8 = 5;
+
+/// v4 layout: v3 column layout with marked dictionary entries.
+const FORMAT_VERSION_V4: u8 = 4;
 
 /// First version whose dictionaries use the marked-entry mapping.
 ///
@@ -196,6 +210,7 @@ impl CompactStoreSection {
                 } else {
                     buf.push(0);
                 }
+                write_null_mask(&mut buf, version, nt.null_mask(key))?;
                 write_codec(
                     codec,
                     &mut buf,
@@ -227,6 +242,7 @@ impl CompactStoreSection {
             write_len(&mut buf, properties.len());
             for (key, codec) in properties {
                 write_str(&mut buf, key.as_str());
+                write_null_mask(&mut buf, version, rt.null_mask(key))?;
                 // Edge property columns don't track per-block zone maps
                 // yet; v3 will compute them inline during write.
                 write_codec(codec, &mut buf, version, None);
@@ -352,6 +368,47 @@ fn write_codec(
     }
 }
 
+/// Writes a column's null mask as a presence byte followed, when present,
+/// by the [`BitVector`] bytes. Nothing is written below
+/// [`NULL_MASKS_SINCE_VERSION`]: those layouts have no slot for it, and a
+/// reader of that version pads exactly as it did before masks existed.
+fn write_null_mask(
+    buf: &mut Vec<u8>,
+    version: u8,
+    mask: Option<&BitVector>,
+) -> grafeo_common::utils::error::Result<()> {
+    if version < NULL_MASKS_SINCE_VERSION {
+        return Ok(());
+    }
+    match mask {
+        Some(mask) => {
+            buf.push(1);
+            buf.extend_from_slice(&mask.to_bytes()?);
+        }
+        None => buf.push(0),
+    }
+    Ok(())
+}
+
+/// Reads the null mask [`write_null_mask`] wrote, when the section version
+/// carries one.
+fn read_null_mask(data: &[u8], pos: &mut usize, version: u8) -> Result<Option<BitVector>, String> {
+    if version < NULL_MASKS_SINCE_VERSION {
+        return Ok(None);
+    }
+    let present = *data.get(*pos).ok_or("truncated null mask flag")?;
+    *pos += 1;
+    match present {
+        0 => Ok(None),
+        1 => {
+            let mask = BitVector::from_bytes(&data[*pos..]).map_err(|e| e.to_string())?;
+            *pos += 4 + mask.word_count() * 8;
+            Ok(Some(mask))
+        }
+        other => Err(format!("invalid null mask flag {other}")),
+    }
+}
+
 impl Section for CompactStoreSection {
     fn section_type(&self) -> SectionType {
         SectionType::CompactStore
@@ -420,9 +477,11 @@ fn read_codec(
         FORMAT_VERSION_V2 => ColumnCodec::read_from_v2(data, pos)
             .map(|c| (c, None))
             .map_err(|e| e.to_string())?,
-        FORMAT_VERSION_V3 | FORMAT_VERSION => ColumnCodec::read_from_v3(data, pos)
-            .map(|(c, stats)| (c, Some(stats)))
-            .map_err(|e| e.to_string())?,
+        FORMAT_VERSION_V3 | FORMAT_VERSION_V4 | FORMAT_VERSION => {
+            ColumnCodec::read_from_v3(data, pos)
+                .map(|(c, stats)| (c, Some(stats)))
+                .map_err(|e| e.to_string())?
+        }
         _ => return Err(format!("unsupported CompactStore version {version}")),
     };
     if version < DICT_MARKERS_SINCE_VERSION {
@@ -463,10 +522,14 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
     pos += 1;
     if !matches!(
         version,
-        FORMAT_VERSION | FORMAT_VERSION_V3 | FORMAT_VERSION_V2 | FORMAT_VERSION_V1
+        FORMAT_VERSION
+            | FORMAT_VERSION_V4
+            | FORMAT_VERSION_V3
+            | FORMAT_VERSION_V2
+            | FORMAT_VERSION_V1
     ) {
         return Err(format!(
-            "unsupported CompactStore section version {version} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION_V3}, {FORMAT_VERSION})"
+            "unsupported CompactStore section version {version} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION_V3}, {FORMAT_VERSION_V4}, {FORMAT_VERSION})"
         ));
     }
     let flags = data[pos];
@@ -489,6 +552,7 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
         let mut columns: FxHashMap<PropertyKey, ColumnCodec> = FxHashMap::default();
         let mut zone_maps: FxHashMap<PropertyKey, ZoneMap> = FxHashMap::default();
         let mut block_zone_maps: FxHashMap<PropertyKey, Vec<ZoneMap>> = FxHashMap::default();
+        let mut null_masks: FxHashMap<PropertyKey, BitVector> = FxHashMap::default();
         let mut col_defs = Vec::with_capacity(num_cols);
 
         for _ in 0..num_cols {
@@ -500,6 +564,9 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
             if has_zm == 1 {
                 let zm = read_zone_map(data, &mut pos)?;
                 zone_maps.insert(key.clone(), zm);
+            }
+            if let Some(mask) = read_null_mask(data, &mut pos, version)? {
+                null_masks.insert(key.clone(), mask);
             }
 
             let (codec, maybe_block_stats) =
@@ -519,7 +586,8 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
             zone_maps,
             block_zone_maps,
             row_count,
-        );
+        )
+        .with_null_masks(null_masks);
         node_tables.push(table);
         label_to_table_id.insert(label.clone(), table_id);
         table_id_to_label.push(label);
@@ -550,10 +618,14 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
 
         let num_props = read_u32(data, &mut pos)? as usize;
         let mut properties: FxHashMap<PropertyKey, ColumnCodec> = FxHashMap::default();
+        let mut null_masks: FxHashMap<PropertyKey, BitVector> = FxHashMap::default();
         let mut prop_defs = Vec::with_capacity(num_props);
         for _ in 0..num_props {
             let key_str = read_string(data, &mut pos)?;
             let key = PropertyKey::new(&key_str);
+            if let Some(mask) = read_null_mask(data, &mut pos, version)? {
+                null_masks.insert(key.clone(), mask);
+            }
             let (codec, _block_stats) = read_codec(data_bytes, &mut pos, version)
                 .map_err(|e| format!("edge codec: {e}"))?;
             let col_type = infer_column_type_from_codec(&codec);
@@ -578,7 +650,8 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
             prop_defs,
         );
 
-        let table = RelTable::new(schema, fwd, bwd, properties, src_tid, dst_tid);
+        let table = RelTable::new(schema, fwd, bwd, properties, src_tid, dst_tid)
+            .with_null_masks(null_masks);
         edge_type_to_rel_id
             .entry(edge_type.clone())
             .or_default()
@@ -902,6 +975,7 @@ mod tests {
             FORMAT_VERSION_V1,
             FORMAT_VERSION_V2,
             FORMAT_VERSION_V3,
+            FORMAT_VERSION_V4,
             FORMAT_VERSION,
         ] {
             let bytes = section.serialize_with_version(version).expect("serialize");
@@ -988,6 +1062,7 @@ mod tests {
             FORMAT_VERSION_V1,
             FORMAT_VERSION_V2,
             FORMAT_VERSION_V3,
+            FORMAT_VERSION_V4,
             FORMAT_VERSION,
         ] {
             let via_vec = section.serialize_with_version(version).unwrap();

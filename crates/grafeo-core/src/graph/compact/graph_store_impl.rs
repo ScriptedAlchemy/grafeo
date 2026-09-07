@@ -296,6 +296,9 @@ impl GraphStore for CompactStore {
             if let Some(col) = nt.column(&key) {
                 let table_id = nt.table_id();
                 for offset in col.find_eq(value) {
+                    if nt.is_null(offset, &key) {
+                        continue;
+                    }
                     let compact_id = encode_node_id(table_id, offset as u64);
                     results.push(self.to_original_node_id(compact_id));
                 }
@@ -368,6 +371,9 @@ impl GraphStore for CompactStore {
             if let Some(col) = nt.column(&key) {
                 let table_id = nt.table_id();
                 for offset in col.find_in_range(min, max, min_inclusive, max_inclusive) {
+                    if nt.is_null(offset, &key) {
+                        continue;
+                    }
                     let compact_id = encode_node_id(table_id, offset as u64);
                     results.push(self.to_original_node_id(compact_id));
                 }
@@ -537,8 +543,10 @@ impl GraphStoreSearch for CompactStore {
             // reason: usize → u64 fits on every supported target (row count
             // bounded by u32::MAX per the section format).
             #[allow(clippy::cast_possible_truncation)]
+            let key = key.clone();
             let iter = col
                 .range_iter(block_zones, min, max, min_inclusive, max_inclusive)
+                .filter(move |&offset| !nt.is_null(offset, &key))
                 .map(move |offset| {
                     let compact_id = encode_node_id(table_id, offset as u64);
                     store.to_original_node_id(compact_id)

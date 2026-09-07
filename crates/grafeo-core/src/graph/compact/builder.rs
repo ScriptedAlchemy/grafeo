@@ -102,6 +102,7 @@ pub struct NodeTableBuilder {
     label: ArcStr,
     columns: Vec<(PropertyKey, ColumnCodec)>,
     zone_maps: Vec<(PropertyKey, ZoneMap)>,
+    null_masks: Vec<(PropertyKey, BitVector)>,
     len: Option<usize>,
     length_mismatch: Option<(usize, usize)>,
     value_overflow: Option<(String, u64)>,
@@ -113,6 +114,7 @@ impl NodeTableBuilder {
             label: label.into(),
             columns: Vec::new(),
             zone_maps: Vec::new(),
+            null_masks: Vec::new(),
             len: None,
             length_mismatch: None,
             value_overflow: None,
@@ -214,12 +216,15 @@ impl NodeTableBuilder {
 
     /// Adds a column whose codec is inferred from its row values (the
     /// `from_graph_store` type mapping), with the zone map that codec
-    /// supports.
+    /// supports and the mask of rows that hold no value.
     fn inferred_column(&mut self, key: &PropertyKey, values: &[Value]) -> &mut Self {
-        let (codec, zone_map) = encode_inferred_column(values);
+        let (codec, zone_map, nulls) = encode_inferred_column(values);
         self.record_len(values.len());
         if let Some(zone_map) = zone_map {
             self.zone_maps.push((key.clone(), zone_map));
+        }
+        if let Some(nulls) = nulls {
+            self.null_masks.push((key.clone(), nulls));
         }
         self.columns.push((key.clone(), codec));
         self
@@ -250,6 +255,7 @@ pub struct RelTableBuilder {
     edges: Vec<(u32, u32)>,
     backward: bool,
     properties: Vec<(PropertyKey, ColumnCodec)>,
+    null_masks: Vec<(PropertyKey, BitVector)>,
 }
 
 impl RelTableBuilder {
@@ -265,6 +271,7 @@ impl RelTableBuilder {
             edges: Vec::new(),
             backward: false,
             properties: Vec::new(),
+            null_masks: Vec::new(),
         }
     }
 
@@ -289,10 +296,13 @@ impl RelTableBuilder {
     }
 
     /// Adds an edge property column whose codec is inferred from its row
-    /// values (the `from_graph_store` type mapping). Edge columns carry no
-    /// zone maps.
+    /// values (the `from_graph_store` type mapping), with the mask of rows
+    /// that hold no value. Edge columns carry no zone maps.
     fn inferred_column(&mut self, key: &PropertyKey, values: &[Value]) -> &mut Self {
-        let (codec, _zone_map) = encode_inferred_column(values);
+        let (codec, _zone_map, nulls) = encode_inferred_column(values);
+        if let Some(nulls) = nulls {
+            self.null_masks.push((key.clone(), nulls));
+        }
         self.properties.push((key.clone(), codec));
         self
     }
@@ -481,7 +491,8 @@ impl CompactStoreBuilder {
                 zone_maps,
                 block_zone_maps,
                 row_count,
-            );
+            )
+            .with_null_masks(ntb.null_masks.into_iter().collect());
             node_tables_by_id.push(table);
         }
 
@@ -575,7 +586,8 @@ impl CompactStoreBuilder {
             let properties: FxHashMap<PropertyKey, ColumnCodec> =
                 rtb.properties.into_iter().collect();
 
-            let table = RelTable::new(schema, fwd, bwd, properties, src_table_id, dst_table_id);
+            let table = RelTable::new(schema, fwd, bwd, properties, src_table_id, dst_table_id)
+                .with_null_masks(rtb.null_masks.into_iter().collect());
             edge_type_to_rel_id
                 .entry(rtb.edge_type.clone())
                 .or_default()
@@ -1096,14 +1108,34 @@ pub fn from_graph_store_preserving_ids(
     Ok(compact)
 }
 
+/// Rows of `values` holding `Value::Null`, as a mask the table consults
+/// before decoding a row; `None` when the column is dense.
+///
+/// A column body has no null representation — a padded row decodes as `0`,
+/// `""`, or `false` — so without the mask a property a node never had would
+/// read back as a value it never had.
+fn null_mask(values: &[Value]) -> Option<BitVector> {
+    values
+        .iter()
+        .any(|v| matches!(v, Value::Null))
+        .then(|| values.iter().map(|v| matches!(v, Value::Null)).collect())
+}
+
 /// Encodes one property column from its row values with the codec
 /// [`infer_type_from_values`] selects, plus the zone map that codec supports
-/// (`None` for float and vector columns, which carry no zone statistics).
+/// (`None` for float and vector columns, which carry no zone statistics)
+/// and the [`null_mask`] of the rows that hold no value.
 ///
 /// This is the single definition of the `from_graph_store` type mapping;
 /// the whole-store conversion and the incremental builder both encode
 /// through it, so a store built either way holds byte-identical columns.
-fn encode_inferred_column(values: &[Value]) -> (ColumnCodec, Option<ZoneMap>) {
+fn encode_inferred_column(values: &[Value]) -> (ColumnCodec, Option<ZoneMap>, Option<BitVector>) {
+    let nulls = null_mask(values);
+    let (codec, zone_map) = encode_inferred_codec(values);
+    (codec, zone_map, nulls)
+}
+
+fn encode_inferred_codec(values: &[Value]) -> (ColumnCodec, Option<ZoneMap>) {
     match infer_type_from_values(values) {
         InferredType::BitPacked => {
             let u64_values: Vec<u64> = values
@@ -1948,25 +1980,41 @@ mod tests {
         let ids = compact.nodes_by_label("Item");
         assert_eq!(ids.len(), 3);
 
-        // All nodes should exist and have the properties they were given.
-        // Missing properties should be null-padded (0 for BitPacked, "" for Dict).
-        let mut name_count = 0;
-        let mut score_count = 0;
+        // Every node has exactly the properties it was given: a property a
+        // node never had is absent, not the column's padding value.
+        let name = PropertyKey::new("name");
+        let score = PropertyKey::new("score");
+        let mut names = Vec::new();
+        let mut scores = Vec::new();
         for &id in &ids {
-            if let Some(Value::String(s)) = compact.get_node_property(id, &PropertyKey::new("name"))
-                && !s.is_empty()
-            {
-                name_count += 1;
-            }
-            if let Some(Value::Int64(n)) = compact.get_node_property(id, &PropertyKey::new("score"))
-                && n > 0
-            {
-                score_count += 1;
-            }
+            let node = compact.get_node(id).unwrap();
+            names.push(node.properties.get(&name).cloned());
+            scores.push(node.properties.get(&score).cloned());
+            assert_eq!(compact.get_node_property(id, &name), names[names.len() - 1]);
+            assert_eq!(
+                compact.get_node_property(id, &score),
+                scores[scores.len() - 1]
+            );
         }
-        // Two nodes have real names, two have real scores.
-        assert_eq!(name_count, 2);
-        assert_eq!(score_count, 2);
+        names.sort_by_key(|v| v.is_none());
+        scores.sort_by_key(|v| v.is_none());
+        assert!(names.contains(&Some(Value::from("alpha"))));
+        assert!(names.contains(&Some(Value::from("beta"))));
+        assert_eq!(names[2], None, "node c never had a name");
+        assert!(scores.contains(&Some(Value::Int64(10))));
+        assert!(scores.contains(&Some(Value::Int64(20))));
+        assert_eq!(scores[2], None, "node b never had a score");
+        // Neither padding value is findable as a real value.
+        assert!(
+            compact
+                .find_nodes_by_property("name", &Value::from(""))
+                .is_empty()
+        );
+        assert!(
+            compact
+                .find_nodes_by_property("score", &Value::Int64(0))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2016,9 +2064,24 @@ mod tests {
         let ids = compact.nodes_by_label("Item");
         assert_eq!(ids.len(), 2);
 
-        // Node a has 'x' but 'y' is null-padded.
-        // Node b has 'y' but 'x' is null-padded.
-        // This exercises the null-padding logic for sparse properties.
+        // Node a has 'x' and no 'y'; node b has 'y' and no 'x'. Each reads
+        // back with exactly one property.
+        let x = PropertyKey::new("x");
+        let y = PropertyKey::new("y");
+        let mut seen = Vec::new();
+        for &id in &ids {
+            let node = compact.get_node(id).unwrap();
+            assert_eq!(node.properties.len(), 1, "{:?}", node.properties);
+            seen.push((
+                compact.get_node_property(id, &x),
+                compact.get_node_property(id, &y),
+            ));
+        }
+        seen.sort_by_key(|(x, _)| x.is_none());
+        assert_eq!(
+            seen,
+            vec![(Some(Value::Int64(1)), None), (None, Some(Value::Int64(2))),]
+        );
     }
 
     #[test]
@@ -3230,6 +3293,140 @@ mod tests {
                 incoming.contains(&EdgeId(id)),
                 "edge {id} reachable backward"
             );
+        }
+    }
+
+    /// Rows of one table with different property sets read back with exactly
+    /// the properties they were pushed with — in memory, after a section
+    /// round trip, and through the property index — for node and edge
+    /// columns of every codec, including the marked `Bytes` dictionary.
+    #[test]
+    fn incremental_builder_keeps_sparse_properties_absent() {
+        use grafeo_common::storage::Section;
+        use std::sync::Arc;
+
+        let full: Vec<(PropertyKey, Value)> = vec![
+            (
+                PropertyKey::new("record"),
+                Value::Bytes(vec![7u8; 4096].into()),
+            ),
+            (PropertyKey::new("marker"), Value::from("m")),
+            (PropertyKey::new("count"), Value::Int64(3)),
+            (PropertyKey::new("neg"), Value::Int64(-3)),
+            (PropertyKey::new("ratio"), Value::Float64(0.5)),
+            (PropertyKey::new("flag"), Value::Bool(true)),
+        ];
+        let bare: Vec<(PropertyKey, Value)> = Vec::new();
+        let rows: [(u64, &Vec<(PropertyKey, Value)>); 4] =
+            [(10, &full), (11, &bare), (12, &full), (13, &bare)];
+
+        let mut builder = IncrementalCompactStoreBuilder::new();
+        for (id, properties) in rows {
+            builder
+                .push_node(
+                    NodeId(id),
+                    ["Entity"],
+                    properties.iter().map(|(k, v)| (k, v)),
+                )
+                .unwrap();
+        }
+        // Edges 20 and 22 carry a weight, 21 does not.
+        let weight = [(PropertyKey::new("weight"), Value::Int64(7))];
+        builder
+            .push_edge(
+                EdgeId(20),
+                "REL",
+                NodeId(10),
+                NodeId(11),
+                weight.iter().map(|(k, v)| (k, v)),
+            )
+            .unwrap();
+        builder
+            .push_edge(
+                EdgeId(21),
+                "REL",
+                NodeId(11),
+                NodeId(12),
+                std::iter::empty(),
+            )
+            .unwrap();
+        builder
+            .push_edge(
+                EdgeId(22),
+                "REL",
+                NodeId(12),
+                NodeId(13),
+                weight.iter().map(|(k, v)| (k, v)),
+            )
+            .unwrap();
+        let built = builder.finish().unwrap();
+
+        let section = super::super::section::CompactStoreSection::new(Arc::new(built));
+        let bytes = section.serialize().unwrap();
+        let mut restored = super::super::section::CompactStoreSection::empty();
+        restored.deserialize(&bytes).unwrap();
+        let reopened = restored.store().unwrap();
+        reopened.enable_property_indexes([PropertyKey::new("marker")]);
+
+        for store in [section.store().unwrap(), reopened] {
+            for (id, properties) in rows {
+                let node = store.get_node(NodeId(id)).unwrap();
+                let expected: FxHashMap<PropertyKey, Value> = properties.iter().cloned().collect();
+                let actual: FxHashMap<PropertyKey, Value> = node
+                    .properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                assert_eq!(actual, expected, "node {id}");
+                for (key, _) in &full {
+                    assert_eq!(
+                        store.get_node_property(NodeId(id), key),
+                        expected.get(key).cloned(),
+                        "node {id} property {key}"
+                    );
+                }
+            }
+            assert_eq!(
+                store.get_edge(EdgeId(21)).unwrap().properties.len(),
+                0,
+                "edge 21 never had a weight"
+            );
+            assert_eq!(
+                store.get_edge_property(EdgeId(20), &PropertyKey::new("weight")),
+                Some(Value::Int64(7))
+            );
+            assert_eq!(
+                store.get_edge_property(EdgeId(21), &PropertyKey::new("weight")),
+                None
+            );
+            // The padding values are not findable, indexed or scanned.
+            assert!(
+                store
+                    .find_nodes_by_property("marker", &Value::from(""))
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .find_nodes_by_property("count", &Value::Int64(0))
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .find_nodes_by_property("flag", &Value::Bool(false))
+                    .is_empty()
+            );
+            let mut with_marker = store.find_nodes_by_property("marker", &Value::from("m"));
+            with_marker.sort();
+            assert_eq!(with_marker, vec![NodeId(10), NodeId(12)]);
+            let mut in_range = store.find_nodes_in_range(
+                "count",
+                Some(&Value::Int64(0)),
+                Some(&Value::Int64(10)),
+                true,
+                true,
+            );
+            in_range.sort();
+            assert_eq!(in_range, vec![NodeId(10), NodeId(12)]);
         }
     }
 

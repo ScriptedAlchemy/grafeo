@@ -413,6 +413,9 @@ impl CompactStore {
             any_column = true;
             let table_id = nt.table_id();
             for offset in 0..col.len() {
+                if nt.is_null(offset, key) {
+                    continue;
+                }
                 let Some(value) = col.get(offset) else {
                     continue;
                 };
