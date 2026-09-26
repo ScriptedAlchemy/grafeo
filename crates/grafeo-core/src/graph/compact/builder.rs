@@ -91,6 +91,10 @@ pub enum CompactStoreError {
         /// The missing endpoint's node id.
         node: u64,
     },
+    /// The incremental builder's column spool could not record or return a
+    /// value.
+    #[error("column spool: {0}")]
+    Spool(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -527,43 +531,8 @@ impl CompactStoreBuilder {
                 .get(dst_table_id as usize)
                 .map_or(0, |t| t.len());
 
-            // Sort edges by source for forward CSR.
-            let mut fwd_edges = rtb.edges.clone();
-            fwd_edges.sort_by_key(|&(src, _dst)| src);
-            let fwd = CsrAdjacency::from_sorted_edges(src_node_count, &fwd_edges);
-
-            // Optionally build backward CSR + pre-compute bwd-to-fwd position mapping.
-            let bwd =
-                if rtb.backward {
-                    let mut bwd_edges: Vec<(u32, u32)> =
-                        rtb.edges.iter().map(|&(src, dst)| (dst, src)).collect();
-                    bwd_edges.sort_by_key(|&(dst, _src)| dst);
-                    let mut bwd_csr = CsrAdjacency::from_sorted_edges(dst_node_count, &bwd_edges);
-
-                    // For each backward edge (dst -> src), find the forward CSR position
-                    // of the corresponding (src -> dst) edge. This eliminates the O(degree)
-                    // linear scan in edges_to_target at query time.
-                    let mut mapping = Vec::with_capacity(bwd_edges.len());
-                    for &(dst, src) in &bwd_edges {
-                        let fwd_neighbors = fwd.neighbors(src);
-                        let fwd_start = fwd.offset_of(src);
-                        let local_idx = fwd_neighbors.iter().position(|&t| t == dst).ok_or_else(
-                            || {
-                                CompactStoreError::InconsistentEdgeData(format!(
-                                    "backward edge ({dst}->{src}) has no corresponding forward edge"
-                                ))
-                            },
-                        )?;
-                        // reason: local index within CSR neighbors fits u32
-                        #[allow(clippy::cast_possible_truncation)]
-                        mapping.push(fwd_start + local_idx as u32);
-                    }
-                    bwd_csr.set_edge_data(mapping);
-
-                    Some(bwd_csr)
-                } else {
-                    None
-                };
+            let (fwd, bwd) =
+                rel_adjacency(&rtb.edges, src_node_count, dst_node_count, rtb.backward)?;
 
             // Build edge property columns.
             let property_col_defs: Vec<ColumnDef> = rtb
@@ -637,6 +606,45 @@ impl CompactStoreBuilder {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Builds a relationship table's forward CSR and, when `backward` is set,
+/// its backward CSR with the backward-to-forward position mapping that
+/// spares `edges_to_target` an O(degree) scan at query time.
+fn rel_adjacency(
+    edges: &[(u32, u32)],
+    src_node_count: usize,
+    dst_node_count: usize,
+    backward: bool,
+) -> Result<(CsrAdjacency, Option<CsrAdjacency>), CompactStoreError> {
+    let mut fwd_edges = edges.to_vec();
+    fwd_edges.sort_by_key(|&(src, _dst)| src);
+    let fwd = CsrAdjacency::from_sorted_edges(src_node_count, &fwd_edges);
+    drop(fwd_edges);
+    if !backward {
+        return Ok((fwd, None));
+    }
+    let mut bwd_edges: Vec<(u32, u32)> = edges.iter().map(|&(src, dst)| (dst, src)).collect();
+    bwd_edges.sort_by_key(|&(dst, _src)| dst);
+    let mut bwd_csr = CsrAdjacency::from_sorted_edges(dst_node_count, &bwd_edges);
+    let mut mapping = Vec::with_capacity(bwd_edges.len());
+    for &(dst, src) in &bwd_edges {
+        let fwd_neighbors = fwd.neighbors(src);
+        let fwd_start = fwd.offset_of(src);
+        let local_idx = fwd_neighbors
+            .iter()
+            .position(|&t| t == dst)
+            .ok_or_else(|| {
+                CompactStoreError::InconsistentEdgeData(format!(
+                    "backward edge ({dst}->{src}) has no corresponding forward edge"
+                ))
+            })?;
+        // reason: local index within CSR neighbors fits u32
+        #[allow(clippy::cast_possible_truncation)]
+        mapping.push(fwd_start + local_idx as u32);
+    }
+    bwd_csr.set_edge_data(mapping);
+    Ok((fwd, Some(bwd_csr)))
+}
 
 /// Infers a [`ColumnType`] from a [`ColumnCodec`] variant.
 fn infer_column_type(codec: &ColumnCodec) -> ColumnType {
@@ -1241,10 +1249,15 @@ fn encode_inferred_codec(values: &[Value]) -> (ColumnCodec, Option<ZoneMap>) {
 /// map walk — fixes that order.
 ///
 /// Every node must be pushed before an edge refers to it; a relationship
-/// table exists only once its first edge arrives. Row values are held in
-/// column form until [`finish`](Self::finish) encodes them, so the peak
-/// footprint is one columnar copy of the rows plus the finished store,
-/// never a live LPG.
+/// table exists only once its first edge arrives.
+///
+/// Pushed property values are not held as [`Value`]s. Each column appends
+/// its present values to a byte spool — in memory, or in the file given to
+/// [`spooling_to`](Self::spooling_to) once a column's buffer fills — and
+/// encoding decodes one column at a time. With a spool file, the resident
+/// footprint while pushing is the row topology plus one small buffer per
+/// column, and [`write_section`](Self::write_section) adds one column's
+/// values and encoding on top of that, never the whole store.
 ///
 /// [`LpgStore`]: crate::graph::lpg::LpgStore
 #[derive(Default)]
@@ -1256,15 +1269,14 @@ pub struct IncrementalCompactStoreBuilder {
     rel_tables: Vec<PendingRelTable>,
     rel_table_index: FxHashMap<(ArcStr, usize, usize), usize>,
     edge_ids: FxHashSet<grafeo_common::types::EdgeId>,
+    spool: ColumnSpool,
 }
 
 /// Row values for one node table, collected before encoding.
 struct PendingNodeTable {
     label_key: ArcStr,
     node_ids: Vec<grafeo_common::types::NodeId>,
-    /// Property key -> value per row, null-padded so every column spans
-    /// every row pushed so far.
-    columns: FxHashMap<PropertyKey, Vec<Value>>,
+    columns: FxHashMap<PropertyKey, SpooledColumn>,
 }
 
 /// Row values for one relationship table, collected before encoding.
@@ -1274,32 +1286,225 @@ struct PendingRelTable {
     dst_table: usize,
     /// (edge id, source offset, destination offset) in push order.
     edges: Vec<(grafeo_common::types::EdgeId, u32, u32)>,
-    columns: FxHashMap<PropertyKey, Vec<Value>>,
+    columns: FxHashMap<PropertyKey, SpooledColumn>,
 }
 
-/// Appends one row's properties to null-padded columns holding `row` rows.
+/// A column buffer is moved to the spool once it reaches this size.
+const SPOOL_CHUNK_BYTES: usize = 32 * 1024;
+
+/// The present values of one column in push order, as bincode
+/// `(rows skipped since the previous value, value)` records. Rows without a
+/// value are never written; decoding pads them with [`Value::Null`], which
+/// is what the null-padded column form held for them.
+#[derive(Default)]
+struct SpooledColumn {
+    chunks: Vec<SpoolChunk>,
+    tail: Vec<u8>,
+    /// Row of the last recorded value.
+    last_row: Option<u32>,
+}
+
+/// A sealed run of whole records.
+enum SpoolChunk {
+    Resident(Vec<u8>),
+    Spilled { offset: u64, len: usize },
+}
+
+/// Where full column buffers go. Without a file they stay resident as
+/// encoded bytes.
+#[derive(Default)]
+struct ColumnSpool {
+    file: Option<std::fs::File>,
+    end: u64,
+    /// A failed spool write leaves a column short, so the builder refuses
+    /// everything after it instead of encoding a store missing values.
+    failure: Option<String>,
+}
+
+fn spool_config() -> bincode::config::Configuration {
+    bincode::config::standard()
+}
+
+fn spool_error(what: &str, error: impl std::fmt::Display) -> CompactStoreError {
+    CompactStoreError::Spool(format!("{what}: {error}"))
+}
+
+impl ColumnSpool {
+    fn check(&self) -> Result<(), CompactStoreError> {
+        match &self.failure {
+            Some(failure) => Err(CompactStoreError::Spool(failure.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Records `value` at `row`. The first value pushed for a row wins, as
+    /// it did in the null-padded column form.
+    fn append(
+        &mut self,
+        column: &mut SpooledColumn,
+        row: u32,
+        value: &Value,
+    ) -> Result<(), CompactStoreError> {
+        let gap = match column.last_row {
+            Some(last) if last >= row => return Ok(()),
+            Some(last) => row - last - 1,
+            None => row,
+        };
+        bincode::serde::encode_into_std_write((gap, value), &mut column.tail, spool_config())
+            .map_err(|error| spool_error("encode a column value", error))?;
+        column.last_row = Some(row);
+        if column.tail.len() >= SPOOL_CHUNK_BYTES {
+            self.seal(column)?;
+        }
+        Ok(())
+    }
+
+    fn seal(&mut self, column: &mut SpooledColumn) -> Result<(), CompactStoreError> {
+        use std::io::Write;
+        let Some(file) = self.file.as_mut() else {
+            column
+                .chunks
+                .push(SpoolChunk::Resident(std::mem::take(&mut column.tail)));
+            return Ok(());
+        };
+        if let Err(error) = file.write_all(&column.tail) {
+            let error = spool_error("write the column spool", error);
+            self.failure = Some(error.to_string());
+            return Err(error);
+        }
+        let len = column.tail.len();
+        column.chunks.push(SpoolChunk::Spilled {
+            offset: self.end,
+            len,
+        });
+        self.end += len as u64;
+        column.tail.clear();
+        Ok(())
+    }
+
+    /// Decodes a column into one value per row, `Value::Null` where the row
+    /// has none.
+    fn read(
+        &mut self,
+        column: SpooledColumn,
+        rows: usize,
+    ) -> Result<Vec<Value>, CompactStoreError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut values = vec![Value::Null; rows];
+        let mut next_row = 0usize;
+        let mut spilled = Vec::new();
+        let mut decode = |bytes: &[u8]| -> Result<(), CompactStoreError> {
+            let mut position = 0;
+            while position < bytes.len() {
+                let ((gap, value), used): ((u32, Value), usize) =
+                    bincode::serde::decode_from_slice(&bytes[position..], spool_config())
+                        .map_err(|error| spool_error("decode a column value", error))?;
+                position += used;
+                let row = next_row + gap as usize;
+                let slot = values.get_mut(row).ok_or_else(|| {
+                    CompactStoreError::Spool(format!(
+                        "a spooled value names row {row} of a {rows}-row table"
+                    ))
+                })?;
+                *slot = value;
+                next_row = row + 1;
+            }
+            Ok(())
+        };
+        for chunk in column.chunks {
+            match chunk {
+                SpoolChunk::Resident(bytes) => decode(&bytes)?,
+                SpoolChunk::Spilled { offset, len } => {
+                    let file = self.file.as_mut().ok_or_else(|| {
+                        CompactStoreError::Spool("a spilled column has no spool file".into())
+                    })?;
+                    spilled.resize(len, 0);
+                    file.seek(SeekFrom::Start(offset))
+                        .and_then(|_| file.read_exact(&mut spilled))
+                        .map_err(|error| spool_error("read the column spool", error))?;
+                    decode(&spilled)?;
+                }
+            }
+        }
+        decode(&column.tail)?;
+        Ok(values)
+    }
+}
+
+/// Appends one row's properties to the columns of a table holding `row`
+/// rows before it.
 fn push_row_properties<'a>(
-    columns: &mut FxHashMap<PropertyKey, Vec<Value>>,
-    row: usize,
+    spool: &mut ColumnSpool,
+    columns: &mut FxHashMap<PropertyKey, SpooledColumn>,
+    row: u32,
     properties: impl IntoIterator<Item = (&'a PropertyKey, &'a Value)>,
-) {
+) -> Result<(), CompactStoreError> {
     for (key, value) in properties {
-        let column = columns
-            .entry(key.clone())
-            .or_insert_with(|| vec![Value::Null; row]);
-        column.resize(row, Value::Null);
-        column.push(value.clone());
+        let column = columns.entry(key.clone()).or_default();
+        spool.append(column, row, value)?;
     }
-    for column in columns.values_mut() {
-        column.resize(row + 1, Value::Null);
-    }
+    Ok(())
+}
+
+/// A table's columns in ascending key order: the section's column order.
+fn columns_by_key(
+    columns: FxHashMap<PropertyKey, SpooledColumn>,
+) -> Vec<(PropertyKey, SpooledColumn)> {
+    let mut sorted: Vec<_> = columns.into_iter().collect();
+    sorted.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+    sorted
+}
+
+/// A relationship table's edges in forward CSR order (source-sorted,
+/// stable): the push rows in that order, and the `(src, dst)` pairs.
+fn csr_order(edges: &[(grafeo_common::types::EdgeId, u32, u32)]) -> (Vec<usize>, Vec<(u32, u32)>) {
+    let mut order: Vec<usize> = (0..edges.len()).collect();
+    order.sort_by_key(|&row| edges[row].1);
+    let pairs = order
+        .iter()
+        .map(|&row| (edges[row].1, edges[row].2))
+        .collect();
+    (order, pairs)
+}
+
+/// Moves push-order `values` into CSR `order`.
+fn permute(mut values: Vec<Value>, order: &[usize]) -> Vec<Value> {
+    order
+        .iter()
+        .map(|&row| std::mem::replace(&mut values[row], Value::Null))
+        .collect()
+}
+
+fn table_id(index: usize, kind: &'static str) -> Result<u16, CompactStoreError> {
+    u16::try_from(index)
+        .ok()
+        .filter(|&id| id <= MAX_TABLE_ID)
+        .ok_or(CompactStoreError::TableCountOverflow {
+            kind,
+            count: index + 1,
+            max: MAX_TABLE_ID,
+        })
 }
 
 impl IncrementalCompactStoreBuilder {
-    /// Creates an empty builder.
+    /// Creates an empty builder whose column spool stays in memory.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an empty builder that moves full column buffers into
+    /// `file`, which must be empty, readable, and writable. The caller owns
+    /// the file's lifetime; an anonymous temporary file removes itself.
+    #[must_use]
+    pub fn spooling_to(file: std::fs::File) -> Self {
+        Self {
+            spool: ColumnSpool {
+                file: Some(file),
+                ..ColumnSpool::default()
+            },
+            ..Self::default()
+        }
     }
 
     /// Nodes pushed so far.
@@ -1321,12 +1526,15 @@ impl IncrementalCompactStoreBuilder {
     /// - [`CompactStoreError::UnlabeledNode`] if `labels` is empty: a
     ///   compact table is keyed by label, so an unlabeled node has no table.
     /// - [`CompactStoreError::DuplicateNodeId`] if `id` was already pushed.
+    /// - [`CompactStoreError::Spool`] if the column spool failed, now or on
+    ///   an earlier push.
     pub fn push_node<'a>(
         &mut self,
         id: grafeo_common::types::NodeId,
         labels: impl IntoIterator<Item = &'a str>,
         properties: impl IntoIterator<Item = (&'a PropertyKey, &'a Value)>,
     ) -> Result<(), CompactStoreError> {
+        self.spool.check()?;
         let mut sorted: Vec<&str> = labels.into_iter().collect();
         let label_key: ArcStr = match sorted.as_slice() {
             [] => return Err(CompactStoreError::UnlabeledNode(id.0)),
@@ -1360,9 +1568,8 @@ impl IncrementalCompactStoreBuilder {
             table: table.label_key.to_string(),
         })?;
         table.node_ids.push(id);
-        push_row_properties(&mut table.columns, row, properties);
         self.node_positions.insert(id, (table_index, offset));
-        Ok(())
+        push_row_properties(&mut self.spool, &mut table.columns, offset, properties)
     }
 
     /// Adds an edge between two nodes pushed earlier.
@@ -1372,6 +1579,8 @@ impl IncrementalCompactStoreBuilder {
     /// - [`CompactStoreError::UnknownEndpoint`] if `src` or `dst` was not
     ///   pushed as a node.
     /// - [`CompactStoreError::DuplicateEdgeId`] if `id` was already pushed.
+    /// - [`CompactStoreError::Spool`] if the column spool failed, now or on
+    ///   an earlier push.
     pub fn push_edge<'a>(
         &mut self,
         id: grafeo_common::types::EdgeId,
@@ -1380,6 +1589,7 @@ impl IncrementalCompactStoreBuilder {
         dst: grafeo_common::types::NodeId,
         properties: impl IntoIterator<Item = (&'a PropertyKey, &'a Value)>,
     ) -> Result<(), CompactStoreError> {
+        self.spool.check()?;
         let &(src_table, src_offset) =
             self.node_positions
                 .get(&src)
@@ -1394,7 +1604,7 @@ impl IncrementalCompactStoreBuilder {
                     edge: id.0,
                     node: dst.0,
                 })?;
-        if !self.edge_ids.insert(id) {
+        if self.edge_ids.contains(&id) {
             return Err(CompactStoreError::DuplicateEdgeId(id.0));
         }
 
@@ -1415,88 +1625,74 @@ impl IncrementalCompactStoreBuilder {
             }
         };
         let table = &mut self.rel_tables[table_index];
-        let row = table.edges.len();
+        let row =
+            u32::try_from(table.edges.len()).map_err(|_| CompactStoreError::TableRowOverflow {
+                table: table.edge_type.to_string(),
+            })?;
+        self.edge_ids.insert(id);
         table.edges.push((id, src_offset, dst_offset));
-        push_row_properties(&mut table.columns, row, properties);
-        Ok(())
+        push_row_properties(&mut self.spool, &mut table.columns, row, properties)
     }
 
     /// Encodes the collected rows into an immutable [`CompactStore`] whose
     /// id maps name every pushed node and edge.
     ///
+    /// Columns are decoded and encoded one at a time, so the transient on
+    /// top of the finished store is one column's values.
+    ///
     /// # Errors
     ///
     /// Propagates [`CompactStoreBuilder::build`] errors (e.g. more than
-    /// 32,768 node tables or relationship tables).
-    pub fn finish(self) -> Result<CompactStore, CompactStoreError> {
+    /// 32,768 node tables or relationship tables) and spool failures.
+    pub fn finish(mut self) -> Result<CompactStore, CompactStoreError> {
+        self.spool.check()?;
         let mut builder = CompactStoreBuilder::new();
-        for table in &self.node_tables {
-            builder = builder.node_table(table.label_key.as_str(), |t| {
-                t.record_len(table.node_ids.len());
-                for (key, values) in &table.columns {
-                    t.inferred_column(key, values);
-                }
-                t
-            });
+        let node_tables = std::mem::take(&mut self.node_tables);
+        let mut labels = Vec::with_capacity(node_tables.len());
+        let mut node_ids = Vec::with_capacity(node_tables.len());
+        for table in node_tables {
+            let rows = table.node_ids.len();
+            let mut t = NodeTableBuilder::new(table.label_key.clone());
+            t.record_len(rows);
+            for (key, column) in columns_by_key(table.columns) {
+                let values = self.spool.read(column, rows)?;
+                t.inferred_column(&key, &values);
+            }
+            builder.node_table_builders.push(t);
+            labels.push(table.label_key);
+            node_ids.push(table.node_ids);
         }
 
         // Relationship tables take the builder's sequential ids in push
-        // order; the source-sorted (stable) order below is the forward CSR
-        // order `CompactStoreBuilder::build` produces, so each edge id maps
-        // to the position its endpoints occupy.
+        // order; the source-sorted (stable) order is the forward CSR order
+        // `CompactStoreBuilder::build` produces, so each edge id maps to the
+        // position its endpoints occupy.
         let mut edge_id_map: FxHashMap<grafeo_common::types::EdgeId, (u16, u64)> =
             FxHashMap::default();
         edge_id_map.reserve(self.edge_ids.len());
+        let rel_tables = std::mem::take(&mut self.rel_tables);
         let mut edge_offset_to_id: Vec<Vec<grafeo_common::types::EdgeId>> =
-            Vec::with_capacity(self.rel_tables.len());
-        for (index, table) in self.rel_tables.into_iter().enumerate() {
-            let rel_table_id =
-                u16::try_from(index).map_err(|_| CompactStoreError::TableCountOverflow {
-                    kind: "relationship",
-                    count: index,
-                    max: MAX_TABLE_ID,
-                })?;
-            let PendingRelTable {
-                edge_type,
-                src_table,
-                dst_table,
-                edges,
-                columns,
-            } = table;
-            // Property columns are indexed by CSR position, so they are
-            // permuted into the same order as the edges they describe.
-            let mut order: Vec<usize> = (0..edges.len()).collect();
-            order.sort_by_key(|&row| edges[row].1);
-            let pairs: Vec<(u32, u32)> = order
-                .iter()
-                .map(|&row| (edges[row].1, edges[row].2))
-                .collect();
+            Vec::with_capacity(rel_tables.len());
+        for (index, table) in rel_tables.into_iter().enumerate() {
+            let rel_table_id = table_id(index, "relationship")?;
+            let (order, pairs) = csr_order(&table.edges);
             let ids: Vec<grafeo_common::types::EdgeId> =
-                order.iter().map(|&row| edges[row].0).collect();
+                order.iter().map(|&row| table.edges[row].0).collect();
             for (position, id) in ids.iter().enumerate() {
                 edge_id_map.insert(*id, (rel_table_id, position as u64));
             }
             edge_offset_to_id.push(ids);
-            let columns: FxHashMap<PropertyKey, Vec<Value>> = columns
-                .into_iter()
-                .map(|(key, mut values)| {
-                    let permuted = order
-                        .iter()
-                        .map(|&row| std::mem::replace(&mut values[row], Value::Null))
-                        .collect();
-                    (key, permuted)
-                })
-                .collect();
-
-            let src_label = self.node_tables[src_table].label_key.as_str();
-            let dst_label = self.node_tables[dst_table].label_key.as_str();
-            builder = builder.rel_table(edge_type.as_str(), src_label, dst_label, |r| {
-                r.edges(pairs).backward(true);
-                for (key, values) in &columns {
-                    r.inferred_column(key, values);
-                }
-                r
-            });
+            let mut r = RelTableBuilder::new(
+                table.edge_type,
+                labels[table.src_table].clone(),
+                labels[table.dst_table].clone(),
+            );
+            r.edges(pairs).backward(true);
+            for (key, column) in columns_by_key(table.columns) {
+                let values = permute(self.spool.read(column, table.edges.len())?, &order);
+                r.inferred_column(&key, &values);
+            }
+            builder.rel_table_builders.push(r);
         }
 
         let mut compact = builder.build()?;
@@ -1504,28 +1700,124 @@ impl IncrementalCompactStoreBuilder {
         let mut node_id_map: FxHashMap<grafeo_common::types::NodeId, (u16, u64)> =
             FxHashMap::default();
         node_id_map.reserve(self.node_positions.len());
-        let mut node_offset_to_id: Vec<Vec<grafeo_common::types::NodeId>> =
-            Vec::with_capacity(self.node_tables.len());
-        for (index, table) in self.node_tables.into_iter().enumerate() {
-            let table_id =
-                u16::try_from(index).map_err(|_| CompactStoreError::TableCountOverflow {
-                    kind: "node",
-                    count: index,
-                    max: MAX_TABLE_ID,
-                })?;
-            for (offset, id) in table.node_ids.iter().enumerate() {
+        for (index, ids) in node_ids.iter().enumerate() {
+            let table_id = table_id(index, "node")?;
+            for (offset, id) in ids.iter().enumerate() {
                 node_id_map.insert(*id, (table_id, offset as u64));
             }
-            node_offset_to_id.push(table.node_ids);
         }
 
-        compact.set_id_maps(
-            node_id_map,
-            edge_id_map,
-            node_offset_to_id,
-            edge_offset_to_id,
-        );
+        compact.set_id_maps(node_id_map, edge_id_map, node_ids, edge_offset_to_id);
         Ok(compact)
+    }
+
+    /// Streams the rows as a CompactStore section into `sink`: byte for
+    /// byte what serializing [`finish`](Self::finish)'s store writes, at
+    /// the current section version, without building that store.
+    ///
+    /// Each column is decoded, encoded, written, and dropped before the
+    /// next, and each relationship table's adjacency is built only while
+    /// that table is written, so the resident peak on top of the pushed
+    /// topology is the largest single column or adjacency.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` for the [`finish`](Self::finish) refusals and
+    /// spool failures, `Error::Io` when `sink` rejects a write.
+    pub fn write_section(
+        mut self,
+        sink: &mut dyn std::io::Write,
+    ) -> grafeo_common::utils::error::Result<()> {
+        let internal = |error: CompactStoreError| {
+            grafeo_common::utils::error::Error::Internal(format!(
+                "incremental compact section: {error}"
+            ))
+        };
+        self.spool.check().map_err(internal)?;
+        table_id(self.node_tables.len().saturating_sub(1), "node").map_err(internal)?;
+        table_id(self.rel_tables.len().saturating_sub(1), "relationship").map_err(internal)?;
+
+        let mut stream =
+            super::section::SectionStream::begin(sink, super::section::FORMAT_VERSION, true);
+        let node_tables = std::mem::take(&mut self.node_tables);
+        let mut node_ids = Vec::with_capacity(node_tables.len());
+        stream.write_len(node_tables.len());
+        for table in node_tables {
+            let rows = table.node_ids.len();
+            let columns = columns_by_key(table.columns);
+            stream.node_table(table.label_key.as_str(), rows, columns.len());
+            for (key, column) in columns {
+                let values = self.spool.read(column, rows).map_err(internal)?;
+                let (codec, zone_map, nulls) = encode_inferred_column(&values);
+                drop(values);
+                let block_zone_maps = super::zone_map::compute_block_zone_maps(&codec);
+                stream.node_column(
+                    &key,
+                    zone_map.as_ref(),
+                    nulls.as_ref(),
+                    &codec,
+                    Some(&block_zone_maps),
+                )?;
+            }
+            node_ids.push(table.node_ids);
+        }
+
+        let rel_tables = std::mem::take(&mut self.rel_tables);
+        let mut edge_entries: Vec<(u64, u16, u64)> = Vec::with_capacity(self.edge_ids.len());
+        stream.write_len(rel_tables.len());
+        for (index, table) in rel_tables.into_iter().enumerate() {
+            let rel_table_id = table_id(index, "relationship").map_err(internal)?;
+            let (order, pairs) = csr_order(&table.edges);
+            for (position, &row) in order.iter().enumerate() {
+                edge_entries.push((table.edges[row].0.as_u64(), rel_table_id, position as u64));
+            }
+            let (fwd, bwd) = rel_adjacency(
+                &pairs,
+                node_ids[table.src_table].len(),
+                node_ids[table.dst_table].len(),
+                true,
+            )
+            .map_err(internal)?;
+            drop(pairs);
+            let columns = columns_by_key(table.columns);
+            stream.rel_table(
+                table.edge_type.as_str(),
+                table_id(table.src_table, "node").map_err(internal)?,
+                table_id(table.dst_table, "node").map_err(internal)?,
+                &fwd,
+                bwd.as_ref(),
+                columns.len(),
+            )?;
+            drop((fwd, bwd));
+            for (key, column) in columns {
+                let values = permute(
+                    self.spool
+                        .read(column, table.edges.len())
+                        .map_err(internal)?,
+                    &order,
+                );
+                let (codec, _zone_map, nulls) = encode_inferred_column(&values);
+                drop(values);
+                stream.rel_column(&key, nulls.as_ref(), &codec)?;
+            }
+        }
+
+        let mut node_entries: Vec<(u64, u16, u64)> = Vec::with_capacity(self.node_positions.len());
+        for (index, ids) in node_ids.iter().enumerate() {
+            let table_id = table_id(index, "node").map_err(internal)?;
+            node_entries.extend(
+                ids.iter()
+                    .enumerate()
+                    .map(|(offset, id)| (id.as_u64(), table_id, offset as u64)),
+            );
+        }
+        drop(node_ids);
+        node_entries.sort_unstable_by_key(|&(id, _, _)| id);
+        stream.id_map(&node_entries)?;
+        drop(node_entries);
+        edge_entries.sort_unstable_by_key(|&(id, _, _)| id);
+        stream.id_map(&edge_entries)?;
+        stream.finish()
     }
 }
 
@@ -3562,5 +3854,162 @@ mod tests {
         assert_eq!(store.node_count(), 0);
         assert_eq!(store.edge_count(), 0);
         assert!(store.max_node_id().is_none());
+    }
+
+    fn fixture_builder(builder: &mut IncrementalCompactStoreBuilder) {
+        for row in fixture_nodes() {
+            builder
+                .push_node(
+                    NodeId(row.id),
+                    row.labels.iter().copied(),
+                    row.properties.iter().map(|(k, v)| (k, v)),
+                )
+                .unwrap();
+        }
+        for (id, edge_type, src, dst, properties) in fixture_edges() {
+            builder
+                .push_edge(
+                    EdgeId(id),
+                    edge_type,
+                    NodeId(src),
+                    NodeId(dst),
+                    properties.iter().map(|(k, v)| (k, v)),
+                )
+                .unwrap();
+        }
+    }
+
+    fn streamed_bytes(builder: IncrementalCompactStoreBuilder) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        builder.write_section(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// Rows enough to fill several spool chunks per column: long unique
+    /// strings, a sparse column, signed and unsigned integers, and edges
+    /// pushed against source order.
+    fn wide_builder(mut builder: IncrementalCompactStoreBuilder) -> IncrementalCompactStoreBuilder {
+        const NODES: u64 = 3_000;
+        for index in 0..NODES {
+            let mut properties = vec![
+                (
+                    PropertyKey::new("identity"),
+                    Value::from(format!("entity:{index:06}:{}", "x".repeat(40))),
+                ),
+                (
+                    PropertyKey::new("rank"),
+                    Value::Int64(i64::try_from(index).unwrap() - 1_000),
+                ),
+            ];
+            if index % 7 == 0 {
+                properties.push((
+                    PropertyKey::new("sparse"),
+                    Value::Int64(i64::try_from(index).unwrap()),
+                ));
+            }
+            let labels: &[&str] = if index % 2 == 0 { &["Even"] } else { &["Odd"] };
+            builder
+                .push_node(
+                    NodeId(index),
+                    labels.iter().copied(),
+                    properties.iter().map(|(k, v)| (k, v)),
+                )
+                .unwrap();
+        }
+        for index in 0..NODES {
+            let src = NodeId(NODES - 1 - index);
+            let dst = NodeId((index * 7) % NODES);
+            let properties = [(
+                PropertyKey::new("relation"),
+                Value::from(format!("relation:{index:06}:{}", "y".repeat(40))),
+            )];
+            builder
+                .push_edge(
+                    EdgeId(index),
+                    "LINKS",
+                    src,
+                    dst,
+                    properties.iter().map(|(k, v)| (k, v)),
+                )
+                .unwrap();
+        }
+        builder
+    }
+
+    /// The streamed section is the finished store's section, byte for byte,
+    /// for the mixed fixture, the empty builder, and a spooled build whose
+    /// columns span many spool chunks on disk.
+    #[test]
+    fn streamed_section_is_the_finished_store_section() {
+        let mut streamed = IncrementalCompactStoreBuilder::new();
+        fixture_builder(&mut streamed);
+        assert_eq!(
+            streamed_bytes(streamed),
+            section_bytes(fixture_incremental())
+        );
+
+        assert_eq!(
+            streamed_bytes(IncrementalCompactStoreBuilder::new()),
+            section_bytes(IncrementalCompactStoreBuilder::new().finish().unwrap())
+        );
+
+        let resident = section_bytes(
+            wide_builder(IncrementalCompactStoreBuilder::new())
+                .finish()
+                .unwrap(),
+        );
+        let spool = tempfile::tempfile().unwrap();
+        let probe = spool.try_clone().unwrap();
+        let spooled = wide_builder(IncrementalCompactStoreBuilder::spooling_to(spool));
+        let spooled_bytes = probe.metadata().unwrap().len();
+        assert!(
+            spooled_bytes > 8 * SPOOL_CHUNK_BYTES as u64,
+            "the wide fixture spilled {spooled_bytes} bytes"
+        );
+        assert_eq!(streamed_bytes(spooled), resident);
+        let spooled_store = wide_builder(IncrementalCompactStoreBuilder::spooling_to(
+            tempfile::tempfile().unwrap(),
+        ))
+        .finish()
+        .unwrap();
+        assert_eq!(section_bytes(spooled_store), resident);
+    }
+
+    /// A key repeated within one row keeps its first value, as the
+    /// null-padded column form did.
+    #[test]
+    fn a_repeated_key_keeps_its_first_value() {
+        let mut builder = IncrementalCompactStoreBuilder::new();
+        let key = PropertyKey::new("name");
+        let first = Value::from("first");
+        let second = Value::from("second");
+        builder
+            .push_node(NodeId(1), ["A"], [(&key, &first), (&key, &second)])
+            .unwrap();
+        builder
+            .push_node(NodeId(2), ["A"], [(&key, &second)])
+            .unwrap();
+        let store = builder.finish().unwrap();
+        assert_eq!(store.get_node_property(NodeId(1), &key), Some(first));
+        assert_eq!(store.get_node_property(NodeId(2), &key), Some(second));
+    }
+
+    /// The streamed section is single-use and write-only.
+    #[test]
+    fn incremental_section_refuses_a_second_write_and_reads() {
+        use grafeo_common::storage::Section;
+        let mut builder = IncrementalCompactStoreBuilder::new();
+        fixture_builder(&mut builder);
+        let mut section = super::super::section::IncrementalCompactStoreSection::new(builder);
+        assert!(section.is_dirty());
+        assert_eq!(
+            section.serialize().unwrap(),
+            section_bytes(fixture_incremental())
+        );
+        assert!(!section.is_dirty());
+        let err = section.serialize().unwrap_err();
+        assert!(err.to_string().contains("already written"), "{err}");
+        let err = section.deserialize(&[]).unwrap_err();
+        assert!(err.to_string().contains("write-only"), "{err}");
     }
 }

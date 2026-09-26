@@ -979,19 +979,20 @@ impl GrafeoDB {
         })
     }
 
-    /// Writes `store` as a complete single-file database container at `path`,
-    /// without a live database.
+    /// Writes the rows pushed into `builder` as a complete single-file
+    /// database container at `path`, without a live database.
     ///
     /// The file holds exactly what [`close`](Self::close) writes for a
     /// compacted database — the compact base, an empty LPG overlay, and a
     /// catalog naming `property_indexes` — produced through the same
     /// streaming section writer, so [`GrafeoDB::open`] (writable or
     /// [`Config::read_only`]) reopens it as a layered database whose base is
-    /// `store`, with those property indexes rebuilt. Pair it with
-    /// [`IncrementalCompactStoreBuilder`] to build a database from a row
-    /// stream with one columnar copy in memory instead of an LPG plus its
-    /// compaction, and one container write instead of a WAL plus a
-    /// checkpoint.
+    /// the store [`IncrementalCompactStoreBuilder::finish`] would build, with
+    /// those property indexes rebuilt. The compact base streams from the
+    /// builder one column at a time, so building a database from a row
+    /// stream holds neither an LPG and its compaction nor the finished
+    /// columnar store, and takes one container write instead of a WAL plus
+    /// a checkpoint.
     ///
     /// Durability is the section writer's: the sections stream to the file,
     /// the file is synced, then the header is flipped and synced. A process
@@ -1011,27 +1012,27 @@ impl GrafeoDB {
     /// failure.
     ///
     /// [`IncrementalCompactStoreBuilder`]: grafeo_core::graph::compact::IncrementalCompactStoreBuilder
+    /// [`IncrementalCompactStoreBuilder::finish`]: grafeo_core::graph::compact::IncrementalCompactStoreBuilder::finish
     #[cfg(all(feature = "grafeo-file", feature = "compact-store", feature = "lpg"))]
     pub fn write_compact_container(
         path: impl AsRef<Path>,
-        store: Arc<grafeo_core::graph::compact::CompactStore>,
+        builder: grafeo_core::graph::compact::IncrementalCompactStoreBuilder,
         property_indexes: impl IntoIterator<Item = String>,
     ) -> Result<()> {
         use grafeo_common::storage::{Section, SectionType};
         use grafeo_common::utils::error::StorageError;
-        use grafeo_core::graph::GraphStore;
-        use grafeo_core::graph::compact::section::CompactStoreSection;
+        use grafeo_core::graph::compact::section::IncrementalCompactStoreSection;
         use grafeo_core::graph::lpg::LpgStoreSection;
 
         let path = path.as_ref();
-        let node_count = store.node_count() as u64;
-        let edge_count = store.edge_count() as u64;
+        let node_count = builder.node_count() as u64;
+        let edge_count = builder.edge_count() as u64;
 
         let overlay = Arc::new(LpgStore::new().map_err(|e| Error::Internal(e.to_string()))?);
         for key in property_indexes {
             overlay.create_property_index(&key);
         }
-        let base_section = CompactStoreSection::new(store);
+        let base_section = IncrementalCompactStoreSection::new(builder);
         let overlay_section = LpgStoreSection::new(Arc::clone(&overlay));
         let catalog_section =
             catalog_section::CatalogSection::new(Arc::new(Catalog::new()), overlay, || 0);
@@ -2741,10 +2742,7 @@ impl GrafeoDB {
             let container_is_current = !layered
                 && !self.container_stale.load(Ordering::Acquire)
                 && !self.store_handle_vended.load(Ordering::Acquire)
-                && self
-                    .wal
-                    .as_ref()
-                    .is_some_and(|wal| wal.record_count() == 0)
+                && self.wal.as_ref().is_some_and(|wal| wal.record_count() == 0)
                 && self.store.as_ref().is_some_and(|store| {
                     let header = fm.active_header();
                     header.epoch == store.current_epoch().0
