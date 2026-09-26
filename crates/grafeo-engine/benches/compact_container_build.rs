@@ -24,7 +24,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::time::Instant;
 
 use grafeo_common::types::{EdgeId, NodeId, PropertyKey, Value};
@@ -153,8 +152,7 @@ fn run_direct(path: &Path, nodes: u64, edges: u64) -> (u64, u64) {
             )
             .unwrap();
     }
-    let store = Arc::new(builder.finish().unwrap());
-    GrafeoDB::write_compact_container(path, store, ["identity".to_owned()]).unwrap();
+    GrafeoDB::write_compact_container(path, builder, ["identity".to_owned()]).unwrap();
     reopen_counts(path)
 }
 

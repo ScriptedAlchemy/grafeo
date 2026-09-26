@@ -1,5 +1,5 @@
-//! `GrafeoDB::write_compact_container`: a database container written from a
-//! [`CompactStore`] built incrementally from a row stream, with no live LPG
+//! `GrafeoDB::write_compact_container`: a database container written from an
+//! `IncrementalCompactStoreBuilder` row stream, with no live LPG
 //! and no WAL — one durable write of the same three sections a compacted
 //! database's `close` produces.
 //!
@@ -8,8 +8,6 @@
 //!     --features "lpg,gql,wal,grafeo-file,compact-store,mmap,testing-crash-injection" \
 //!     --test compact_container_write
 //! ```
-//!
-//! [`CompactStore`]: grafeo_core::graph::compact::CompactStore
 
 #![cfg(all(feature = "compact-store", feature = "lpg", feature = "grafeo-file"))]
 // reason: fixture indices are small, known values.
@@ -17,12 +15,11 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
 
 use grafeo_common::storage::SectionType;
 use grafeo_common::types::{EdgeId, NodeId, PropertyKey, Value};
 use grafeo_core::graph::Direction;
-use grafeo_core::graph::compact::{CompactStore, IncrementalCompactStoreBuilder};
+use grafeo_core::graph::compact::IncrementalCompactStoreBuilder;
 use grafeo_engine::{Config, GrafeoDB};
 use grafeo_storage::file::GrafeoFileManager;
 
@@ -38,7 +35,7 @@ fn key(name: &str) -> PropertyKey {
 /// The fixture rows: `PEOPLE` people with a unique `key`, each linked to
 /// the next by `KNOWS`, plus one multi-label `City|Place` node every
 /// person `LIVES_IN`.
-fn fixture_store() -> Arc<CompactStore> {
+fn fixture_builder() -> IncrementalCompactStoreBuilder {
     let mut builder = IncrementalCompactStoreBuilder::new();
     let city = NodeId(FIRST_ID + PEOPLE);
     builder
@@ -91,11 +88,11 @@ fn fixture_store() -> Arc<CompactStore> {
             )
             .unwrap();
     }
-    Arc::new(builder.finish().unwrap())
+    builder
 }
 
 fn write_fixture(path: &Path) {
-    GrafeoDB::write_compact_container(path, fixture_store(), ["key".to_owned()]).unwrap();
+    GrafeoDB::write_compact_container(path, fixture_builder(), ["key".to_owned()]).unwrap();
 }
 
 /// Section type -> payload bytes of a closed container.
@@ -246,8 +243,8 @@ fn identical_rows_write_identical_sections() {
     let dir = tempfile::TempDir::new().unwrap();
     let first = dir.path().join("first.grafeo");
     let second = dir.path().join("second.grafeo");
-    GrafeoDB::write_compact_container(&first, fixture_store(), indexes).unwrap();
-    GrafeoDB::write_compact_container(&second, fixture_store(), reversed).unwrap();
+    GrafeoDB::write_compact_container(&first, fixture_builder(), indexes).unwrap();
+    GrafeoDB::write_compact_container(&second, fixture_builder(), reversed).unwrap();
     let first = section_payloads(&first);
     assert!(first.values().all(|bytes| !bytes.is_empty()));
     assert_eq!(first, section_payloads(&second));
@@ -264,8 +261,7 @@ fn write_refuses_an_existing_path_and_leaves_it_untouched() {
     builder
         .push_node(NodeId(1), ["Other"], std::iter::empty())
         .unwrap();
-    let other = Arc::new(builder.finish().unwrap());
-    let err = GrafeoDB::write_compact_container(&path, other, std::iter::empty()).unwrap_err();
+    let err = GrafeoDB::write_compact_container(&path, builder, std::iter::empty()).unwrap_err();
     assert!(err.to_string().contains("already exists"), "{err}");
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
@@ -303,11 +299,10 @@ fn crash_during_write_never_yields_a_partial_container() {
     for crash_after in 1..=8 {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("crash.grafeo");
-        let store = fixture_store();
         let result = with_crash_at(
             crash_after,
             std::panic::AssertUnwindSafe(|| {
-                GrafeoDB::write_compact_container(&path, Arc::clone(&store), ["key".to_owned()])
+                GrafeoDB::write_compact_container(&path, fixture_builder(), ["key".to_owned()])
             }),
         );
         match result {
@@ -327,7 +322,8 @@ fn crash_during_write_never_yields_a_partial_container() {
                 }
                 drop(db);
                 let retry = dir.path().join("retry.grafeo");
-                GrafeoDB::write_compact_container(&retry, store, ["key".to_owned()]).unwrap();
+                GrafeoDB::write_compact_container(&retry, fixture_builder(), ["key".to_owned()])
+                    .unwrap();
                 let db = GrafeoDB::with_config(Config::read_only(&retry)).unwrap();
                 assert_fixture_readable(&db, 0);
             }

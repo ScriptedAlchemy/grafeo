@@ -35,7 +35,7 @@ const MAGIC: [u8; 4] = *b"GCST";
 /// each node and edge column body, so a row the builder padded because
 /// its node never had the property reads back as absent instead of as
 /// `0`, `""`, or `false`. Column bodies are unchanged from v3/v4.
-const FORMAT_VERSION: u8 = 5;
+pub(crate) const FORMAT_VERSION: u8 = 5;
 
 /// First version that stores per-column null masks. Columns read from an
 /// older section have no mask, so their padded rows still decode as the
@@ -182,125 +182,199 @@ impl CompactStoreSection {
             grafeo_common::utils::error::Error::Internal("no CompactStore to serialize".into())
         })?;
 
-        // Starts small and grows to the largest table; `drain_chunk`
-        // clears without releasing capacity, so later tables reuse it.
-        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_TARGET_BYTES);
-        let mut crc = crc32fast::Hasher::new();
+        let mut stream = SectionStream::begin(sink, version, store.preserves_ids());
 
-        // Header.
-        buf.extend_from_slice(&MAGIC);
-        buf.push(version);
-        let flags: u8 = u8::from(store.preserves_ids());
-        buf.push(flags);
-
-        // Node tables.
-        write_len(&mut buf, store.node_tables_by_id.len());
+        stream.write_len(store.node_tables_by_id.len());
         for nt in &store.node_tables_by_id {
-            write_str(&mut buf, nt.label());
-            write_len(&mut buf, nt.len());
-            let zone_maps = nt.zone_maps();
             let columns = sorted_by_key(nt.columns());
-            write_len(&mut buf, columns.len());
+            stream.node_table(nt.label(), nt.len(), columns.len());
+            let zone_maps = nt.zone_maps();
             for (key, codec) in columns {
-                write_str(&mut buf, key.as_str());
-                // Zone map for this column.
-                if let Some(zm) = zone_maps.get(key) {
-                    buf.push(1);
-                    write_zone_map(&mut buf, zm);
-                } else {
-                    buf.push(0);
-                }
-                write_null_mask(&mut buf, version, nt.null_mask(key))?;
-                write_codec(
+                stream.node_column(
+                    key,
+                    zone_maps.get(key),
+                    nt.null_mask(key),
                     codec,
-                    &mut buf,
-                    version,
                     nt.block_zone_maps().get(key).map(Vec::as_slice),
-                );
-                // Column granularity: a single wide column is the
-                // smallest unit this encoder can emit without rewriting
-                // the sibling-module writers.
-                drain_chunk(&mut buf, sink, &mut crc, false)?;
+                )?;
             }
         }
 
-        // Relationship tables.
-        write_len(&mut buf, store.rel_tables_by_id.len());
+        stream.write_len(store.rel_tables_by_id.len());
         for rt in &store.rel_tables_by_id {
-            write_str(&mut buf, rt.edge_type().as_str());
-            write_u16(&mut buf, rt.src_table_id());
-            write_u16(&mut buf, rt.dst_table_id());
-            rt.fwd().write_to(&mut buf);
-            if let Some(bwd) = rt.bwd() {
-                buf.push(1);
-                bwd.write_to(&mut buf);
-            } else {
-                buf.push(0);
-            }
-            drain_chunk(&mut buf, sink, &mut crc, false)?;
             let properties = sorted_by_key(rt.properties());
-            write_len(&mut buf, properties.len());
+            stream.rel_table(
+                rt.edge_type().as_str(),
+                rt.src_table_id(),
+                rt.dst_table_id(),
+                rt.fwd(),
+                rt.bwd(),
+                properties.len(),
+            )?;
             for (key, codec) in properties {
-                write_str(&mut buf, key.as_str());
-                write_null_mask(&mut buf, version, rt.null_mask(key))?;
-                // Edge property columns don't track per-block zone maps
-                // yet; v3 will compute them inline during write.
-                write_codec(codec, &mut buf, version, None);
-                drain_chunk(&mut buf, sink, &mut crc, false)?;
+                stream.rel_column(key, rt.null_mask(key), codec)?;
             }
         }
 
-        self.write_id_maps(&mut buf, sink, &mut crc, store)?;
-
-        // Flush whatever is left, then the CRC over everything written.
-        drain_chunk(&mut buf, sink, &mut crc, true)?;
-        sink.write_all(&crc.finalize().to_le_bytes())?;
-        Ok(())
-    }
-
-    /// Writes the ID maps (when the store preserves ids), draining to
-    /// the sink as the scratch buffer fills.
-    fn write_id_maps(
-        &self,
-        buf: &mut Vec<u8>,
-        sink: &mut dyn std::io::Write,
-        crc: &mut crc32fast::Hasher,
-        store: &CompactStore,
-    ) -> grafeo_common::utils::error::Result<()> {
-        if !store.preserves_ids() {
-            return Ok(());
-        }
         // Ascending id order: the maps hash with a per-instance random
         // seed, so their walk order would make two writes of the same store
         // differ byte for byte.
         if let Some(ref node_map) = store.node_id_map {
-            let mut entries: Vec<(NodeId, u16, u64)> = node_map
+            let mut entries: Vec<(u64, u16, u64)> = node_map
                 .iter()
-                .map(|(&nid, &(tid, off))| (nid, tid, off))
+                .map(|(&nid, &(tid, off))| (nid.as_u64(), tid, off))
                 .collect();
             entries.sort_unstable_by_key(|&(nid, _, _)| nid);
-            write_len(buf, entries.len());
-            for (nid, tid, off) in entries {
-                write_u64(buf, nid.as_u64());
-                write_u16(buf, tid);
-                write_u64(buf, off);
-                drain_chunk(buf, sink, crc, false)?;
-            }
+            stream.id_map(&entries)?;
         }
         if let Some(ref edge_map) = store.edge_id_map {
-            let mut entries: Vec<(EdgeId, u16, u64)> = edge_map
+            let mut entries: Vec<(u64, u16, u64)> = edge_map
                 .iter()
-                .map(|(&eid, &(rtid, pos))| (eid, rtid, pos))
+                .map(|(&eid, &(rtid, pos))| (eid.as_u64(), rtid, pos))
                 .collect();
             entries.sort_unstable_by_key(|&(eid, _, _)| eid);
-            write_len(buf, entries.len());
-            for (eid, rtid, pos) in entries {
-                write_u64(buf, eid.as_u64());
-                write_u16(buf, rtid);
-                write_u64(buf, pos);
-                drain_chunk(buf, sink, crc, false)?;
-            }
+            stream.id_map(&entries)?;
         }
+
+        stream.finish()
+    }
+}
+
+/// The one encoder of the CompactStore section layout, driven in layout
+/// order: header, node tables with their columns, relationship tables with
+/// their adjacency and columns, id maps, CRC.
+///
+/// A resident [`CompactStore`] and the incremental builder's spooled rows
+/// both serialize through it, so a section written either way is the same
+/// bytes. Each column is drained to the sink as soon as it is written, so
+/// the resident scratch is one column, and a caller that produces columns
+/// one at a time never holds more than the column it is writing.
+pub(crate) struct SectionStream<'a> {
+    sink: &'a mut dyn std::io::Write,
+    buf: Vec<u8>,
+    crc: crc32fast::Hasher,
+    version: u8,
+}
+
+impl<'a> SectionStream<'a> {
+    /// Writes the section header.
+    pub(crate) fn begin(
+        sink: &'a mut dyn std::io::Write,
+        version: u8,
+        preserves_ids: bool,
+    ) -> Self {
+        // Starts small and grows to the largest column; `drain_chunk`
+        // clears without releasing capacity, so later columns reuse it.
+        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_TARGET_BYTES);
+        buf.extend_from_slice(&MAGIC);
+        buf.push(version);
+        buf.push(u8::from(preserves_ids));
+        Self {
+            sink,
+            buf,
+            crc: crc32fast::Hasher::new(),
+            version,
+        }
+    }
+
+    /// Writes a table count.
+    pub(crate) fn write_len(&mut self, len: usize) {
+        write_len(&mut self.buf, len);
+    }
+
+    /// Opens a node table whose `column_count` columns follow in ascending
+    /// key order.
+    pub(crate) fn node_table(&mut self, label: &str, rows: usize, column_count: usize) {
+        write_str(&mut self.buf, label);
+        write_len(&mut self.buf, rows);
+        write_len(&mut self.buf, column_count);
+    }
+
+    /// Writes one node column and drains it.
+    pub(crate) fn node_column(
+        &mut self,
+        key: &PropertyKey,
+        zone_map: Option<&ZoneMap>,
+        null_mask: Option<&BitVector>,
+        codec: &ColumnCodec,
+        block_zone_maps: Option<&[ZoneMap]>,
+    ) -> grafeo_common::utils::error::Result<()> {
+        write_str(&mut self.buf, key.as_str());
+        if let Some(zm) = zone_map {
+            self.buf.push(1);
+            write_zone_map(&mut self.buf, zm);
+        } else {
+            self.buf.push(0);
+        }
+        write_null_mask(&mut self.buf, self.version, null_mask)?;
+        write_codec(codec, &mut self.buf, self.version, block_zone_maps);
+        // Column granularity: a single wide column is the smallest unit
+        // this encoder can emit without rewriting the sibling-module
+        // writers.
+        drain_chunk(&mut self.buf, &mut *self.sink, &mut self.crc, false)
+    }
+
+    /// Writes a relationship table's adjacency, drains it, and opens its
+    /// `property_count` columns, which follow in ascending key order.
+    pub(crate) fn rel_table(
+        &mut self,
+        edge_type: &str,
+        src_table_id: u16,
+        dst_table_id: u16,
+        fwd: &CsrAdjacency,
+        bwd: Option<&CsrAdjacency>,
+        property_count: usize,
+    ) -> grafeo_common::utils::error::Result<()> {
+        write_str(&mut self.buf, edge_type);
+        write_u16(&mut self.buf, src_table_id);
+        write_u16(&mut self.buf, dst_table_id);
+        fwd.write_to(&mut self.buf);
+        if let Some(bwd) = bwd {
+            self.buf.push(1);
+            bwd.write_to(&mut self.buf);
+        } else {
+            self.buf.push(0);
+        }
+        drain_chunk(&mut self.buf, &mut *self.sink, &mut self.crc, false)?;
+        write_len(&mut self.buf, property_count);
+        Ok(())
+    }
+
+    /// Writes one relationship property column and drains it. Edge
+    /// columns carry no per-block zone maps.
+    pub(crate) fn rel_column(
+        &mut self,
+        key: &PropertyKey,
+        null_mask: Option<&BitVector>,
+        codec: &ColumnCodec,
+    ) -> grafeo_common::utils::error::Result<()> {
+        write_str(&mut self.buf, key.as_str());
+        write_null_mask(&mut self.buf, self.version, null_mask)?;
+        write_codec(codec, &mut self.buf, self.version, None);
+        drain_chunk(&mut self.buf, &mut *self.sink, &mut self.crc, false)
+    }
+
+    /// Writes one id map: `(id, table id, offset)` entries in ascending id
+    /// order.
+    pub(crate) fn id_map(
+        &mut self,
+        entries: &[(u64, u16, u64)],
+    ) -> grafeo_common::utils::error::Result<()> {
+        write_len(&mut self.buf, entries.len());
+        for &(id, table, offset) in entries {
+            write_u64(&mut self.buf, id);
+            write_u16(&mut self.buf, table);
+            write_u64(&mut self.buf, offset);
+            drain_chunk(&mut self.buf, &mut *self.sink, &mut self.crc, false)?;
+        }
+        Ok(())
+    }
+
+    /// Flushes what is left, then the CRC over everything written.
+    pub(crate) fn finish(mut self) -> grafeo_common::utils::error::Result<()> {
+        drain_chunk(&mut self.buf, &mut *self.sink, &mut self.crc, true)?;
+        let crc = std::mem::take(&mut self.crc).finalize();
+        self.sink.write_all(&crc.to_le_bytes())?;
         Ok(())
     }
 }
@@ -447,6 +521,71 @@ impl Section for CompactStoreSection {
 
     fn memory_usage(&self) -> usize {
         self.store.read().as_ref().map_or(0, |s| s.memory_bytes())
+    }
+}
+
+/// A CompactStore section written straight from an
+/// [`IncrementalCompactStoreBuilder`], one column at a time, without first
+/// building the [`CompactStore`] it describes.
+///
+/// Write-only and single-use: the first serialization consumes the rows, so
+/// a second one — or a read — is refused rather than answered with a
+/// different or empty section.
+pub struct IncrementalCompactStoreSection {
+    builder: parking_lot::Mutex<Option<super::IncrementalCompactStoreBuilder>>,
+}
+
+impl IncrementalCompactStoreSection {
+    /// Wraps the rows to be written.
+    #[must_use]
+    pub fn new(builder: super::IncrementalCompactStoreBuilder) -> Self {
+        Self {
+            builder: parking_lot::Mutex::new(Some(builder)),
+        }
+    }
+}
+
+impl Section for IncrementalCompactStoreSection {
+    fn section_type(&self) -> SectionType {
+        SectionType::CompactStore
+    }
+
+    fn version(&self) -> u8 {
+        FORMAT_VERSION
+    }
+
+    fn serialize(&self) -> grafeo_common::utils::error::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.serialize_into(&mut out)?;
+        Ok(out)
+    }
+
+    fn serialize_into(
+        &self,
+        sink: &mut dyn std::io::Write,
+    ) -> grafeo_common::utils::error::Result<()> {
+        let builder = self.builder.lock().take().ok_or_else(|| {
+            grafeo_common::utils::error::Error::Internal(
+                "incremental compact section was already written".into(),
+            )
+        })?;
+        builder.write_section(sink)
+    }
+
+    fn deserialize(&mut self, _data: &[u8]) -> grafeo_common::utils::error::Result<()> {
+        Err(grafeo_common::utils::error::Error::Internal(
+            "incremental compact section is write-only".into(),
+        ))
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.builder.lock().is_some()
+    }
+
+    fn mark_clean(&self) {}
+
+    fn memory_usage(&self) -> usize {
+        0
     }
 }
 
