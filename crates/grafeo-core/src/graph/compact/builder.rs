@@ -3896,10 +3896,16 @@ mod tests {
                     PropertyKey::new("identity"),
                     Value::from(format!("entity:{index:06}:{}", "x".repeat(40))),
                 ),
-                (PropertyKey::new("rank"), Value::Int64(index as i64 - 1_000)),
+                (
+                    PropertyKey::new("rank"),
+                    Value::Int64(i64::try_from(index).unwrap() - 1_000),
+                ),
             ];
             if index % 7 == 0 {
-                properties.push((PropertyKey::new("sparse"), Value::Int64(index as i64)));
+                properties.push((
+                    PropertyKey::new("sparse"),
+                    Value::Int64(i64::try_from(index).unwrap()),
+                ));
             }
             let labels: &[&str] = if index % 2 == 0 { &["Even"] } else { &["Odd"] };
             builder
