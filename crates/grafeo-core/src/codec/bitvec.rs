@@ -25,6 +25,8 @@
 use std::io;
 
 use bytes::{Bytes, BytesMut};
+
+use super::SectionSpan;
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
 /// Immutable bitset stored in a refcounted [`Bytes`] buffer of LE u64
@@ -335,6 +337,12 @@ impl BitVector {
     #[must_use]
     pub fn data_bytes(&self) -> &Bytes {
         &self.data
+    }
+
+    /// Heap bytes the bit words own outside `section`.
+    #[must_use]
+    pub fn heap_bytes(&self, section: &SectionSpan) -> usize {
+        section.owned_bytes(&self.data)
     }
 
     /// Returns the number of bits set to true.

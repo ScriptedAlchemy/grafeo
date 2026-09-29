@@ -237,10 +237,21 @@ impl LayeredStore {
         store_mem.total_bytes + index_mem.total_bytes + mvcc_mem.total_bytes + pool_mem.total_bytes
     }
 
-    /// Approximate heap memory of both layers.
+    /// Heap bytes of the overlay's dirty and deleted-from-base id sets.
     #[must_use]
-    pub fn memory_bytes(&self) -> usize {
-        self.base.load().memory_bytes() + self.overlay_memory_bytes()
+    pub fn bookkeeping_heap_bytes(&self) -> usize {
+        self.dirty_node_ids.read().allocation_size()
+            + self.dirty_edge_ids.read().allocation_size()
+            + self.deleted_from_base_nodes.read().allocation_size()
+            + self.deleted_from_base_edges.read().allocation_size()
+    }
+
+    /// Heap bytes of both layers and the overlay bookkeeping. Column bodies
+    /// that view the base's section buffer are the section holder's; see
+    /// [`CompactStore::section_bytes`].
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.base.load().heap_bytes() + self.overlay_memory_bytes() + self.bookkeeping_heap_bytes()
     }
 
     /// Replaces the overlay with a fresh empty `LpgStore` and clears
@@ -2370,11 +2381,11 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_bytes_nonzero() {
+    fn test_heap_bytes_nonzero() {
         let layered = build_test_layered();
         assert!(
-            layered.memory_bytes() > 0,
-            "memory_bytes should be positive for a non-empty store"
+            layered.heap_bytes() > 0,
+            "heap_bytes should be positive for a non-empty store"
         );
     }
 

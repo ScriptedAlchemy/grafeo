@@ -9,9 +9,10 @@ use grafeo_common::utils::hash::FxHashMap;
 
 use super::column::ColumnCodec;
 use super::csr::CsrAdjacency;
+use super::heap::{edge_schema_bytes, key_bytes};
 use super::id::{encode_edge_id, encode_node_id};
 use super::schema::EdgeSchema;
-use crate::codec::BitVector;
+use crate::codec::{BitVector, SectionSpan};
 
 /// A relationship table holding all edges of a single type.
 ///
@@ -257,19 +258,25 @@ impl RelTable {
         &self.properties
     }
 
-    /// Returns an estimate of heap memory used by the CSR structures and
-    /// edge property columns in bytes.
+    /// Heap bytes the table owns outside `section`: its schema, both CSRs,
+    /// and every property column's key, body, and null mask.
     #[must_use]
-    pub fn memory_bytes(&self) -> usize {
-        let fwd_bytes = self.fwd.memory_bytes();
-        let bwd_bytes = self.bwd.as_ref().map_or(0, |b| b.memory_bytes());
-        let prop_bytes: usize = self.properties.values().map(|c| c.heap_bytes()).sum();
-        let mask_bytes: usize = self
-            .null_masks
-            .values()
-            .map(|mask| mask.data_bytes().len())
-            .sum();
-        fwd_bytes + bwd_bytes + prop_bytes + mask_bytes
+    pub fn heap_bytes(&self, section: &SectionSpan) -> usize {
+        edge_schema_bytes(&self.schema)
+            + self.fwd.heap_bytes()
+            + self.bwd.as_ref().map_or(0, CsrAdjacency::heap_bytes)
+            + self.properties.allocation_size()
+            + self
+                .properties
+                .iter()
+                .map(|(key, column)| key_bytes(key) + column.heap_bytes(section))
+                .sum::<usize>()
+            + self.null_masks.allocation_size()
+            + self
+                .null_masks
+                .values()
+                .map(|mask| mask.heap_bytes(section))
+                .sum::<usize>()
     }
 }
 

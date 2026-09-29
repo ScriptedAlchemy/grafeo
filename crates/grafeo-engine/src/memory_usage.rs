@@ -26,6 +26,9 @@ pub struct MemoryUsage {
     pub string_pool: StringPoolMemory,
     /// Buffer manager tracked allocations.
     pub buffer_manager: BufferManagerMemory,
+    /// Columnar base of a compacted store.
+    #[serde(default)]
+    pub compact_base: CompactBaseMemory,
     /// RDF triple store (only populated when the `triple-store` feature is enabled).
     #[serde(default, skip_serializing_if = "RdfMemory::is_empty")]
     pub rdf: RdfMemory,
@@ -43,9 +46,22 @@ impl MemoryUsage {
             + self.caches.total_bytes
             + self.string_pool.total_bytes
             + self.buffer_manager.allocated_bytes
+            + self.compact_base.heap_bytes
             + self.rdf.total_bytes
             + self.cdc.total_bytes;
     }
+}
+
+/// Memory of a compacted store's columnar base and the overlay bookkeeping
+/// layered over it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompactBaseMemory {
+    /// Heap the base's tables, maps, indexes, and the overlay's id sets hold,
+    /// plus the section buffer when it is a heap copy.
+    pub heap_bytes: usize,
+    /// Section buffer mapped from the database file. File-backed pages in
+    /// the OS page cache, so not part of `total_bytes`.
+    pub mapped_bytes: usize,
 }
 
 /// Cache memory usage.

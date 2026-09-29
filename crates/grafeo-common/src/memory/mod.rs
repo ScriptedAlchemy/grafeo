@@ -13,6 +13,7 @@
 pub mod arena;
 pub mod buffer;
 pub mod bump;
+pub mod heap;
 pub mod pool;
 pub mod reporter;
 pub mod usage;

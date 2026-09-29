@@ -25,6 +25,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
+use grafeo_common::memory::heap::{arc_slice_bytes, arc_str_bytes, vec_bytes};
+
+use super::SectionSpan;
 
 /// Reads an LE u32 at byte offset `idx * 4`. Returns `None` if out of range.
 #[inline]
@@ -97,6 +100,13 @@ impl CodeStore {
         }
     }
 
+    fn heap_bytes(&self, section: &SectionSpan) -> usize {
+        match self {
+            Self::Inline(v) => vec_bytes(v),
+            Self::Mapped(b) => section.owned_bytes(b),
+        }
+    }
+
     #[inline]
     fn len_codes(&self, code_count: usize) -> usize {
         match self {
@@ -114,6 +124,13 @@ enum NullBitmap {
 }
 
 impl NullBitmap {
+    fn heap_bytes(&self, section: &SectionSpan) -> usize {
+        match self {
+            Self::Inline(v) => vec_bytes(v),
+            Self::Mapped(b) => section.owned_bytes(b),
+        }
+    }
+
     #[inline]
     fn as_slice(&self) -> Option<&[u64]> {
         match self {
@@ -210,6 +227,19 @@ impl DictionaryEncoding {
     /// Returns the number of unique strings in the dictionary.
     pub fn dictionary_size(&self) -> usize {
         self.dictionary.len()
+    }
+
+    /// Heap bytes the dictionary, its strings, the codes, and the null
+    /// bitmap own outside `section`.
+    #[must_use]
+    pub fn heap_bytes(&self, section: &SectionSpan) -> usize {
+        arc_slice_bytes::<Arc<str>>(self.dictionary.len())
+            + self.dictionary.iter().map(arc_str_bytes).sum::<usize>()
+            + self.codes.heap_bytes(section)
+            + self
+                .null_bitmap
+                .as_ref()
+                .map_or(0, |bitmap| bitmap.heap_bytes(section))
     }
 
     /// Returns the dictionary.
