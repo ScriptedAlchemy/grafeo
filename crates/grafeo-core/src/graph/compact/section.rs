@@ -19,7 +19,7 @@ use super::node_table::NodeTable;
 use super::rel_table::RelTable;
 use super::schema::{ColumnDef, ColumnType, EdgeSchema, TableSchema};
 use super::zone_map::ZoneMap;
-use crate::codec::BitVector;
+use crate::codec::{BitVector, SectionSpan};
 use crate::statistics::{EdgeTypeStatistics, LabelStatistics, Statistics};
 
 /// Magic bytes identifying a CompactStore section.
@@ -71,6 +71,10 @@ const FORMAT_VERSION_V1: u8 = 1;
 pub struct CompactStoreSection {
     store: RwLock<Option<Arc<CompactStore>>>,
     dirty: AtomicBool,
+    /// Whether the store's section buffer is the heap copy
+    /// [`Section::deserialize`] made, rather than bytes the caller handed
+    /// to [`deserialize_from_bytes`](Self::deserialize_from_bytes).
+    owns_section_copy: bool,
 }
 
 impl CompactStoreSection {
@@ -80,6 +84,7 @@ impl CompactStoreSection {
         Self {
             store: RwLock::new(Some(store)),
             dirty: AtomicBool::new(false),
+            owns_section_copy: false,
         }
     }
 
@@ -89,6 +94,7 @@ impl CompactStoreSection {
         Self {
             store: RwLock::new(None),
             dirty: AtomicBool::new(false),
+            owns_section_copy: false,
         }
     }
 
@@ -125,6 +131,7 @@ impl CompactStoreSection {
             ))
         })?;
         *self.store.write() = Some(Arc::new(store));
+        self.owns_section_copy = false;
         Ok(())
     }
 
@@ -148,7 +155,7 @@ impl CompactStoreSection {
             .store
             .read()
             .as_ref()
-            .map_or(0, |store| store.memory_bytes());
+            .map_or(0, |store| store.heap_bytes() + store.section_bytes());
         let mut out = Vec::with_capacity(capacity);
         self.serialize_into_with_version(&mut out, version)?;
         Ok(out)
@@ -508,7 +515,9 @@ impl Section for CompactStoreSection {
         // [`deserialize_from_bytes`](Self::deserialize_from_bytes) which
         // skips the copy on the mmap path.
         let owned = bytes::Bytes::copy_from_slice(data);
-        self.deserialize_from_bytes(owned)
+        self.deserialize_from_bytes(owned)?;
+        self.owns_section_copy = true;
+        Ok(())
     }
 
     fn is_dirty(&self) -> bool {
@@ -520,7 +529,14 @@ impl Section for CompactStoreSection {
     }
 
     fn memory_usage(&self) -> usize {
-        self.store.read().as_ref().map_or(0, |s| s.memory_bytes())
+        self.store.read().as_ref().map_or(0, |store| {
+            store.heap_bytes()
+                + if self.owns_section_copy {
+                    store.section_bytes()
+                } else {
+                    0
+                }
+        })
     }
 }
 
@@ -877,6 +893,7 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
             edge_offset_to_id,
         );
     }
+    store.section = SectionSpan::of(data_bytes);
 
     Ok(store)
 }

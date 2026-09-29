@@ -74,6 +74,8 @@ use grafeo_storage::wal::{DurabilityMode as WalDurabilityMode, LpgWal, WalConfig
 
 use crate::catalog::Catalog;
 use crate::config::Config;
+#[cfg(all(feature = "compact-store", feature = "lpg"))]
+use crate::memory_usage::CompactBaseMemory;
 use crate::query::cache::QueryCache;
 use crate::session::Session;
 use crate::transaction::TransactionManager;
@@ -1802,6 +1804,47 @@ impl GrafeoDB {
         let mut section = grafeo_core::graph::compact::section::CompactStoreSection::empty();
         section.deserialize(&data)?;
         Ok(section.store().map(|store| (store, None)))
+    }
+
+    /// The compacted base's heap and mapped bytes. The base's column bodies
+    /// are views into its section buffer, which is mapped from the file on
+    /// the zero-copy open and after a spill, and a heap copy otherwise.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    pub(crate) fn compact_base_memory(&self) -> CompactBaseMemory {
+        let Some(layered) = &self.layered_store else {
+            return CompactBaseMemory::default();
+        };
+        let base = layered.base_store_arc();
+        let heap_bytes = base.heap_bytes() + layered.bookkeeping_heap_bytes();
+        let section_bytes = base.section_bytes();
+        if self.compact_base_is_mapped() {
+            CompactBaseMemory {
+                heap_bytes,
+                mapped_bytes: section_bytes,
+            }
+        } else {
+            CompactBaseMemory {
+                heap_bytes: heap_bytes + section_bytes,
+                mapped_bytes: 0,
+            }
+        }
+    }
+
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    fn compact_base_is_mapped(&self) -> bool {
+        #[cfg(feature = "grafeo-file")]
+        if self.compact_base_mmap.lock().is_some() {
+            return true;
+        }
+        #[cfg(feature = "mmap")]
+        if self
+            .compact_tiered
+            .as_ref()
+            .is_some_and(|tiered| tiered.is_on_disk())
+        {
+            return true;
+        }
+        false
     }
 
     /// Rebuilds the compact base on the heap and releases the container

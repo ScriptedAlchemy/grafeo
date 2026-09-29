@@ -142,6 +142,11 @@ impl Histogram {
         &self.buckets
     }
 
+    /// The bucket buffer itself, whose capacity heap accounting charges.
+    pub(crate) fn bucket_storage(&self) -> &Vec<HistogramBucket> {
+        &self.buckets
+    }
+
     /// Returns the total row count.
     pub fn total_rows(&self) -> u64 {
         self.total_rows

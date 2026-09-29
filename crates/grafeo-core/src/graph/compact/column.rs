@@ -9,9 +9,10 @@ use std::sync::Arc;
 #[cfg(test)]
 use arcstr::ArcStr;
 use bytes::{Bytes, BytesMut};
+use grafeo_common::memory::heap::vec_bytes;
 use grafeo_common::types::Value;
 
-use crate::codec::{BitPackedInts, BitVector, BlockEntry, DictionaryEncoding};
+use crate::codec::{BitPackedInts, BitVector, BlockEntry, DictionaryEncoding, SectionSpan};
 
 // ── Phase 3a: Bytes-backed read helpers ──────────────────────────────
 //
@@ -150,6 +151,15 @@ impl I64Store {
             Self::Mapped(b) => b.len(),
         }
     }
+
+    /// Heap bytes the values own outside `section`.
+    #[must_use]
+    pub fn heap_bytes(&self, section: &SectionSpan) -> usize {
+        match self {
+            Self::Inline(v) => vec_bytes(v),
+            Self::Mapped(b) => section.owned_bytes(b),
+        }
+    }
 }
 
 /// Two-variant backing for `f64` columns. `Inline(Vec<f64>)` is used
@@ -213,6 +223,15 @@ impl F64Store {
         match self {
             Self::Inline(v) => v.len() * 8,
             Self::Mapped(b) => b.len(),
+        }
+    }
+
+    /// Heap bytes the values own outside `section`.
+    #[must_use]
+    pub fn heap_bytes(&self, section: &SectionSpan) -> usize {
+        match self {
+            Self::Inline(v) => vec_bytes(v),
+            Self::Mapped(b) => section.owned_bytes(b),
         }
     }
 }
@@ -1631,21 +1650,19 @@ impl ColumnCodec {
         }
     }
 
-    /// Returns an estimate of heap memory used by this column in bytes.
+    /// Heap bytes this column owns outside `section`, the section buffer
+    /// a deserialized store's column bodies are views into.
     #[must_use]
-    pub fn heap_bytes(&self) -> usize {
+    pub fn heap_bytes(&self, section: &SectionSpan) -> usize {
         match self {
-            Self::BitPacked(bp) => bp.data_bytes().len(),
-            Self::Dict(d) => {
-                let codes_bytes = d.code_count() * 4;
-                let dict_bytes: usize = d.dictionary().iter().map(|s| s.len()).sum();
-                codes_bytes + dict_bytes
+            Self::BitPacked(bp) => bp.heap_bytes(section),
+            Self::Dict(d) => d.heap_bytes(section),
+            Self::Bitmap(bv) => bv.heap_bytes(section),
+            Self::Int8Vector { bytes, .. } | Self::Float32Vector { bytes, .. } => {
+                section.owned_bytes(bytes)
             }
-            Self::Bitmap(bv) => bv.data_bytes().len(),
-            Self::Int8Vector { bytes, .. } => bytes.len(),
-            Self::Float64(store) => store.byte_len(),
-            Self::Float32Vector { bytes, .. } => bytes.len(),
-            Self::RawI64(store) => store.byte_len(),
+            Self::Float64(store) => store.heap_bytes(section),
+            Self::RawI64(store) => store.heap_bytes(section),
         }
     }
 }
@@ -2037,11 +2054,9 @@ mod tests {
 
     #[test]
     fn test_heap_bytes_bitpacked() {
-        let values = vec![0u64, 5, 10, 15];
-        let bp = BitPackedInts::pack(&values);
-        let col = ColumnCodec::BitPacked(bp);
-        // Should report nonzero heap usage.
-        assert!(col.heap_bytes() > 0);
+        // Four 4-bit values pack into one word.
+        let col = ColumnCodec::BitPacked(BitPackedInts::pack(&[0u64, 5, 10, 15]));
+        assert_eq!(col.heap_bytes(&SectionSpan::default()), 8);
     }
 
     #[test]
@@ -2050,25 +2065,41 @@ mod tests {
         builder.add("Amsterdam");
         builder.add("Berlin");
         builder.add("Paris");
-        let dict = builder.build();
-        let col = ColumnCodec::Dict(dict);
-        assert!(col.heap_bytes() > 0);
+        let col = ColumnCodec::Dict(builder.build());
+        // The `Arc<[Arc<str>]>` (16 + 3 * 16), each `Arc<str>` (16 + len,
+        // padded to 8: 32, 24, 24), and three codes in a four-slot `Vec<u32>`.
+        assert_eq!(col.heap_bytes(&SectionSpan::default()), 64 + 80 + 16);
     }
 
     #[test]
     fn test_heap_bytes_bitmap() {
-        let bools = vec![true, false, true, true, false];
-        let bv = BitVector::from_bools(&bools);
-        let col = ColumnCodec::Bitmap(bv);
-        assert!(col.heap_bytes() > 0);
+        let bv = BitVector::from_bools(&[true, false, true, true, false]);
+        assert_eq!(
+            ColumnCodec::Bitmap(bv).heap_bytes(&SectionSpan::default()),
+            8
+        );
     }
 
     #[test]
     fn test_heap_bytes_int8_vector() {
-        let data = vec![1i8, 2, 3, 4, 5, 6];
-        let col = ColumnCodec::int8_vector(data, 3);
-        // Heap usage equals data length (1 byte per i8).
-        assert_eq!(col.heap_bytes(), 6);
+        let col = ColumnCodec::int8_vector(vec![1i8, 2, 3, 4, 5, 6], 3);
+        assert_eq!(col.heap_bytes(&SectionSpan::default()), 6);
+    }
+
+    #[test]
+    fn test_heap_bytes_count_capacity_and_leave_section_views_to_the_section() {
+        let mut values = Vec::with_capacity(10);
+        values.extend([-1_i64, 2, -3]);
+        assert_eq!(
+            ColumnCodec::raw_i64(values).heap_bytes(&SectionSpan::default()),
+            80
+        );
+
+        let section = Bytes::from(vec![7_u8; 64]);
+        let view = ColumnCodec::raw_i64_from_bytes(section.slice(8..32));
+        assert_eq!(view.heap_bytes(&SectionSpan::of(&section)), 0);
+        let elsewhere = Bytes::from(vec![7_u8; 64]);
+        assert_eq!(view.heap_bytes(&SectionSpan::of(&elsewhere)), 24);
     }
 
     // -----------------------------------------------------------------------
@@ -2756,14 +2787,16 @@ mod tests {
 
     #[test]
     fn test_heap_bytes_empty_columns() {
+        let none = SectionSpan::default();
         let bp = BitPackedInts::pack(&[]);
-        assert_eq!(ColumnCodec::BitPacked(bp).heap_bytes(), 0);
+        assert_eq!(ColumnCodec::BitPacked(bp).heap_bytes(&none), 0);
 
+        // An empty `Arc<[Arc<str>]>` still allocates its reference counts.
         let builder = DictionaryBuilder::new();
-        assert_eq!(ColumnCodec::Dict(builder.build()).heap_bytes(), 0);
+        assert_eq!(ColumnCodec::Dict(builder.build()).heap_bytes(&none), 16);
 
         let col = ColumnCodec::int8_vector(Vec::new(), 4);
-        assert_eq!(col.heap_bytes(), 0);
+        assert_eq!(col.heap_bytes(&none), 0);
     }
 
     // -----------------------------------------------------------------------
@@ -3181,11 +3214,12 @@ mod tests {
 
     #[test]
     fn test_raw_i64_heap_bytes() {
+        let none = SectionSpan::default();
         let col = ColumnCodec::raw_i64(vec![-1, 2, -3]);
-        assert_eq!(col.heap_bytes(), 3 * std::mem::size_of::<i64>());
+        assert_eq!(col.heap_bytes(&none), 3 * std::mem::size_of::<i64>());
 
         let empty = ColumnCodec::raw_i64(Vec::new());
-        assert_eq!(empty.heap_bytes(), 0);
+        assert_eq!(empty.heap_bytes(&none), 0);
     }
 
     // ── Phase 2a: Block API ────────────────────────────────────────────

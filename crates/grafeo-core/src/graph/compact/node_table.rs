@@ -3,14 +3,16 @@
 //! Each `NodeTable` stores all nodes of a single label as typed columns.
 //! Nodes are addressed by row offset; the `NodeId` encodes (table_id, offset).
 
+use grafeo_common::memory::heap::vec_bytes;
 use grafeo_common::types::{NodeId, PropertyKey, Value};
 use grafeo_common::utils::hash::FxHashMap;
 
 use super::column::ColumnCodec;
+use super::heap::{key_bytes, table_schema_bytes, zone_map_bytes};
 use super::id::encode_node_id;
 use super::schema::TableSchema;
 use super::zone_map::ZoneMap;
-use crate::codec::BitVector;
+use crate::codec::{BitVector, SectionSpan};
 
 /// Per-label columnar storage for nodes.
 ///
@@ -237,16 +239,32 @@ impl NodeTable {
         self.null_masks.get(key)
     }
 
-    /// Returns an estimate of heap memory used by all columns in bytes.
+    /// Heap bytes the table owns outside `section`: its schema, every map's
+    /// table, each column's key and body, and the zone maps and null masks.
+    /// Keys are shared across the per-column maps and charged once.
     #[must_use]
-    pub fn memory_bytes(&self) -> usize {
-        let column_bytes: usize = self.columns.values().map(|c| c.heap_bytes()).sum();
-        let mask_bytes: usize = self
-            .null_masks
-            .values()
-            .map(|mask| mask.data_bytes().len())
-            .sum();
-        column_bytes + mask_bytes
+    pub fn heap_bytes(&self, section: &SectionSpan) -> usize {
+        table_schema_bytes(&self.schema)
+            + self.columns.allocation_size()
+            + self
+                .columns
+                .iter()
+                .map(|(key, column)| key_bytes(key) + column.heap_bytes(section))
+                .sum::<usize>()
+            + self.zone_maps.allocation_size()
+            + self.zone_maps.values().map(zone_map_bytes).sum::<usize>()
+            + self.block_zone_maps.allocation_size()
+            + self
+                .block_zone_maps
+                .values()
+                .map(|blocks| vec_bytes(blocks) + blocks.iter().map(zone_map_bytes).sum::<usize>())
+                .sum::<usize>()
+            + self.null_masks.allocation_size()
+            + self
+                .null_masks
+                .values()
+                .map(|mask| mask.heap_bytes(section))
+                .sum::<usize>()
     }
 }
 

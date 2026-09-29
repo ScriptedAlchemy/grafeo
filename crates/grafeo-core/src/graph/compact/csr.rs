@@ -3,6 +3,8 @@
 //! For node i, its neighbors are `targets[offsets[i]..offsets[i+1]]`.
 //! Uses u32 for both offsets and targets (max ~4B nodes/edges per table).
 
+use grafeo_common::memory::heap::vec_bytes;
+
 /// Compressed Sparse Row adjacency structure.
 ///
 /// Stores a directed graph in two flat arrays: `offsets` (one per node + 1
@@ -261,15 +263,12 @@ impl CsrAdjacency {
         Ok(Self::from_raw_parts(offsets, targets, edge_data))
     }
 
-    /// Returns the approximate heap memory usage in bytes.
+    /// Heap bytes the offsets, targets, and edge data buffers occupy.
     #[must_use]
-    pub fn memory_bytes(&self) -> usize {
-        self.offsets.len() * std::mem::size_of::<u32>()
-            + self.targets.len() * std::mem::size_of::<u32>()
-            + self
-                .edge_data
-                .as_ref()
-                .map_or(0, |d| d.len() * std::mem::size_of::<u32>())
+    pub fn heap_bytes(&self) -> usize {
+        vec_bytes(&self.offsets)
+            + vec_bytes(&self.targets)
+            + self.edge_data.as_ref().map_or(0, vec_bytes)
     }
 }
 
@@ -340,6 +339,6 @@ mod tests {
         assert_eq!(csr.num_nodes(), 0);
         assert_eq!(csr.num_edges(), 0);
         assert_eq!(csr.source_for_position(0), None);
-        assert_eq!(csr.memory_bytes(), 4); // 1 offset entry (sentinel)
+        assert_eq!(csr.heap_bytes(), 4); // 1 offset entry (sentinel)
     }
 }
