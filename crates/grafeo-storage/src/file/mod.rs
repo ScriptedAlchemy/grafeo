@@ -16,9 +16,14 @@
 //!
 //! ## Crash safety
 //!
-//! Two database headers alternate writes. On checkpoint, the inactive slot
-//! is overwritten with metadata pointing to the freshly written snapshot.
-//! If the process crashes mid-write, the other header is still valid.
+//! Two database headers alternate writes. A checkpoint first writes the new
+//! generation's payload **out of place** (never over bytes the active header
+//! points at) and fsyncs it, then overwrites the inactive header slot with
+//! metadata pointing at the new generation and fsyncs again — the header
+//! flip is the single atomic commit point. Each slot carries a CRC tail so
+//! a torn header write is detected and the other slot's generation wins.
+//! A kill at any byte of the checkpoint leaves the store openable at the
+//! previous consistent generation.
 
 pub mod format;
 pub mod header;

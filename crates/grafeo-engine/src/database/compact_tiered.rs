@@ -211,6 +211,25 @@ impl CompactStoreTiered {
         Ok(())
     }
 
+    /// Replaces the wrapped store with `store` and marks the tier
+    /// in-memory, without touching any backing file.
+    ///
+    /// Used by the container-open path: a base deserialized from a
+    /// mmap'd container section is still an `Arc<CompactStore>` in the
+    /// `InMemory` tier as far as this wrapper is concerned, but its
+    /// column codecs point into the mapping. When the engine has to
+    /// detach from that mapping (any write to the container invalidates
+    /// it), it rebuilds a heap-backed store and publishes it here so the
+    /// tier wrapper and its `CompactStoreConsumer` keep pointing at the
+    /// live base.
+    ///
+    /// Distinct from [`reload_to_ram`](Self::reload_to_ram), which
+    /// re-serializes an `OnDisk` tier backed by a spill file this
+    /// wrapper owns.
+    pub fn rebase_in_memory(&self, store: Arc<CompactStore>) {
+        *self.state.write() = TierState::InMemory(store);
+    }
+
     /// Estimated heap memory footprint of the wrapped store, in bytes.
     ///
     /// When the state is `OnDisk`, this counts the heap copy alone: the

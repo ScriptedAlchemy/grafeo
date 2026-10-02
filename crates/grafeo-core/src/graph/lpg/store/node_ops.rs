@@ -8,6 +8,8 @@ use std::sync::atomic::Ordering;
 use grafeo_common::mvcc::VersionChain;
 
 #[cfg(feature = "tiered-storage")]
+use grafeo_common::memory::AllocError;
+#[cfg(feature = "tiered-storage")]
 use grafeo_common::mvcc::{HotVersionRef, VersionIndex, VersionRef};
 
 impl LpgStore {
@@ -104,6 +106,61 @@ impl LpgStore {
         node
     }
 
+    /// Whether the node exists, is visible at the current epoch, and is not
+    /// deleted. Cheaper than [`Self::get_node`]: no labels or properties are
+    /// materialized.
+    #[must_use]
+    #[cfg(not(feature = "tiered-storage"))]
+    pub fn node_visible(&self, id: NodeId) -> bool {
+        let nodes = self.nodes.read();
+        nodes
+            .get(&id)
+            .and_then(|chain| chain.visible_at(self.current_epoch()))
+            .is_some_and(|record| !record.is_deleted())
+    }
+
+    /// Whether the node exists, is visible at the current epoch, and is not
+    /// deleted. (Tiered storage version)
+    #[must_use]
+    #[cfg(feature = "tiered-storage")]
+    pub fn node_visible(&self, id: NodeId) -> bool {
+        let versions = self.node_versions.read();
+        versions
+            .get(&id)
+            .and_then(|index| index.visible_at(self.current_epoch()))
+            .and_then(|version_ref| self.read_node_record(&version_ref))
+            .is_some_and(|record| !record.is_deleted())
+    }
+
+    /// Appends the node's current labels to `out` as shared strings.
+    ///
+    /// Used by the checkpoint writer to materialize entities without the
+    /// per-node `String` copies that `get_node` would make.
+    pub fn collect_node_labels(&self, id: NodeId, out: &mut Vec<arcstr::ArcStr>) {
+        let registry = self.label_registry.read();
+        let node_labels = self.node_labels.read();
+
+        #[cfg(not(feature = "temporal"))]
+        if let Some(label_ids) = node_labels.get(&id) {
+            for &label_id in label_ids {
+                if let Some(label) = registry.get_name(label_id) {
+                    out.push(label.clone());
+                }
+            }
+        }
+
+        #[cfg(feature = "temporal")]
+        if let Some(log) = node_labels.get(&id)
+            && let Some(label_ids) = log.latest()
+        {
+            for &label_id in label_ids {
+                if let Some(label) = registry.get_name(label_id) {
+                    out.push(label.clone());
+                }
+            }
+        }
+    }
+
     /// Builds a `Node` with labels and properties as they were at a specific epoch.
     ///
     /// This is the critical method that makes `get_node_at_epoch()` return
@@ -163,12 +220,20 @@ impl LpgStore {
 
         let chain = VersionChain::with_initial(record, version_epoch, transaction_id);
         self.nodes.write().insert(id, chain);
+        self.track_node_version(transaction_id, id);
         self.live_node_count.fetch_add(1, Ordering::Relaxed);
         id
     }
 
     /// Creates a new node with the given labels within a transaction context.
     /// (Tiered storage version: stores data in arena, metadata in VersionIndex)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the epoch's arena cannot hold another node record. Callers
+    /// that would rather handle that should use
+    /// [`try_create_node_versioned`](Self::try_create_node_versioned); this
+    /// signature is fixed by the `GraphStore` trait.
     #[cfg(feature = "tiered-storage")]
     #[doc(hidden)]
     pub fn create_node_versioned(
@@ -177,6 +242,30 @@ impl LpgStore {
         epoch: EpochId,
         transaction_id: TransactionId,
     ) -> NodeId {
+        self.try_create_node_versioned(labels, epoch, transaction_id)
+            .unwrap_or_else(|error| panic!("arena allocation failed for node record: {error}"))
+    }
+
+    /// Creates a new node with the given labels within a transaction context,
+    /// reporting arena exhaustion instead of panicking.
+    ///
+    /// TraceDecay patch. Upstream 0.5.42 only had the infallible form above and
+    /// swallowed the typed `AllocError` in an `expect`, so a full epoch arena
+    /// aborted the process. The allocation now happens before any store
+    /// mutation, so a failure leaves nothing behind but a consumed node id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AllocError`] if the epoch's arena cannot be created or has no
+    /// room for another node record.
+    #[cfg(feature = "tiered-storage")]
+    #[doc(hidden)]
+    pub fn try_create_node_versioned(
+        &self,
+        labels: &[&str],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Result<NodeId, AllocError> {
         let id = NodeId::new(self.next_node_id.fetch_add(1, Ordering::Relaxed));
 
         let mut record = NodeRecord::new(id, epoch);
@@ -192,19 +281,19 @@ impl LpgStore {
             EpochId::PENDING
         };
 
+        // Allocate record in arena and get offset (create epoch if needed).
+        // Kept ahead of the label registration and the version index so that a
+        // failure cannot leave a half-created node behind.
+        let offset = {
+            let arena = self.arena_allocator.arena_or_create(epoch)?;
+            let (offset, _stored) = arena.alloc_value_with_offset(record)?;
+            offset
+        };
+
         #[cfg(not(feature = "temporal"))]
         self.register_node_labels(id, labels);
         #[cfg(feature = "temporal")]
         self.register_node_labels(id, labels, version_epoch);
-
-        // Allocate record in arena and get offset (create epoch if needed)
-        let arena = self
-            .arena_allocator
-            .arena_or_create(epoch)
-            .expect("failed to create arena for epoch");
-        let (offset, _stored) = arena
-            .alloc_value_with_offset(record)
-            .expect("arena allocation failed for node record");
 
         // Create HotVersionRef pointing to arena data
         let hot_ref = HotVersionRef::new(version_epoch, epoch, offset, transaction_id);
@@ -216,9 +305,11 @@ impl LpgStore {
         } else {
             versions.insert(id, VersionIndex::with_initial(hot_ref));
         }
+        drop(versions);
+        self.track_node_version(transaction_id, id);
 
         self.live_node_count.fetch_add(1, Ordering::Relaxed);
-        id
+        Ok(id)
     }
 
     /// Creates a new node with labels and properties.
@@ -246,19 +337,25 @@ impl LpgStore {
     ) -> NodeId {
         let id = self.create_node_versioned(labels, epoch, transaction_id);
 
+        // The node is brand new, so counting newly inserted keys gives the
+        // exact property count without materializing a property map.
+        let mut count: u16 = 0;
         for (key, value) in properties {
             let prop_key: PropertyKey = key.into();
             let prop_value: Value = value.into();
             // Update property index before setting the property
             self.update_property_index_on_set(id, &prop_key, &prop_value);
             #[cfg(not(feature = "temporal"))]
-            self.node_properties.set(id, prop_key, prop_value);
+            if self.node_properties.set(id, prop_key, prop_value) {
+                count = count.saturating_add(1);
+            }
             #[cfg(feature = "temporal")]
-            self.node_properties.set(id, prop_key, prop_value, epoch);
+            if self.node_properties.set(id, prop_key, prop_value, epoch) {
+                count = count.saturating_add(1);
+            }
         }
 
         // Update props_count in record
-        let count = u16::try_from(self.node_properties.get_all(id).len()).unwrap_or(u16::MAX);
         if let Some(chain) = self.nodes.write().get_mut(&id)
             && let Some(record) = chain.latest_mut()
         {
@@ -529,9 +626,11 @@ impl LpgStore {
                 }
             }
 
-            // Remove from text indexes before removing properties
+            // Remove from text and property indexes before removing
+            // properties: both read the node's current values.
             #[cfg(feature = "text-index")]
             self.remove_from_all_text_indexes(id);
+            self.remove_node_from_property_indexes(id);
 
             // Remove properties
             drop(nodes); // Release lock before removing properties
@@ -587,9 +686,11 @@ impl LpgStore {
                 }
             }
 
-            // Remove from text indexes before removing properties
+            // Remove from text and property indexes before removing
+            // properties: both read the node's current values.
             #[cfg(feature = "text-index")]
             self.remove_from_all_text_indexes(id);
+            self.remove_node_from_property_indexes(id);
 
             // Remove properties
             drop(versions);
@@ -666,6 +767,7 @@ impl LpgStore {
 
             // Capture properties for undo log
             drop(nodes);
+            self.track_node_version(transaction_id, id);
             let properties: Vec<(PropertyKey, Value)> =
                 self.node_properties.get_all(id).into_iter().collect();
 
@@ -686,9 +788,11 @@ impl LpgStore {
             drop(index);
             drop(node_labels_w);
 
-            // Remove from text indexes
+            // Remove from text and property indexes before removing
+            // properties: both read the node's current values.
             #[cfg(feature = "text-index")]
             self.remove_from_all_text_indexes(id);
+            self.remove_node_from_property_indexes(id);
 
             // Remove properties (will be restored on rollback)
             #[cfg(not(feature = "temporal"))]
@@ -772,6 +876,7 @@ impl LpgStore {
 
             // Capture properties for undo log
             drop(versions);
+            self.track_node_version(transaction_id, id);
             let properties: Vec<(PropertyKey, Value)> =
                 self.node_properties.get_all(id).into_iter().collect();
 
@@ -792,9 +897,11 @@ impl LpgStore {
             drop(label_index);
             drop(node_labels_w);
 
-            // Remove from text indexes
+            // Remove from text and property indexes before removing
+            // properties: both read the node's current values.
             #[cfg(feature = "text-index")]
             self.remove_from_all_text_indexes(id);
+            self.remove_node_from_property_indexes(id);
 
             // Remove properties
             #[cfg(not(feature = "temporal"))]
@@ -1144,6 +1251,8 @@ impl LpgStore {
     #[must_use]
     #[cfg(not(feature = "tiered-storage"))]
     pub fn node_count(&self) -> usize {
+        #[cfg(debug_assertions)]
+        crate::testing::count_probe::record_node_count();
         let epoch = self.current_epoch();
         self.nodes
             .read()
@@ -1158,6 +1267,8 @@ impl LpgStore {
     #[must_use]
     #[cfg(feature = "tiered-storage")]
     pub fn node_count(&self) -> usize {
+        #[cfg(debug_assertions)]
+        crate::testing::count_probe::record_node_count();
         let epoch = self.current_epoch();
         let versions = self.node_versions.read();
         versions

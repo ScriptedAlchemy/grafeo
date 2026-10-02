@@ -61,14 +61,22 @@ pub(super) fn flush(
 
     maybe_crash("flush:before_serialize");
 
-    // Collect sections to write based on flush reason
-    // Write all sections (dirty or not for Explicit, only dirty for Checkpoint)
-    let mut targets: Vec<(SectionType, Vec<u8>)> = Vec::new();
-    for section in sections {
-        if reason == FlushReason::Explicit || section.is_dirty() {
-            targets.push((section.section_type(), section.serialize()?));
-        }
-    }
+    // Select sections to write based on flush reason
+    // (all sections for Explicit, only dirty ones for Checkpoint).
+    //
+    // Selection used to be *materialisation*: every chosen section was
+    // serialized into its own `Vec<u8>` and all of them were held live
+    // until the container write finished, so the transient heap during a
+    // full-store persist was the whole store on top of the store itself.
+    // Now only the references are collected; each section streams itself
+    // into the file in turn, so the peak is whatever the single largest
+    // section chooses to stage.
+    let targets: Vec<&dyn Section> = sections
+        .iter()
+        .copied()
+        .filter(|section| reason == FlushReason::Explicit || section.is_dirty())
+        .collect();
+
     // If nothing is dirty on a periodic checkpoint, skip the write entirely.
     // Previous sections remain intact in the container.
     if targets.is_empty() {
@@ -78,15 +86,13 @@ pub(super) fn flush(
     }
 
     let sections_written = targets.len();
+    let written_types: Vec<SectionType> = targets.iter().map(|s| s.section_type()).collect();
 
     maybe_crash("flush:after_serialize");
 
     // Write sections to container
-    let section_refs: Vec<(SectionType, &[u8])> =
-        targets.iter().map(|(t, d)| (*t, d.as_slice())).collect();
-
-    fm.write_sections(
-        &section_refs,
+    fm.write_sections_streaming(
+        &targets,
         context.epoch,
         context.transaction_id,
         context.node_count,
@@ -95,7 +101,7 @@ pub(super) fn flush(
 
     // Mark all written sections as clean
     for section in sections {
-        if targets.iter().any(|(t, _)| *t == section.section_type()) {
+        if written_types.contains(&section.section_type()) {
             section.mark_clean();
         }
     }

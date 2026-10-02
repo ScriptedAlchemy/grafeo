@@ -3022,7 +3022,9 @@ mod tests {
         MergeOp, MergeRelationshipOp, MultiWayJoinOp, OtherwiseOp, ParameterScanOp, RemoveLabelOp,
         SetPropertyOp, ShortestPathOp, TripleComponent, TripleScanOp, UnionOp, UnwindOp,
     };
-    use grafeo_core::execution::operators::{Operator, SessionContext};
+    // `Operator` itself arrives through `use super::*`; importing it here
+    // again is unused whenever the `algos`-gated test below is compiled out.
+    use grafeo_core::execution::operators::SessionContext;
 
     fn full_store() -> Arc<LpgStore> {
         // Richer store so expand and shortest path tests have real data.

@@ -22,7 +22,10 @@
 
 use std::collections::BTreeMap;
 
-use grafeo_common::types::{EdgeId, EpochId, NodeId, Value};
+use arcstr::ArcStr;
+use smallvec::SmallVec;
+
+use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, Value};
 use grafeo_common::utils::error::{Error, Result};
 
 // ── Magic and version ──────────────────────────────────────────────
@@ -31,7 +34,16 @@ use grafeo_common::utils::error::{Error, Result};
 pub const LPG_BLOCK_MAGIC: [u8; 4] = *b"LPGB";
 
 /// Current block format version.
-pub const LPG_BLOCK_VERSION: u8 = 1;
+pub const LPG_BLOCK_VERSION: u8 = 2;
+
+/// First version whose directory entries carry 64-bit offsets and lengths.
+///
+/// Version 1 packed `offset` and `length` as `u32`, so any section larger
+/// than 4 GiB silently truncated on write and produced a structurally
+/// corrupt container (issue observed as an `offset + length` overflow panic
+/// while opening an 8.6 GiB store). Version 2 widens both fields; version 1
+/// sections remain readable.
+const LPG_BLOCK_VERSION_WIDE_OFFSETS: u8 = 2;
 
 // ── Block types ────────────────────────────────────────────────────
 
@@ -80,7 +92,9 @@ pub enum ValueTag {
 
 /// A directory entry describing a single block within the section.
 ///
-/// 24 bytes, packed sequentially after the section header.
+/// Version 2 entries are 32 bytes with 64-bit `offset` and `length`; version 1
+/// entries were 24 bytes with 32-bit fields, which silently truncated once a
+/// section crossed 4 GiB.
 #[derive(Debug, Clone, Copy)]
 pub struct BlockDirEntry {
     /// Block type.
@@ -88,9 +102,9 @@ pub struct BlockDirEntry {
     /// Reserved for future use.
     pub _reserved: [u8; 3],
     /// Byte offset from the start of the section.
-    pub offset: u32,
+    pub offset: u64,
     /// Length of the block in bytes.
-    pub length: u32,
+    pub length: u64,
     /// CRC-32 of the block data.
     pub checksum: u32,
     /// For PropertyColumn: index into string table for the property key.
@@ -102,7 +116,16 @@ pub struct BlockDirEntry {
 }
 
 impl BlockDirEntry {
-    const SIZE: usize = 24;
+    const SIZE: usize = 32;
+    const V1_SIZE: usize = 24;
+
+    fn size_for_version(version: u8) -> usize {
+        if version >= LPG_BLOCK_VERSION_WIDE_OFFSETS {
+            Self::SIZE
+        } else {
+            Self::V1_SIZE
+        }
+    }
 
     fn write_to(&self, buf: &mut Vec<u8>) {
         buf.push(self.block_type);
@@ -121,8 +144,24 @@ impl BlockDirEntry {
         Some(Self {
             block_type: data[0],
             _reserved: [data[1], data[2], data[3]],
-            offset: u32::from_le_bytes(data[4..8].try_into().ok()?),
-            length: u32::from_le_bytes(data[8..12].try_into().ok()?),
+            offset: u64::from_le_bytes(data[4..12].try_into().ok()?),
+            length: u64::from_le_bytes(data[12..20].try_into().ok()?),
+            checksum: u32::from_le_bytes(data[20..24].try_into().ok()?),
+            key_string_index: u32::from_le_bytes(data[24..28].try_into().ok()?),
+            sub_type: u32::from_le_bytes(data[28..32].try_into().ok()?),
+        })
+    }
+
+    /// Reads a version-1 entry, widening the 32-bit offset and length.
+    fn read_from_v1(data: &[u8]) -> Option<Self> {
+        if data.len() < Self::V1_SIZE {
+            return None;
+        }
+        Some(Self {
+            block_type: data[0],
+            _reserved: [data[1], data[2], data[3]],
+            offset: u64::from(u32::from_le_bytes(data[4..8].try_into().ok()?)),
+            length: u64::from(u32::from_le_bytes(data[8..12].try_into().ok()?)),
             checksum: u32::from_le_bytes(data[12..16].try_into().ok()?),
             key_string_index: u32::from_le_bytes(data[16..20].try_into().ok()?),
             sub_type: u32::from_le_bytes(data[20..24].try_into().ok()?),
@@ -192,8 +231,11 @@ impl SectionHeader {
 
 /// Builds a deduplicated string table and maps strings to indices.
 struct StringTableBuilder {
-    strings: Vec<String>,
-    index: hashbrown::HashMap<String, u32>,
+    strings: Vec<ArcStr>,
+    index: hashbrown::HashMap<ArcStr, u32>,
+    /// Running length of the packed-strings region, so `serialize` can
+    /// allocate the output once.
+    packed_len: usize,
 }
 
 impl StringTableBuilder {
@@ -201,7 +243,18 @@ impl StringTableBuilder {
         Self {
             strings: Vec::new(),
             index: hashbrown::HashMap::new(),
+            packed_len: 0,
         }
+    }
+
+    fn insert_new(&mut self, s: ArcStr) -> u32 {
+        // reason: string table size bounded by section limits, fits u32
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = self.strings.len() as u32;
+        self.packed_len += 4 + s.len();
+        self.strings.push(s.clone());
+        self.index.insert(s, idx);
+        idx
     }
 
     /// Interns a string, returning its index.
@@ -209,12 +262,15 @@ impl StringTableBuilder {
         if let Some(&idx) = self.index.get(s) {
             return idx;
         }
-        // reason: string table size bounded by section limits, fits u32
-        #[allow(clippy::cast_possible_truncation)]
-        let idx = self.strings.len() as u32;
-        self.strings.push(s.to_owned());
-        self.index.insert(s.to_owned(), idx);
-        idx
+        self.insert_new(ArcStr::from(s))
+    }
+
+    /// Interns an already-shared string without copying its bytes.
+    fn intern_arc(&mut self, s: &ArcStr) -> u32 {
+        if let Some(&idx) = self.index.get(s.as_str()) {
+            return idx;
+        }
+        self.insert_new(s.clone())
     }
 
     /// Serializes the string table: [count:u32] [offsets:u32*count] [packed strings]
@@ -222,8 +278,7 @@ impl StringTableBuilder {
         // reason: string table counts and offsets within a section fit u32
         #[allow(clippy::cast_possible_truncation)]
         let count = self.strings.len() as u32;
-        // Pre-calculate total size
-        let mut packed = Vec::new();
+        let mut packed = Vec::with_capacity(self.packed_len);
         let mut offsets = Vec::with_capacity(self.strings.len());
         for s in &self.strings {
             // reason: packed buffer and string lengths bounded by section size, fit u32
@@ -316,7 +371,7 @@ fn encode_value(val: &Value, strings: &mut StringTableBuilder, buf: &mut Vec<u8>
         }
         Value::String(s) => {
             buf.push(ValueTag::String as u8);
-            let idx = strings.intern(s);
+            let idx = strings.intern_arc(s);
             buf.extend_from_slice(&idx.to_le_bytes());
         }
         Value::Bytes(b) => {
@@ -366,7 +421,7 @@ fn encode_value(val: &Value, strings: &mut StringTableBuilder, buf: &mut Vec<u8>
             #[allow(clippy::cast_possible_truncation)]
             buf.extend_from_slice(&(map.len() as u32).to_le_bytes());
             for (key, val) in map.iter() {
-                let key_idx = strings.intern(key.as_ref());
+                let key_idx = strings.intern_arc(key.as_arc());
                 buf.extend_from_slice(&key_idx.to_le_bytes());
                 encode_value(val, strings, buf);
             }
@@ -402,8 +457,33 @@ fn encode_value(val: &Value, strings: &mut StringTableBuilder, buf: &mut Vec<u8>
     }
 }
 
+/// Shared-string view of a serialized string table.
+///
+/// Converts each table entry to an `ArcStr` once, so every reference the
+/// decoded entities make is a refcount bump instead of a fresh byte copy.
+struct ArcStringTable {
+    strings: Vec<ArcStr>,
+}
+
+impl ArcStringTable {
+    fn new(reader: &StringTableReader<'_>) -> Result<Self> {
+        let mut strings = Vec::with_capacity(reader.count as usize);
+        for i in 0..reader.count {
+            let s = reader.get(i).ok_or_else(|| {
+                Error::Serialization(format!("invalid string table entry {i}"))
+            })?;
+            strings.push(ArcStr::from(s));
+        }
+        Ok(Self { strings })
+    }
+
+    fn get(&self, index: u32) -> Option<&ArcStr> {
+        self.strings.get(index as usize)
+    }
+}
+
 /// Decodes a `Value` from the binary format.
-fn decode_value(data: &[u8], pos: &mut usize, strings: &StringTableReader<'_>) -> Result<Value> {
+fn decode_value(data: &[u8], pos: &mut usize, strings: &ArcStringTable) -> Result<Value> {
     if *pos >= data.len() {
         return Err(Error::Serialization(
             "unexpected end of data in value".to_string(),
@@ -443,7 +523,7 @@ fn decode_value(data: &[u8], pos: &mut usize, strings: &StringTableReader<'_>) -
             let s = strings
                 .get(idx)
                 .ok_or_else(|| Error::Serialization(format!("invalid string index {idx}")))?;
-            Ok(Value::String(s.into()))
+            Ok(Value::String(s.clone()))
         }
         5 => {
             // Bytes
@@ -536,8 +616,9 @@ fn decode_value(data: &[u8], pos: &mut usize, strings: &StringTableReader<'_>) -
                 let key_str = strings.get(key_idx).ok_or_else(|| {
                     Error::Serialization(format!("invalid map key string index {key_idx}"))
                 })?;
+                let key = PropertyKey::new(key_str.clone());
                 let val = decode_value(data, pos, strings)?;
-                map.insert(key_str.into(), val);
+                map.insert(key, val);
             }
             Ok(Value::Map(Arc::new(map)))
         }
@@ -604,11 +685,21 @@ use std::sync::Arc;
 
 // ── Writer ─────────────────────────────────────────────────────────
 
+/// Version list for one property of one entity.
+///
+/// Non-temporal stores always carry exactly one entry, which stays inline;
+/// only temporal history spills to the heap.
+pub(crate) type BlockPropertyVersions = SmallVec<[(EpochId, Value); 1]>;
+
 /// Intermediate node representation for the block writer.
+///
+/// Strings are shared (`ArcStr`/`PropertyKey`) so materializing an entity
+/// from a live store bumps refcounts instead of copying bytes, and the
+/// writer can reuse one scratch entity across the whole visit.
 pub(crate) struct BlockNode {
     pub id: NodeId,
-    pub labels: Vec<String>,
-    pub properties: Vec<(String, Vec<(EpochId, Value)>)>,
+    pub labels: Vec<ArcStr>,
+    pub properties: Vec<(PropertyKey, BlockPropertyVersions)>,
 }
 
 /// Intermediate edge representation for the block writer.
@@ -616,8 +707,8 @@ pub(crate) struct BlockEdge {
     pub id: EdgeId,
     pub src: NodeId,
     pub dst: NodeId,
-    pub edge_type: String,
-    pub properties: Vec<(String, Vec<(EpochId, Value)>)>,
+    pub edge_type: ArcStr,
+    pub properties: Vec<(PropertyKey, BlockPropertyVersions)>,
 }
 
 /// Intermediate named graph representation for the block writer.
@@ -627,123 +718,224 @@ pub(crate) struct BlockNamedGraph {
     pub edges: Vec<BlockEdge>,
 }
 
+/// Repeatable, deterministically ordered source for the block encoder.
+///
+/// The encoder makes several passes (string interning, entity blocks, labels,
+/// and property columns). A live store can implement those passes by lending
+/// one materialized entity to the visitor at a time instead of retaining a
+/// second owned copy of the whole graph.
+pub(crate) trait BlockSource {
+    fn node_count(&self) -> usize;
+    fn edge_count(&self) -> usize;
+    fn named_graph_count(&self) -> usize;
+
+    fn visit_nodes(&self, visitor: &mut dyn FnMut(&BlockNode) -> Result<()>) -> Result<()>;
+    fn visit_edges(&self, visitor: &mut dyn FnMut(&BlockEdge) -> Result<()>) -> Result<()>;
+    fn visit_named_graphs(
+        &self,
+        visitor: &mut dyn FnMut(&str, &dyn BlockSource) -> Result<()>,
+    ) -> Result<()>;
+}
+
+#[cfg(test)]
+struct SliceBlockSource<'a> {
+    nodes: &'a [BlockNode],
+    edges: &'a [BlockEdge],
+    named_graphs: &'a [BlockNamedGraph],
+}
+
+#[cfg(test)]
+impl BlockSource for SliceBlockSource<'_> {
+    fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    fn named_graph_count(&self) -> usize {
+        self.named_graphs.len()
+    }
+
+    fn visit_nodes(&self, visitor: &mut dyn FnMut(&BlockNode) -> Result<()>) -> Result<()> {
+        for node in self.nodes {
+            visitor(node)?;
+        }
+        Ok(())
+    }
+
+    fn visit_edges(&self, visitor: &mut dyn FnMut(&BlockEdge) -> Result<()>) -> Result<()> {
+        for edge in self.edges {
+            visitor(edge)?;
+        }
+        Ok(())
+    }
+
+    fn visit_named_graphs(
+        &self,
+        visitor: &mut dyn FnMut(&str, &dyn BlockSource) -> Result<()>,
+    ) -> Result<()> {
+        for graph in self.named_graphs {
+            let source = SliceBlockSource {
+                nodes: &graph.nodes,
+                edges: &graph.edges,
+                named_graphs: &[],
+            };
+            visitor(&graph.name, &source)?;
+        }
+        Ok(())
+    }
+}
+
 /// Serializes LPG data into the block-based binary format.
+///
+/// Thin wrapper over [`write_blocks_into`]: identical bytes, but the
+/// whole section is materialised in the returned `Vec`. Callers on the
+/// flush path should prefer the sink form.
+#[cfg(test)]
 pub(crate) fn write_blocks(
     nodes: &[BlockNode],
     edges: &[BlockEdge],
     named_graphs: &[BlockNamedGraph],
     epoch: u64,
 ) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_blocks_into(&mut out, nodes, edges, named_graphs, epoch)?;
+    Ok(out)
+}
+
+/// Serializes LPG data into the block-based binary format, writing
+/// straight into `sink`.
+///
+/// The previous assembly step built every block into its own `Vec` and
+/// then copied all of them into one output `Vec`, so the peak was twice
+/// the section size. Blocks still have to be built before the directory
+/// can record their offsets and CRCs, but the second copy is gone: the
+/// header, the directory, and each block body go to the sink in place.
+#[cfg(test)]
+pub(crate) fn write_blocks_into(
+    sink: &mut dyn std::io::Write,
+    nodes: &[BlockNode],
+    edges: &[BlockEdge],
+    named_graphs: &[BlockNamedGraph],
+    epoch: u64,
+) -> Result<()> {
+    let source = SliceBlockSource {
+        nodes,
+        edges,
+        named_graphs,
+    };
+    write_source_blocks_into(sink, &source, epoch)
+}
+
+pub(crate) fn write_source_blocks_into(
+    sink: &mut dyn std::io::Write,
+    source: &dyn BlockSource,
+    epoch: u64,
+) -> Result<()> {
     let mut strings = StringTableBuilder::new();
-    let mut blocks: Vec<(BlockType, Vec<u8>, u32, u32)> = Vec::new(); // (type, data, key_idx, sub_type)
+    let mut node_property_keys = std::collections::BTreeSet::new();
+    let mut edge_property_keys = std::collections::BTreeSet::new();
 
     // Phase 1: intern all strings first so the table is complete before
-    // we write any blocks that reference string indices.
-    for node in nodes {
+    // we write any blocks that reference string indices. Property keys are
+    // deduplicated during the same source pass instead of materialising one
+    // key copy per entity.
+    source.visit_nodes(&mut |node| {
         for label in &node.labels {
-            strings.intern(label);
+            strings.intern_arc(label);
         }
         for (key, entries) in &node.properties {
-            strings.intern(key);
+            strings.intern_arc(key.as_arc());
+            node_property_keys.insert(key.clone());
             intern_values_strings(entries, &mut strings);
         }
-    }
-    for edge in edges {
-        strings.intern(&edge.edge_type);
+        Ok(())
+    })?;
+    source.visit_edges(&mut |edge| {
+        strings.intern_arc(&edge.edge_type);
         for (key, entries) in &edge.properties {
-            strings.intern(key);
+            strings.intern_arc(key.as_arc());
+            edge_property_keys.insert(key.clone());
             intern_values_strings(entries, &mut strings);
         }
-    }
-    for graph in named_graphs {
-        strings.intern(&graph.name);
-        for node in &graph.nodes {
-            for label in &node.labels {
-                strings.intern(label);
-            }
-            for (key, entries) in &node.properties {
-                strings.intern(key);
-                intern_values_strings(entries, &mut strings);
-            }
-        }
-        for edge in &graph.edges {
-            strings.intern(&edge.edge_type);
-            for (key, entries) in &edge.properties {
-                strings.intern(key);
-                intern_values_strings(entries, &mut strings);
-            }
-        }
-    }
+        Ok(())
+    })?;
+    source.visit_named_graphs(&mut |name, graph| {
+        strings.intern(name);
+        intern_source_strings(graph, &mut strings)
+    })?;
 
-    // Block 0: String table
-    let st_data = strings.serialize();
-    blocks.push((BlockType::StringTable, st_data, 0, 0));
-
-    // Block 1: Node data
-    // Format: for each node [id:u64]
-    let mut node_buf = Vec::with_capacity(nodes.len() * 8);
-    for node in nodes {
-        node_buf.extend_from_slice(&node.id.as_u64().to_le_bytes());
-    }
-    blocks.push((BlockType::NodeData, node_buf, 0, 0));
-
-    // Block 2: Edge data
-    // Format: for each edge [id:u64][src:u64][dst:u64][type_str_idx:u32]
-    let mut edge_buf = Vec::with_capacity(edges.len() * 28);
-    for edge in edges {
-        edge_buf.extend_from_slice(&edge.id.as_u64().to_le_bytes());
-        edge_buf.extend_from_slice(&edge.src.as_u64().to_le_bytes());
-        edge_buf.extend_from_slice(&edge.dst.as_u64().to_le_bytes());
-        let type_idx = strings.intern(&edge.edge_type);
-        edge_buf.extend_from_slice(&type_idx.to_le_bytes());
-    }
-    blocks.push((BlockType::EdgeData, edge_buf, 0, 0));
-
-    // Block 3: Label assignments
-    // Format: [node_count:u32] for each node [label_count:u16][label_idx:u32*count]
+    // Phase 2: encode every top-level node exactly once into all node-backed
+    // blocks. The block buffers are the durable output pieces; only the one
+    // currently visited entity is materialized beside them.
+    let mut node_buf = Vec::with_capacity(source.node_count() * 8);
     let mut label_buf = Vec::new();
     // reason: node and label counts within a section fit u32/u16
     #[allow(clippy::cast_possible_truncation)]
-    label_buf.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
-    for node in nodes {
+    label_buf.extend_from_slice(&(source.node_count() as u32).to_le_bytes());
+    let mut node_property_columns = property_column_builders(node_property_keys, &mut strings);
+    source.visit_nodes(&mut |node| {
+        node_buf.extend_from_slice(&node.id.as_u64().to_le_bytes());
         // reason: label count per node is bounded, fits u16
         #[allow(clippy::cast_possible_truncation)]
         label_buf.extend_from_slice(&(node.labels.len() as u16).to_le_bytes());
         for label in &node.labels {
-            let idx = strings.intern(label);
+            let idx = strings.intern_arc(label);
             label_buf.extend_from_slice(&idx.to_le_bytes());
         }
-    }
-    blocks.push((BlockType::LabelAssignment, label_buf, 0, 0));
+        append_entity_properties(
+            node.id.as_u64(),
+            &node.properties,
+            &mut node_property_columns,
+            &mut strings,
+        );
+        Ok(())
+    })?;
 
-    // Property columns: one block per (property_key, entity_type) pair
-    // Node properties
-    let node_prop_keys = collect_property_keys(nodes.iter().flat_map(|n| n.properties.iter()));
-    for key in &node_prop_keys {
-        let key_idx = strings.intern(key);
-        let col_data = write_property_column(key, nodes.iter(), &mut strings, true);
-        blocks.push((BlockType::PropertyColumn, col_data, key_idx, 0));
-    }
+    // Encode every top-level edge once into its fixed-width row and property
+    // columns for the same reason.
+    let mut edge_buf = Vec::with_capacity(source.edge_count() * 28);
+    let mut edge_property_columns = property_column_builders(edge_property_keys, &mut strings);
+    source.visit_edges(&mut |edge| {
+        edge_buf.extend_from_slice(&edge.id.as_u64().to_le_bytes());
+        edge_buf.extend_from_slice(&edge.src.as_u64().to_le_bytes());
+        edge_buf.extend_from_slice(&edge.dst.as_u64().to_le_bytes());
+        let type_idx = strings.intern_arc(&edge.edge_type);
+        edge_buf.extend_from_slice(&type_idx.to_le_bytes());
+        append_entity_properties(
+            edge.id.as_u64(),
+            &edge.properties,
+            &mut edge_property_columns,
+            &mut strings,
+        );
+        Ok(())
+    })?;
 
-    // Edge properties
-    let edge_prop_keys = collect_property_keys(edges.iter().flat_map(|e| e.properties.iter()));
-    for key in &edge_prop_keys {
-        let key_idx = strings.intern(key);
-        let col_data = write_property_column_edges(key, edges.iter(), &mut strings);
-        blocks.push((BlockType::PropertyColumn, col_data, key_idx, 1));
-    }
+    let mut named_graph_blocks = Vec::with_capacity(source.named_graph_count());
+    source.visit_named_graphs(&mut |name, graph| {
+        let name_idx = strings.intern(name);
+        let graph_data = write_source_blocks(graph, epoch)?;
+        named_graph_blocks.push((BlockType::NamedGraph, graph_data, name_idx, 0));
+        Ok(())
+    })?;
 
-    // Named graphs: each is a self-contained sub-section
-    for graph in named_graphs {
-        let name_idx = strings.intern(&graph.name);
-        let graph_data = write_blocks(&graph.nodes, &graph.edges, &[], epoch)?;
-        blocks.push((BlockType::NamedGraph, graph_data, name_idx, 0));
-    }
-
-    // Re-serialize the string table now that all strings are interned
-    // (property column writing may have added new strings)
-    let final_st_data = strings.serialize();
-    blocks[0].1 = final_st_data;
+    let mut blocks: Vec<(BlockType, Vec<u8>, u32, u32)> = vec![
+        (BlockType::StringTable, strings.serialize(), 0, 0),
+        (BlockType::NodeData, node_buf, 0, 0),
+        (BlockType::EdgeData, edge_buf, 0, 0),
+        (BlockType::LabelAssignment, label_buf, 0, 0),
+    ]; // (type, data, key_idx, sub_type)
+    blocks.extend(node_property_columns.into_iter().map(|column| {
+        let key_index = column.key_index;
+        (BlockType::PropertyColumn, column.finish(), key_index, 0)
+    }));
+    blocks.extend(edge_property_columns.into_iter().map(|column| {
+        let key_index = column.key_index;
+        (BlockType::PropertyColumn, column.finish(), key_index, 1)
+    }));
+    blocks.extend(named_graph_blocks);
 
     // Assemble the final output
     let block_count = blocks.len();
@@ -758,12 +950,8 @@ pub(crate) fn write_blocks(
         dir_entries.push(BlockDirEntry {
             block_type: *block_type as u8,
             _reserved: [0; 3],
-            // reason: section offsets and block sizes fit u32
-            #[allow(clippy::cast_possible_truncation)]
-            offset: data_offset as u32,
-            // reason: block data offset and length bounded by block capacity (64 KB)
-            #[allow(clippy::cast_possible_truncation)]
-            length: block_data.len() as u32,
+            offset: data_offset as u64,
+            length: block_data.len() as u64,
             checksum,
             key_string_index: *key_idx,
             sub_type: *sub_type,
@@ -771,9 +959,11 @@ pub(crate) fn write_blocks(
         data_offset += block_data.len();
     }
 
-    // Write output
+    // Write output. Header + directory are fixed-size and tiny
+    // (64 B + 24 B per block), so they are staged in one small buffer;
+    // block bodies go straight to the sink without a second copy.
     let total_size = data_offset;
-    let mut output = Vec::with_capacity(total_size);
+    let mut prologue = Vec::with_capacity(HEADER_SIZE + dir_size);
 
     // Header
     // reason: section block counts fit u16/u32
@@ -783,26 +973,62 @@ pub(crate) fn write_blocks(
         version: LPG_BLOCK_VERSION,
         flags: 0,
         block_count: block_count as u16,
-        node_count: nodes.len() as u64,
-        edge_count: edges.len() as u64,
+        node_count: source.node_count() as u64,
+        edge_count: source.edge_count() as u64,
         epoch,
-        named_graph_count: named_graphs.len() as u32,
+        named_graph_count: source.named_graph_count() as u32,
         _reserved: [0; 28],
     };
-    header.write_to(&mut output);
+    header.write_to(&mut prologue);
 
     // Directory
     for entry in &dir_entries {
-        entry.write_to(&mut output);
+        entry.write_to(&mut prologue);
     }
+    debug_assert_eq!(prologue.len(), HEADER_SIZE + dir_size);
+    sink.write_all(&prologue)?;
 
     // Block data
+    let mut written = prologue.len();
     for (_, block_data, _, _) in &blocks {
-        output.extend_from_slice(block_data);
+        sink.write_all(block_data)?;
+        written += block_data.len();
     }
 
-    debug_assert_eq!(output.len(), total_size);
-    Ok(output)
+    debug_assert_eq!(written, total_size);
+    let _ = written;
+    Ok(())
+}
+
+fn write_source_blocks(source: &dyn BlockSource, epoch: u64) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_source_blocks_into(&mut out, source, epoch)?;
+    Ok(out)
+}
+
+fn intern_source_strings(source: &dyn BlockSource, strings: &mut StringTableBuilder) -> Result<()> {
+    source.visit_nodes(&mut |node| {
+        for label in &node.labels {
+            strings.intern_arc(label);
+        }
+        for (key, entries) in &node.properties {
+            strings.intern_arc(key.as_arc());
+            intern_values_strings(entries, strings);
+        }
+        Ok(())
+    })?;
+    source.visit_edges(&mut |edge| {
+        strings.intern_arc(&edge.edge_type);
+        for (key, entries) in &edge.properties {
+            strings.intern_arc(key.as_arc());
+            intern_values_strings(entries, strings);
+        }
+        Ok(())
+    })?;
+    source.visit_named_graphs(&mut |name, graph| {
+        strings.intern(name);
+        intern_source_strings(graph, strings)
+    })
 }
 
 fn intern_values_strings(entries: &[(EpochId, Value)], strings: &mut StringTableBuilder) {
@@ -839,88 +1065,106 @@ fn intern_value_strings(value: &Value, strings: &mut StringTableBuilder) {
     }
 }
 
-fn collect_property_keys<'a>(
-    props: impl Iterator<Item = &'a (String, Vec<(EpochId, Value)>)>,
-) -> Vec<String> {
-    let mut keys: Vec<String> = props.map(|(k, _)| k.clone()).collect();
-    keys.sort();
-    keys.dedup();
-    keys
+struct PropertyColumnBuilder {
+    key: PropertyKey,
+    key_index: u32,
+    entry_count: usize,
+    data: Vec<u8>,
 }
 
-/// Writes a property column for node properties.
-///
-/// Format: [entry_count:u32] for each entry [entity_id:u64][version_count:u16]
-///         for each version [epoch:u64][encoded_value]
-fn write_property_column<'a>(
-    key: &str,
-    nodes: impl Iterator<Item = &'a BlockNode>,
-    strings: &mut StringTableBuilder,
-    _is_node: bool,
-) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut entries: Vec<(u64, &[(EpochId, Value)])> = Vec::new();
-
-    for node in nodes {
-        for (k, versions) in &node.properties {
-            if k == key && !versions.is_empty() {
-                entries.push((node.id.as_u64(), versions));
-            }
+impl PropertyColumnBuilder {
+    fn new(key: PropertyKey, key_index: u32) -> Self {
+        Self {
+            key,
+            key_index,
+            entry_count: 0,
+            data: vec![0; std::mem::size_of::<u32>()],
         }
     }
 
-    // reason: property column entry counts fit u32/u16 within a section
-    #[allow(clippy::cast_possible_truncation)]
-    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (entity_id, versions) in &entries {
-        buf.extend_from_slice(&entity_id.to_le_bytes());
+    fn append(
+        &mut self,
+        entity_id: u64,
+        versions: &[(EpochId, Value)],
+        strings: &mut StringTableBuilder,
+    ) {
+        self.entry_count += 1;
+        self.data.extend_from_slice(&entity_id.to_le_bytes());
         // reason: version count per entity is bounded, fits u16
         #[allow(clippy::cast_possible_truncation)]
-        buf.extend_from_slice(&(versions.len() as u16).to_le_bytes());
-        for (epoch, value) in *versions {
-            buf.extend_from_slice(&epoch.as_u64().to_le_bytes());
-            encode_value(value, strings, &mut buf);
+        self.data
+            .extend_from_slice(&(versions.len() as u16).to_le_bytes());
+        for (epoch, value) in versions {
+            self.data.extend_from_slice(&epoch.as_u64().to_le_bytes());
+            encode_value(value, strings, &mut self.data);
         }
     }
 
-    buf
+    fn finish(mut self) -> Vec<u8> {
+        // reason: property column entry counts fit u32 within a section
+        #[allow(clippy::cast_possible_truncation)]
+        let entry_count = self.entry_count as u32;
+        self.data[..std::mem::size_of::<u32>()].copy_from_slice(&entry_count.to_le_bytes());
+        self.data
+    }
 }
 
-/// Writes a property column for edge properties.
-fn write_property_column_edges<'a>(
-    key: &str,
-    edges: impl Iterator<Item = &'a BlockEdge>,
+fn property_column_builders(
+    keys: std::collections::BTreeSet<PropertyKey>,
     strings: &mut StringTableBuilder,
-) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut entries: Vec<(u64, &[(EpochId, Value)])> = Vec::new();
+) -> Vec<PropertyColumnBuilder> {
+    keys.into_iter()
+        .map(|key| {
+            let key_index = strings.intern_arc(key.as_arc());
+            PropertyColumnBuilder::new(key, key_index)
+        })
+        .collect()
+}
 
-    for edge in edges {
-        for (k, versions) in &edge.properties {
-            if k == key && !versions.is_empty() {
-                entries.push((edge.id.as_u64(), versions));
-            }
+fn append_entity_properties(
+    entity_id: u64,
+    properties: &[(PropertyKey, BlockPropertyVersions)],
+    columns: &mut [PropertyColumnBuilder],
+    strings: &mut StringTableBuilder,
+) {
+    for (key, versions) in properties {
+        if versions.is_empty() {
+            continue;
+        }
+        if let Ok(index) =
+            columns.binary_search_by(|column| column.key.as_str().cmp(key.as_str()))
+        {
+            columns[index].append(entity_id, versions, strings);
         }
     }
-
-    // reason: property column entry counts fit u32/u16 within a section
-    #[allow(clippy::cast_possible_truncation)]
-    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (entity_id, versions) in &entries {
-        buf.extend_from_slice(&entity_id.to_le_bytes());
-        // reason: version count per entity is bounded, fits u16
-        #[allow(clippy::cast_possible_truncation)]
-        buf.extend_from_slice(&(versions.len() as u16).to_le_bytes());
-        for (epoch, value) in *versions {
-            buf.extend_from_slice(&epoch.as_u64().to_le_bytes());
-            encode_value(value, strings, &mut buf);
-        }
-    }
-
-    buf
 }
 
 // ── Reader ─────────────────────────────────────────────────────────
+
+fn checked_block_range(entry: &BlockDirEntry, data_len: usize) -> Result<std::ops::Range<usize>> {
+    // The 64-bit sum is checked before any usize conversion so a corrupt
+    // entry surfaces as a typed error on every target width.
+    let end = entry.offset.checked_add(entry.length).ok_or_else(|| {
+        Error::Serialization(format!(
+            "LPG block range overflows the address space: offset {} + length {}",
+            entry.offset, entry.length
+        ))
+    })?;
+    if end > data_len as u64 {
+        return Err(Error::Serialization(format!(
+            "LPG block extends past end of data: range {}..{end}, data length {data_len}",
+            entry.offset
+        )));
+    }
+    // reason: both bounds were validated against data_len, which fits usize
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(entry.offset as usize..end as usize)
+}
+
+fn checked_block_data<'a>(data: &'a [u8], entry: &BlockDirEntry) -> Result<&'a [u8]> {
+    let range = checked_block_range(entry, data.len())?;
+    Ok(&data[range])
+}
 
 /// Reads block-based LPG section data and populates the store.
 pub(crate) fn read_blocks(
@@ -943,8 +1187,9 @@ pub(crate) fn read_blocks(
     }
 
     let block_count = header.block_count as usize;
+    let entry_size = BlockDirEntry::size_for_version(header.version);
     let dir_start = HEADER_SIZE;
-    let dir_end = dir_start + block_count * BlockDirEntry::SIZE;
+    let dir_end = dir_start + block_count * entry_size;
 
     if data.len() < dir_end {
         return Err(Error::Serialization(
@@ -953,24 +1198,25 @@ pub(crate) fn read_blocks(
     }
 
     // Parse directory
+    let wide_offsets = header.version >= LPG_BLOCK_VERSION_WIDE_OFFSETS;
     let mut dir_entries = Vec::with_capacity(block_count);
     for i in 0..block_count {
-        let entry_start = dir_start + i * BlockDirEntry::SIZE;
-        let entry = BlockDirEntry::read_from(&data[entry_start..])
-            .ok_or_else(|| Error::Serialization(format!("invalid block directory entry {i}")))?;
+        let entry_start = dir_start + i * entry_size;
+        let entry = if wide_offsets {
+            BlockDirEntry::read_from(&data[entry_start..])
+        } else {
+            BlockDirEntry::read_from_v1(&data[entry_start..])
+        }
+        .ok_or_else(|| Error::Serialization(format!("invalid block directory entry {i}")))?;
         dir_entries.push(entry);
     }
 
-    // Verify checksums and extract blocks
+    // Verify bounds and checksums
     for (i, entry) in dir_entries.iter().enumerate() {
-        let start = entry.offset as usize;
-        let end = start + entry.length as usize;
-        if end > data.len() {
-            return Err(Error::Serialization(format!(
-                "block {i} extends past end of data"
-            )));
-        }
-        let actual_crc = crc32fast::hash(&data[start..end]);
+        let block = checked_block_data(data, entry).map_err(|error| {
+            Error::Serialization(format!("block {i} has an invalid range: {error}"))
+        })?;
+        let actual_crc = crc32fast::hash(block);
         if actual_crc != entry.checksum {
             return Err(Error::Serialization(format!(
                 "block {i} CRC mismatch: expected {:08x}, got {actual_crc:08x}",
@@ -984,9 +1230,10 @@ pub(crate) fn read_blocks(
         .iter()
         .find(|e| e.block_type == BlockType::StringTable as u8)
         .ok_or_else(|| Error::Serialization("missing string table block".to_string()))?;
-    let st_data = &data[st_entry.offset as usize..(st_entry.offset + st_entry.length) as usize];
+    let st_data = checked_block_data(data, st_entry)?;
     let strings = StringTableReader::new(st_data)
         .ok_or_else(|| Error::Serialization("invalid string table".to_string()))?;
+    let strings = ArcStringTable::new(&strings)?;
 
     // Read node data (cap capacity to prevent OOM from untrusted header)
     // reason: on 64-bit targets u64 == usize; on 32-bit, capacity is capped by .min()
@@ -996,7 +1243,7 @@ pub(crate) fn read_blocks(
         .iter()
         .find(|e| e.block_type == BlockType::NodeData as u8)
     {
-        let block = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
+        let block = checked_block_data(data, entry)?;
         let mut pos = 0;
         while pos + 8 <= block.len() {
             let id = NodeId::new(u64::from_le_bytes(block[pos..pos + 8].try_into().unwrap()));
@@ -1017,7 +1264,7 @@ pub(crate) fn read_blocks(
         .iter()
         .find(|e| e.block_type == BlockType::EdgeData as u8)
     {
-        let block = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
+        let block = checked_block_data(data, entry)?;
         let mut pos = 0;
         while pos + 28 <= block.len() {
             let id = EdgeId::new(u64::from_le_bytes(block[pos..pos + 8].try_into().unwrap()));
@@ -1033,7 +1280,7 @@ pub(crate) fn read_blocks(
                 .ok_or_else(|| {
                     Error::Serialization(format!("invalid edge type string index {type_idx}"))
                 })?
-                .to_owned();
+                .clone();
             edges.push(BlockEdge {
                 id,
                 src,
@@ -1049,7 +1296,7 @@ pub(crate) fn read_blocks(
         .iter()
         .find(|e| e.block_type == BlockType::LabelAssignment as u8)
     {
-        let block = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
+        let block = checked_block_data(data, entry)?;
         let mut pos = 0;
         ensure_remaining(block, pos, 4)?;
         let node_count = u32::from_le_bytes(block[pos..pos + 4].try_into().unwrap()) as usize;
@@ -1067,7 +1314,7 @@ pub(crate) fn read_blocks(
                 let label = strings.get(idx).ok_or_else(|| {
                     Error::Serialization(format!("invalid label string index {idx}"))
                 })?;
-                labels.push(label.to_owned());
+                labels.push(label.clone());
             }
             nodes[i].labels = labels;
         }
@@ -1090,13 +1337,14 @@ pub(crate) fn read_blocks(
         if entry.block_type != BlockType::PropertyColumn as u8 {
             continue;
         }
-        let block = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
+        let block = checked_block_data(data, entry)?;
         let key_name = strings.get(entry.key_string_index).ok_or_else(|| {
             Error::Serialization(format!(
                 "invalid property key string index {}",
                 entry.key_string_index
             ))
         })?;
+        let key = PropertyKey::new(key_name.clone());
         let is_edge_prop = entry.sub_type == 1;
 
         let mut pos = 0;
@@ -1112,7 +1360,7 @@ pub(crate) fn read_blocks(
                 u16::from_le_bytes(block[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
 
-            let mut versions = Vec::with_capacity(version_count);
+            let mut versions = BlockPropertyVersions::with_capacity(version_count);
             for _ in 0..version_count {
                 ensure_remaining(block, pos, 8)?;
                 let epoch =
@@ -1124,10 +1372,10 @@ pub(crate) fn read_blocks(
 
             if is_edge_prop {
                 if let Some(&idx) = edge_id_map.get(&entity_id) {
-                    edges[idx].properties.push((key_name.to_owned(), versions));
+                    edges[idx].properties.push((key.clone(), versions));
                 }
             } else if let Some(&idx) = node_id_map.get(&entity_id) {
-                nodes[idx].properties.push((key_name.to_owned(), versions));
+                nodes[idx].properties.push((key.clone(), versions));
             }
         }
     }
@@ -1138,7 +1386,7 @@ pub(crate) fn read_blocks(
         if entry.block_type != BlockType::NamedGraph as u8 {
             continue;
         }
-        let block = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
+        let block = checked_block_data(data, entry)?;
         let graph_name = strings.get(entry.key_string_index).ok_or_else(|| {
             Error::Serialization(format!(
                 "invalid graph name string index {}",
@@ -1156,7 +1404,7 @@ pub(crate) fn read_blocks(
         })?;
 
         named_graphs.push(BlockNamedGraph {
-            name: graph_name.to_owned(),
+            name: graph_name.to_string(),
             nodes: graph_nodes,
             edges: graph_edges,
         });
@@ -1203,21 +1451,21 @@ mod tests {
         let nodes = vec![
             BlockNode {
                 id: NodeId::new(1),
-                labels: vec!["Person".to_string()],
+                labels: vec!["Person".into()],
                 properties: vec![(
-                    "name".to_string(),
-                    vec![(EpochId::new(1), Value::String("Alix".into()))],
+                    "name".into(),
+                    smallvec::smallvec![(EpochId::new(1), Value::String("Alix".into()))],
                 )],
             },
             BlockNode {
                 id: NodeId::new(2),
-                labels: vec!["Person".to_string(), "Employee".to_string()],
+                labels: vec!["Person".into(), "Employee".into()],
                 properties: vec![
                     (
-                        "name".to_string(),
-                        vec![(EpochId::new(1), Value::String("Gus".into()))],
+                        "name".into(),
+                        smallvec::smallvec![(EpochId::new(1), Value::String("Gus".into()))],
                     ),
-                    ("age".to_string(), vec![(EpochId::new(1), Value::Int64(30))]),
+                    ("age".into(), smallvec::smallvec![(EpochId::new(1), Value::Int64(30))]),
                 ],
             },
         ];
@@ -1233,7 +1481,7 @@ mod tests {
             assert_eq!(decoded_nodes[0].id, NodeId::new(1));
             assert_eq!(decoded_nodes[0].labels, vec!["Person"]);
             assert_eq!(decoded_nodes[0].properties.len(), 1);
-            assert_eq!(decoded_nodes[0].properties[0].0, "name");
+            assert_eq!(decoded_nodes[0].properties[0].0.as_str(), "name");
 
             assert_eq!(decoded_nodes[1].id, NodeId::new(2));
             assert_eq!(decoded_nodes[1].labels.len(), 2);
@@ -1249,12 +1497,12 @@ mod tests {
         let nodes = vec![
             BlockNode {
                 id: NodeId::new(1),
-                labels: vec!["Person".to_string()],
+                labels: vec!["Person".into()],
                 properties: vec![],
             },
             BlockNode {
                 id: NodeId::new(2),
-                labels: vec!["Person".to_string()],
+                labels: vec!["Person".into()],
                 properties: vec![],
             },
         ];
@@ -1262,10 +1510,10 @@ mod tests {
             id: EdgeId::new(1),
             src: NodeId::new(1),
             dst: NodeId::new(2),
-            edge_type: "KNOWS".to_string(),
+            edge_type: "KNOWS".into(),
             properties: vec![(
-                "since".to_string(),
-                vec![(EpochId::new(1), Value::Int64(2020))],
+                "since".into(),
+                smallvec::smallvec![(EpochId::new(1), Value::Int64(2020))],
             )],
         }];
 
@@ -1277,7 +1525,7 @@ mod tests {
             assert_eq!(decoded_edges[0].src, NodeId::new(1));
             assert_eq!(decoded_edges[0].dst, NodeId::new(2));
             assert_eq!(decoded_edges[0].properties.len(), 1);
-            assert_eq!(decoded_edges[0].properties[0].0, "since");
+            assert_eq!(decoded_edges[0].properties[0].0.as_str(), "since");
             Ok(())
         })
         .unwrap();
@@ -1288,34 +1536,34 @@ mod tests {
         use grafeo_common::types::{Date, Duration, Time, Timestamp, ZonedDatetime};
 
         let props = vec![
-            ("null_val".to_string(), vec![(EpochId::new(0), Value::Null)]),
+            ("null_val".into(), smallvec::smallvec![(EpochId::new(0), Value::Null)]),
             (
-                "bool_val".to_string(),
-                vec![(EpochId::new(0), Value::Bool(true))],
+                "bool_val".into(),
+                smallvec::smallvec![(EpochId::new(0), Value::Bool(true))],
             ),
             (
-                "int_val".to_string(),
-                vec![(EpochId::new(0), Value::Int64(-42))],
+                "int_val".into(),
+                smallvec::smallvec![(EpochId::new(0), Value::Int64(-42))],
             ),
             (
-                "float_val".to_string(),
-                vec![(EpochId::new(0), Value::Float64(2.72))],
+                "float_val".into(),
+                smallvec::smallvec![(EpochId::new(0), Value::Float64(2.72))],
             ),
             (
-                "string_val".to_string(),
-                vec![(EpochId::new(0), Value::String("hello".into()))],
+                "string_val".into(),
+                smallvec::smallvec![(EpochId::new(0), Value::String("hello".into()))],
             ),
             (
-                "bytes_val".to_string(),
-                vec![(EpochId::new(0), Value::Bytes(vec![1, 2, 3].into()))],
+                "bytes_val".into(),
+                smallvec::smallvec![(EpochId::new(0), Value::Bytes(vec![1, 2, 3].into()))],
             ),
             (
-                "date_val".to_string(),
-                vec![(EpochId::new(0), Value::Date(Date::from_days(19000)))],
+                "date_val".into(),
+                smallvec::smallvec![(EpochId::new(0), Value::Date(Date::from_days(19000)))],
             ),
             (
-                "time_val".to_string(),
-                vec![(
+                "time_val".into(),
+                smallvec::smallvec![(
                     EpochId::new(0),
                     Value::Time(
                         Time::from_nanos(43_200_000_000_000)
@@ -1325,15 +1573,15 @@ mod tests {
                 )],
             ),
             (
-                "ts_val".to_string(),
-                vec![(
+                "ts_val".into(),
+                smallvec::smallvec![(
                     EpochId::new(0),
                     Value::Timestamp(Timestamp::from_millis(1_700_000_000_000)),
                 )],
             ),
             (
-                "zdt_val".to_string(),
-                vec![(
+                "zdt_val".into(),
+                smallvec::smallvec![(
                     EpochId::new(0),
                     Value::ZonedDatetime(ZonedDatetime::from_timestamp_offset(
                         Timestamp::from_millis(1_700_000_000_000),
@@ -1342,22 +1590,22 @@ mod tests {
                 )],
             ),
             (
-                "dur_val".to_string(),
-                vec![(
+                "dur_val".into(),
+                smallvec::smallvec![(
                     EpochId::new(0),
                     Value::Duration(Duration::new(14, 3, 1_000_000)),
                 )],
             ),
             (
-                "list_val".to_string(),
-                vec![(
+                "list_val".into(),
+                smallvec::smallvec![(
                     EpochId::new(0),
                     Value::List(vec![Value::Int64(1), Value::String("two".into())].into()),
                 )],
             ),
             (
-                "vec_val".to_string(),
-                vec![(EpochId::new(0), Value::Vector(vec![1.0, 2.0, 3.0].into()))],
+                "vec_val".into(),
+                smallvec::smallvec![(EpochId::new(0), Value::Vector(vec![1.0, 2.0, 3.0].into()))],
             ),
         ];
 
@@ -1405,17 +1653,17 @@ mod tests {
         let nodes = vec![
             BlockNode {
                 id: NodeId::new(1),
-                labels: vec!["Person".to_string()],
+                labels: vec!["Person".into()],
                 properties: vec![],
             },
             BlockNode {
                 id: NodeId::new(2),
-                labels: vec!["Person".to_string()],
+                labels: vec!["Person".into()],
                 properties: vec![],
             },
             BlockNode {
                 id: NodeId::new(3),
-                labels: vec!["Person".to_string()],
+                labels: vec!["Person".into()],
                 properties: vec![],
             },
         ];
@@ -1426,7 +1674,7 @@ mod tests {
         let _header = SectionHeader::read_from(&data).unwrap();
         let dir_start = HEADER_SIZE;
         let st_entry = BlockDirEntry::read_from(&data[dir_start..]).unwrap();
-        let st_data = &data[st_entry.offset as usize..(st_entry.offset + st_entry.length) as usize];
+        let st_data = checked_block_data(&data, &st_entry).unwrap();
         let strings = StringTableReader::new(st_data).unwrap();
 
         // "Person" should only appear once in the string table
@@ -1434,22 +1682,95 @@ mod tests {
         assert_eq!(strings.get(0), Some("Person"));
     }
 
+    /// Repacks a version-2 section as version 1 (24-byte directory entries
+    /// with 32-bit offsets), the shape every store written before the wide-
+    /// offset format carries on disk.
+    fn downgrade_to_v1(data: &[u8]) -> Vec<u8> {
+        let header = SectionHeader::read_from(data).unwrap();
+        let n = header.block_count as usize;
+        let old_dir_end = HEADER_SIZE + n * BlockDirEntry::SIZE;
+        let shift = n * (BlockDirEntry::SIZE - BlockDirEntry::V1_SIZE);
+        let mut out = Vec::with_capacity(data.len() - shift);
+        out.extend_from_slice(&data[..HEADER_SIZE]);
+        out[4] = 1;
+        for i in 0..n {
+            let entry =
+                BlockDirEntry::read_from(&data[HEADER_SIZE + i * BlockDirEntry::SIZE..]).unwrap();
+            out.push(entry.block_type);
+            out.extend_from_slice(&entry._reserved);
+            let offset = u32::try_from(entry.offset - shift as u64).unwrap();
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&u32::try_from(entry.length).unwrap().to_le_bytes());
+            out.extend_from_slice(&entry.checksum.to_le_bytes());
+            out.extend_from_slice(&entry.key_string_index.to_le_bytes());
+            out.extend_from_slice(&entry.sub_type.to_le_bytes());
+        }
+        out.extend_from_slice(&data[old_dir_end..]);
+        out
+    }
+
+    #[test]
+    fn test_reads_version_one_sections() {
+        let nodes = vec![BlockNode {
+            id: NodeId::new(1),
+            labels: vec!["Person".into()],
+            properties: vec![(
+                "name".into(),
+                smallvec::smallvec![(EpochId::new(1), Value::String("Alix".into()))],
+            )],
+        }];
+        let v1 = downgrade_to_v1(&write_blocks(&nodes, &[], &[], 9).unwrap());
+
+        read_blocks(&v1, &mut |decoded, edges, graphs, epoch| {
+            assert_eq!(epoch, 9);
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(decoded[0].labels, vec!["Person"]);
+            assert_eq!(decoded[0].properties.len(), 1);
+            assert!(edges.is_empty());
+            assert!(graphs.is_empty());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_directory_entry_past_section_end_is_a_typed_error() {
+        let mut data = write_blocks(&[], &[], &[], 0).unwrap();
+        // First entry's length field (bytes 12..20 of the 32-byte entry).
+        let len_at = HEADER_SIZE + 12;
+        data[len_at..len_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let result = read_blocks(&data, &mut |_, _, _, _| Ok(()));
+        assert!(matches!(result, Err(Error::Serialization(_))), "{result:?}");
+    }
+
+    #[test]
+    fn test_directory_entry_offset_overflow_is_a_typed_error() {
+        let mut data = write_blocks(&[], &[], &[], 0).unwrap();
+        let off_at = HEADER_SIZE + 4;
+        data[off_at..off_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        data[off_at + 8..off_at + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let result = read_blocks(&data, &mut |_, _, _, _| Ok(()));
+        assert!(matches!(result, Err(Error::Serialization(_))), "{result:?}");
+    }
+
     #[test]
     fn test_named_graph_round_trip() {
         let nodes = vec![BlockNode {
             id: NodeId::new(1),
-            labels: vec!["Root".to_string()],
+            labels: vec!["Root".into()],
             properties: vec![],
         }];
 
         let named_graphs = vec![BlockNamedGraph {
-            name: "social".to_string(),
+            name: "social".into(),
             nodes: vec![BlockNode {
                 id: NodeId::new(10),
-                labels: vec!["Friend".to_string()],
+                labels: vec!["Friend".into()],
                 properties: vec![(
-                    "name".to_string(),
-                    vec![(EpochId::new(1), Value::String("Alix".into()))],
+                    "name".into(),
+                    smallvec::smallvec![(EpochId::new(1), Value::String("Alix".into()))],
                 )],
             }],
             edges: vec![],
@@ -1474,7 +1795,7 @@ mod tests {
     fn test_crc_corruption_detected() {
         let nodes = vec![BlockNode {
             id: NodeId::new(1),
-            labels: vec!["Test".to_string()],
+            labels: vec!["Test".into()],
             properties: vec![],
         }];
 
@@ -1491,6 +1812,24 @@ mod tests {
     }
 
     #[test]
+    fn block_range_accepts_offsets_crossing_the_u32_boundary() {
+        let entry = BlockDirEntry {
+            block_type: BlockType::PropertyColumn as u8,
+            _reserved: [0; 3],
+            offset: u64::from(u32::MAX) - 1,
+            length: 4,
+            checksum: 0,
+            key_string_index: 0,
+            sub_type: 0,
+        };
+
+        let range = checked_block_range(&entry, u32::MAX as usize + 4).unwrap();
+
+        assert_eq!(range.start, u32::MAX as usize - 1);
+        assert_eq!(range.end, u32::MAX as usize + 3);
+    }
+
+    #[test]
     fn test_invalid_magic_rejected() {
         let data = vec![0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
         assert!(!is_block_format(&data));
@@ -1503,8 +1842,8 @@ mod tests {
             id: NodeId::new(1),
             labels: vec![],
             properties: vec![(
-                "name".to_string(),
-                vec![
+                "name".into(),
+                smallvec::smallvec![
                     (EpochId::new(1), Value::String("Alix".into())),
                     (EpochId::new(5), Value::String("Gus".into())),
                     (EpochId::new(10), Value::String("Vincent".into())),
@@ -1536,10 +1875,10 @@ mod tests {
         let nodes: Vec<BlockNode> = (1..=1000)
             .map(|i| BlockNode {
                 id: NodeId::new(i),
-                labels: vec!["Node".to_string()],
+                labels: vec!["Node".into()],
                 properties: vec![(
-                    "index".to_string(),
-                    vec![(EpochId::new(0), Value::Int64(i as i64))],
+                    "index".into(),
+                    smallvec::smallvec![(EpochId::new(0), Value::Int64(i as i64))],
                 )],
             })
             .collect();
@@ -1549,7 +1888,7 @@ mod tests {
                 id: EdgeId::new(i),
                 src: NodeId::new((i % 1000) + 1),
                 dst: NodeId::new(((i + 1) % 1000) + 1),
-                edge_type: "LINK".to_string(),
+                edge_type: "LINK".into(),
                 properties: vec![],
             })
             .collect();
@@ -1580,8 +1919,8 @@ mod tests {
             id: NodeId::new(1),
             labels: vec![],
             properties: vec![(
-                "metadata".to_string(),
-                vec![(EpochId::new(0), Value::Map(Arc::new(map.clone())))],
+                "metadata".into(),
+                smallvec::smallvec![(EpochId::new(0), Value::Map(Arc::new(map.clone())))],
             )],
         }];
 
@@ -1620,7 +1959,7 @@ mod tests {
         // then either errors or gracefully truncates.
         let nodes = vec![BlockNode {
             id: NodeId::new(1),
-            labels: vec!["A".to_string()],
+            labels: vec!["A".into()],
             properties: vec![],
         }];
         let mut data = write_blocks(&nodes, &[], &[], 0).unwrap();
@@ -1640,7 +1979,7 @@ mod tests {
             id: EdgeId::new(1),
             src: NodeId::new(1),
             dst: NodeId::new(2),
-            edge_type: "E".to_string(),
+            edge_type: "E".into(),
             properties: vec![],
         }];
         let mut data = write_blocks(&[], &edges, &[], 0).unwrap();
@@ -1662,42 +2001,42 @@ mod tests {
             labels: vec![],
             properties: vec![
                 (
-                    "bool_val".to_string(),
-                    vec![(EpochId::new(0), Value::Bool(true))],
+                    "bool_val".into(),
+                    smallvec::smallvec![(EpochId::new(0), Value::Bool(true))],
                 ),
                 (
-                    "float_val".to_string(),
-                    vec![(EpochId::new(0), Value::Float64(1.234))],
+                    "float_val".into(),
+                    smallvec::smallvec![(EpochId::new(0), Value::Float64(1.234))],
                 ),
                 (
-                    "bytes_val".to_string(),
-                    vec![(EpochId::new(0), Value::Bytes(vec![0xDE, 0xAD].into()))],
+                    "bytes_val".into(),
+                    smallvec::smallvec![(EpochId::new(0), Value::Bytes(vec![0xDE, 0xAD].into()))],
                 ),
-                ("null_val".to_string(), vec![(EpochId::new(0), Value::Null)]),
+                ("null_val".into(), smallvec::smallvec![(EpochId::new(0), Value::Null)]),
                 (
-                    "date_val".to_string(),
-                    vec![(
+                    "date_val".into(),
+                    smallvec::smallvec![(
                         EpochId::new(0),
                         Value::Date(Date::from_ymd(2026, 4, 11).unwrap()),
                     )],
                 ),
                 (
-                    "time_val".to_string(),
-                    vec![(
+                    "time_val".into(),
+                    smallvec::smallvec![(
                         EpochId::new(0),
                         Value::Time(Time::from_hms(14, 30, 0).unwrap()),
                     )],
                 ),
                 (
-                    "list_val".to_string(),
-                    vec![(
+                    "list_val".into(),
+                    smallvec::smallvec![(
                         EpochId::new(0),
                         Value::List(vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)].into()),
                     )],
                 ),
                 (
-                    "vector_val".to_string(),
-                    vec![(EpochId::new(0), Value::Vector(vec![0.1, 0.2, 0.3].into()))],
+                    "vector_val".into(),
+                    smallvec::smallvec![(EpochId::new(0), Value::Vector(vec![0.1, 0.2, 0.3].into()))],
                 ),
             ],
         }];
@@ -1715,7 +2054,7 @@ mod tests {
 
             // Verify each type decoded correctly
             let find_prop =
-                |name: &str| -> &Value { &props.iter().find(|(k, _)| k == name).unwrap().1[0].1 };
+                |name: &str| -> &Value { &props.iter().find(|(k, _)| k.as_str() == name).unwrap().1[0].1 };
             assert_eq!(*find_prop("bool_val"), Value::Bool(true));
             assert_eq!(*find_prop("float_val"), Value::Float64(1.234));
             assert_eq!(*find_prop("null_val"), Value::Null);
@@ -1739,7 +2078,7 @@ mod tests {
             },
             BlockNode {
                 id: NodeId::new(2),
-                labels: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+                labels: vec!["A".into(), "B".into(), "C".into()],
                 properties: vec![],
             },
         ];

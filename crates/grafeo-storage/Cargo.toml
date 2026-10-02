@@ -47,6 +47,11 @@ name = "wal_bench"
 harness = false
 required-features = ["wal"]
 
+[[bench]]
+name = "wal_write_amplification"
+harness = false
+required-features = ["wal"]
+
 [features]
 default = ["wal"]
 wal = ["memmap2", "tokio", "crossbeam"]

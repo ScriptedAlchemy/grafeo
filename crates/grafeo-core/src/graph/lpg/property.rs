@@ -178,29 +178,30 @@ impl<Id: EntityId> PropertyStorage<Id> {
         self.default_compression = mode;
     }
 
-    /// Sets a property value for an entity.
+    /// Sets a property value for an entity and reports whether it was newly inserted.
     #[cfg(not(feature = "temporal"))]
-    pub fn set(&self, id: Id, key: PropertyKey, value: Value) {
+    pub fn set(&self, id: Id, key: PropertyKey, value: Value) -> bool {
         let mut columns = self.columns.write();
         let mode = self.default_compression;
         columns
             .entry(key)
             .or_insert_with(|| PropertyColumn::with_compression(mode))
-            .set(id, value);
+            .set(id, value)
     }
 
-    /// Sets a property value for an entity at a specific epoch.
+    /// Sets a property value for an entity at a specific epoch and reports whether
+    /// the prior latest value was absent or a tombstone.
     ///
     /// For non-transactional writes, pass the current epoch.
     /// For transactional writes, pass `EpochId::PENDING`.
     #[cfg(feature = "temporal")]
-    pub fn set(&self, id: Id, key: PropertyKey, value: Value, epoch: EpochId) {
+    pub fn set(&self, id: Id, key: PropertyKey, value: Value, epoch: EpochId) -> bool {
         let mut columns = self.columns.write();
         let mode = self.default_compression;
         columns
             .entry(key)
             .or_insert_with(|| PropertyColumn::with_compression(mode))
-            .set(id, value, epoch);
+            .set(id, value, epoch)
     }
 
     /// Enables compression for a specific column.
@@ -311,6 +312,19 @@ impl<Id: EntityId> PropertyStorage<Id> {
             }
         }
         result
+    }
+
+    /// Visits every current property of an entity without building a map.
+    ///
+    /// The visit order is the column map's iteration order; callers that
+    /// need a deterministic order must sort what they collect.
+    pub fn for_each(&self, id: Id, mut visit: impl FnMut(&PropertyKey, Value)) {
+        let columns = self.columns.read();
+        for (key, col) in columns.iter() {
+            if let Some(value) = col.get(id) {
+                visit(key, value);
+            }
+        }
     }
 
     /// Gets property values for multiple entities in a single lock acquisition.
@@ -953,11 +967,11 @@ impl<Id: EntityId> PropertyColumn<Id> {
         self.compression_mode
     }
 
-    /// Sets a value for an entity.
-    pub fn set(&mut self, id: Id, value: Value) {
+    /// Sets a value for an entity and reports whether it was newly inserted.
+    pub fn set(&mut self, id: Id, value: Value) -> bool {
         // Update zone map incrementally
         self.update_zone_map_on_insert(&value);
-        self.values.insert(id, value);
+        let inserted = self.values.insert(id, value).is_none();
 
         // Check if we should compress (in Auto mode)
         if self.compression_mode == CompressionMode::Auto {
@@ -969,6 +983,7 @@ impl<Id: EntityId> PropertyColumn<Id> {
                 self.compress();
             }
         }
+        inserted
     }
 
     /// Updates zone map when inserting a value.
@@ -1628,13 +1643,17 @@ impl<Id: EntityId> PropertyColumn<Id> {
         self.compression_mode
     }
 
-    /// Sets a value for an entity, appending to its version log.
+    /// Sets a value for an entity, appending to its version log, and reports
+    /// whether the prior latest value was absent or a tombstone.
     ///
     /// For non-transactional writes, pass the current epoch.
     /// For transactional writes, pass `EpochId::PENDING`.
-    pub fn set(&mut self, id: Id, value: Value, epoch: EpochId) {
+    pub fn set(&mut self, id: Id, value: Value, epoch: EpochId) -> bool {
         self.update_zone_map_on_insert(&value);
-        self.values.entry(id).or_default().append(epoch, value);
+        let versions = self.values.entry(id).or_default();
+        let inserted = versions.latest().is_none_or(Value::is_null);
+        versions.append(epoch, value);
+        inserted
     }
 
     /// Updates zone map when inserting a value.
@@ -2441,6 +2460,17 @@ mod tests {
                 .block_zone_maps_for(&PropertyKey::new("missing"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn property_set_reports_new_values_without_rescanning_columns() {
+        let storage: PropertyStorage<NodeId> = PropertyStorage::new();
+        let target = NodeId::new(7);
+
+        assert!(storage.set(target, PropertyKey::new("name"), Value::from("Alix")));
+        assert!(!storage.set(target, PropertyKey::new("name"), Value::from("A. Example")));
+        assert!(storage.set(target, PropertyKey::new("age"), Value::Int64(30)));
+        assert_eq!(storage.get_all(target).len(), 2);
     }
 
     #[test]

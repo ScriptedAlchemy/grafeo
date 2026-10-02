@@ -32,6 +32,12 @@ impl PropertyKey {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Returns the interned string, cloneable without copying the bytes.
+    #[must_use]
+    pub fn as_arc(&self) -> &ArcStr {
+        &self.0
+    }
 }
 
 impl fmt::Debug for PropertyKey {

@@ -1,7 +1,10 @@
 //! Section directory: the index of sections within a `.grafeo` container.
 //!
-//! The directory occupies a single 4 KiB page at offset 0x3000 in the file.
-//! It contains a count followed by fixed-size 32-byte entries, one per section.
+//! The directory occupies a single 4 KiB page. Stores written before
+//! out-of-place checkpoints keep it at the fixed [`DIRECTORY_OFFSET`]
+//! (0x3000); current checkpoints write it inside each generation's own
+//! region and record its offset in the active `DbHeader`. It contains a
+//! count followed by fixed-size 32-byte entries, one per section.
 
 use grafeo_common::storage::section::{SectionDirectoryEntry, SectionFlags, SectionType};
 use grafeo_common::utils::error::{Error, Result};
@@ -13,10 +16,13 @@ pub const MAX_SECTIONS: usize = 127;
 /// Size of the section directory page in bytes.
 pub const DIRECTORY_PAGE_SIZE: usize = 4096;
 
-/// Byte offset of the section directory within the `.grafeo` file.
+/// Legacy fixed byte offset of the section directory. Stores whose active
+/// `DbHeader` predates out-of-place checkpoints (directory offset 0) read
+/// their directory here.
 pub const DIRECTORY_OFFSET: u64 = 3 * 4096; // After FileHeader + 2 DbHeaders
 
-/// Byte offset where section data begins (after all headers + directory).
+/// Lowest byte offset where generation data may be placed (after all
+/// headers and the legacy directory slot).
 pub const SECTION_DATA_OFFSET: u64 = 4 * 4096;
 
 /// In-memory representation of the section directory.

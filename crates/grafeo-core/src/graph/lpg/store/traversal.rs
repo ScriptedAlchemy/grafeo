@@ -158,15 +158,15 @@ impl LpgStore {
         node_ids.into_iter().filter_map(move |id| self.get_node(id))
     }
 
-    /// Returns an iterator over all edges in the database.
+    /// Returns the IDs of all edges visible at the current epoch.
     ///
-    /// This creates a snapshot of all visible edges at the current epoch.
-    /// Useful for dump/export operations.
+    /// Snapshot listing without materializing any `Edge` (no type-name or
+    /// property copies); used by the checkpoint writer.
+    #[must_use]
     #[cfg(not(feature = "tiered-storage"))]
-    pub fn all_edges(&self) -> impl Iterator<Item = Edge> + '_ {
+    pub fn visible_edge_ids(&self) -> Vec<EdgeId> {
         let epoch = self.current_epoch();
-        let edge_ids: Vec<EdgeId> = self
-            .edges
+        self.edges
             .read()
             .iter()
             .filter_map(|(id, chain)| {
@@ -174,18 +174,17 @@ impl LpgStore {
                     .visible_at(epoch)
                     .and_then(|r| if !r.is_deleted() { Some(*id) } else { None })
             })
-            .collect();
-
-        edge_ids.into_iter().filter_map(move |id| self.get_edge(id))
+            .collect()
     }
 
-    /// Returns an iterator over all edges in the database.
+    /// Returns the IDs of all edges visible at the current epoch.
     /// (Tiered storage version)
+    #[must_use]
     #[cfg(feature = "tiered-storage")]
-    pub fn all_edges(&self) -> impl Iterator<Item = Edge> + '_ {
+    pub fn visible_edge_ids(&self) -> Vec<EdgeId> {
         let epoch = self.current_epoch();
         let versions = self.edge_versions.read();
-        let edge_ids: Vec<EdgeId> = versions
+        versions
             .iter()
             .filter_map(|(id, index)| {
                 index.visible_at(epoch).and_then(|vref| {
@@ -193,9 +192,17 @@ impl LpgStore {
                         .and_then(|r| if !r.is_deleted() { Some(*id) } else { None })
                 })
             })
-            .collect();
+            .collect()
+    }
 
-        edge_ids.into_iter().filter_map(move |id| self.get_edge(id))
+    /// Returns an iterator over all edges in the database.
+    ///
+    /// This creates a snapshot of all visible edges at the current epoch.
+    /// Useful for dump/export operations.
+    pub fn all_edges(&self) -> impl Iterator<Item = Edge> + '_ {
+        self.visible_edge_ids()
+            .into_iter()
+            .filter_map(move |id| self.get_edge(id))
     }
 
     /// Returns an iterator over nodes with a specific label.

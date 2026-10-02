@@ -112,3 +112,71 @@ fn post_compact_node_property_survives_reread() {
         "overlay-only node property should be readable"
     );
 }
+
+/// Attaching a new edge to a base node promotes that node into the
+/// overlay. Promotion copies the node and its properties but not its
+/// adjacency, so the base remains the only record of the edges written
+/// before `compact()` — they must still be traversable.
+#[test]
+fn pre_compact_edges_survive_their_source_being_promoted() {
+    let mut db = GrafeoDB::new_in_memory();
+    let a = db.create_node(&["P"]);
+    let b = db.create_node(&["P"]);
+    db.create_edge(a, b, "KNOWS");
+    db.compact().expect("compact");
+
+    // Promotes `a` into the overlay.
+    db.create_edge(a, b, "LIKES");
+
+    assert_eq!(int_scalar(&db, "MATCH ()-[r]->() RETURN count(r)"), 2);
+    assert_eq!(int_scalar(&db, "MATCH ()-[r:KNOWS]->() RETURN count(r)"), 1);
+    assert_eq!(int_scalar(&db, "MATCH ()-[r:LIKES]->() RETURN count(r)"), 1);
+}
+
+/// The counterpart: an edge deleted after its promotion must not be
+/// resurrected by the base copy that promotion left behind.
+#[test]
+fn a_promoted_edge_stays_deleted() {
+    let mut db = GrafeoDB::new_in_memory();
+    let a = db.create_node(&["P"]);
+    let b = db.create_node(&["P"]);
+    db.create_edge(a, b, "KNOWS");
+    db.compact().expect("compact");
+
+    // Writing a property promotes the edge into the overlay; deleting it
+    // afterwards has to tombstone the base row as well.
+    let s = db.session();
+    s.execute("MATCH ()-[r:KNOWS]->() SET r.since = 2020")
+        .unwrap();
+    s.execute("MATCH ()-[r:KNOWS]->() DELETE r").unwrap();
+    drop(s);
+
+    assert_eq!(int_scalar(&db, "MATCH ()-[r]->() RETURN count(r)"), 0);
+}
+
+/// The node counterpart of `a_promoted_edge_stays_deleted`: writing a
+/// property promotes a base node into the overlay, and deleting it
+/// afterwards must not leave the base copy visible in `node_ids`.
+#[test]
+fn a_promoted_node_stays_deleted() {
+    let mut db = GrafeoDB::new_in_memory();
+    db.create_node(&["P"]);
+    db.create_node(&["P"]);
+    db.compact().expect("compact");
+
+    let s = db.session();
+    s.execute("MATCH (n:P) WHERE id(n) = 0 SET n.tag = 1")
+        .unwrap();
+    s.execute("MATCH (n:P) WHERE id(n) = 0 DELETE n").unwrap();
+    drop(s);
+
+    assert_eq!(int_scalar(&db, "MATCH (n:P) RETURN count(n)"), 1);
+    let store = db.graph_store();
+    assert_eq!(
+        store.node_ids().len(),
+        1,
+        "the promoted node's base copy is still listed: {:?}",
+        store.node_ids()
+    );
+    assert_eq!(store.node_count(), 1);
+}

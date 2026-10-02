@@ -2368,6 +2368,7 @@ mod gql_conformance_edge_cases {
     }
 }
 
+#[cfg(feature = "sql-pgq")]
 mod sql_pgq_correctness {
     use super::*;
 

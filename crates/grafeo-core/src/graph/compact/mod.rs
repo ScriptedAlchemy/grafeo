@@ -14,6 +14,7 @@ pub mod csr;
 /// Container section serialization for the layered overlay deletion log.
 #[cfg(feature = "lpg")]
 pub mod deletions_section;
+pub(crate) mod dict_value;
 mod graph_store_impl;
 /// Node/edge ID encoding and decoding helpers.
 pub mod id;
@@ -38,7 +39,7 @@ pub use builder::{CompactStoreBuilder, from_graph_store, from_graph_store_preser
 use std::sync::Arc;
 
 use arcstr::ArcStr;
-use grafeo_common::types::{EdgeId, NodeId};
+use grafeo_common::types::{EdgeId, HashableValue, NodeId, PropertyKey};
 use grafeo_common::utils::hash::FxHashMap;
 
 use self::node_table::NodeTable;
@@ -82,7 +83,28 @@ pub struct CompactStore {
     node_offset_to_id: Option<Vec<Vec<NodeId>>>,
     /// Reverse: rel_table_id index -> vec of original `EdgeId` per CSR position.
     edge_offset_to_id: Option<Vec<Vec<EdgeId>>>,
+    /// Highest preserved `NodeId`, cached from `node_id_map` at the point
+    /// the maps are attached. `None` when not ID-preserving or empty.
+    max_node_id: Option<NodeId>,
+    /// Highest preserved `EdgeId`. See [`max_node_id`](Self::max_node_id).
+    max_edge_id: Option<EdgeId>,
+
+    /// Hash indexes over node property values: for each indexed property,
+    /// value to the original `NodeId`s that carry it.
+    ///
+    /// Purely an accelerator for
+    /// [`find_nodes_by_property`](crate::graph::traits::GraphStoreSearch::find_nodes_by_property),
+    /// which otherwise zone-map-prunes and then scans the surviving
+    /// columns — linear in the table, and orders of magnitude slower than
+    /// the `LpgStore` property index it replaces after a compaction.
+    /// Derived entirely from the columns, so it is never serialized; the
+    /// engine re-declares the indexed properties after a reload.
+    property_value_indexes: parking_lot::RwLock<FxHashMap<PropertyKey, Arc<PropertyValueIndex>>>,
 }
+
+/// One property's value-to-nodes map. See
+/// [`CompactStore::enable_property_indexes`].
+type PropertyValueIndex = FxHashMap<HashableValue, Vec<NodeId>>;
 
 impl std::fmt::Debug for CompactStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -149,6 +171,9 @@ impl CompactStore {
             edge_id_map: None,
             node_offset_to_id: None,
             edge_offset_to_id: None,
+            max_node_id: None,
+            max_edge_id: None,
+            property_value_indexes: parking_lot::RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -269,7 +294,7 @@ impl CompactStore {
             .map(|rt| rt.memory_bytes())
             .sum();
         let id_map_bytes = self.id_map_memory_bytes();
-        node_bytes + rel_bytes + id_map_bytes
+        node_bytes + rel_bytes + id_map_bytes + self.property_index_memory_bytes()
     }
 
     // ── ID-preserving accessors ────────────────────────────────────
@@ -289,10 +314,134 @@ impl CompactStore {
         node_offset_to_id: Vec<Vec<NodeId>>,
         edge_offset_to_id: Vec<Vec<EdgeId>>,
     ) {
+        // Cache the high-water marks while the maps are in hand: the
+        // layered overlay reads them on every open to seed its allocator,
+        // and re-scanning a million-entry map there is pure waste.
+        self.max_node_id = node_id_map.keys().copied().max();
+        self.max_edge_id = edge_id_map.keys().copied().max();
         self.node_id_map = Some(node_id_map);
         self.edge_id_map = Some(edge_id_map);
         self.node_offset_to_id = Some(node_offset_to_id);
         self.edge_offset_to_id = Some(edge_offset_to_id);
+    }
+
+    /// Returns the highest `NodeId` the base owns, or `None` when it holds
+    /// no nodes.
+    ///
+    /// The layered overlay seeds its ID allocator from this so IDs minted
+    /// after a reopen cannot collide with — and thereby shadow or
+    /// tombstone — a base row.
+    #[must_use]
+    pub fn max_node_id(&self) -> Option<NodeId> {
+        if self.preserves_ids() {
+            return self.max_node_id;
+        }
+        // Synthetic IDs: the largest one a table owns is its last row.
+        self.node_tables_by_id
+            .iter()
+            .enumerate()
+            .filter(|(_, nt)| !nt.is_empty())
+            .filter_map(|(tid, nt)| {
+                let table_id = u16::try_from(tid).ok()?;
+                Some(id::encode_node_id(table_id, nt.len() as u64 - 1))
+            })
+            .max()
+    }
+
+    /// Declares which node properties should be served from a hash index,
+    /// building each one now.
+    ///
+    /// Mirrors [`LpgStore::create_property_index`](crate::graph::lpg::LpgStore::create_property_index):
+    /// the engine calls this with the source store's indexed properties
+    /// after a compaction, and again after a reload, so an indexed lookup
+    /// stays O(1) once the rows move into the columnar base instead of
+    /// falling back to a column scan.
+    ///
+    /// Re-declaring a property rebuilds it. Properties no table carries
+    /// are ignored.
+    pub fn enable_property_indexes<I>(&self, keys: I)
+    where
+        I: IntoIterator<Item = PropertyKey>,
+    {
+        for key in keys {
+            let Some(index) = self.build_property_value_index(&key) else {
+                continue;
+            };
+            self.property_value_indexes
+                .write()
+                .insert(key, Arc::new(index));
+        }
+    }
+
+    /// Drops the hash index for `key`, returning whether one existed.
+    ///
+    /// The inverse of [`Self::enable_property_indexes`]: the engine calls
+    /// this when an index is dropped after a compaction, so
+    /// `has_property_index` stops reporting the property as indexed and
+    /// lookups fall back to the column scan.
+    pub fn disable_property_index(&self, key: &PropertyKey) -> bool {
+        self.property_value_indexes.write().remove(key).is_some()
+    }
+
+    /// Returns the property names currently served from a hash index.
+    #[must_use]
+    pub fn indexed_property_keys(&self) -> Vec<PropertyKey> {
+        self.property_value_indexes.read().keys().cloned().collect()
+    }
+
+    /// Returns the hash index for `key`, if one was declared.
+    pub(crate) fn property_value_index(
+        &self,
+        key: &PropertyKey,
+    ) -> Option<Arc<PropertyValueIndex>> {
+        self.property_value_indexes.read().get(key).cloned()
+    }
+
+    /// Groups every row that carries `key` by its value.
+    ///
+    /// Returns `None` when no table has a column for the property, so a
+    /// stale index name costs nothing.
+    fn build_property_value_index(&self, key: &PropertyKey) -> Option<PropertyValueIndex> {
+        let mut any_column = false;
+        let mut index: PropertyValueIndex = FxHashMap::default();
+
+        for nt in &self.node_tables_by_id {
+            let Some(col) = nt.column(key) else { continue };
+            any_column = true;
+            let table_id = nt.table_id();
+            for offset in 0..col.len() {
+                let Some(value) = col.get(offset) else {
+                    continue;
+                };
+                let node_id = self.to_original_node_id(id::encode_node_id(table_id, offset as u64));
+                index
+                    .entry(HashableValue::new(value))
+                    .or_default()
+                    .push(node_id);
+            }
+        }
+
+        any_column.then_some(index)
+    }
+
+    /// Returns the highest `EdgeId` the base owns, or `None` when it holds
+    /// no edges.
+    ///
+    /// See [`max_node_id`](Self::max_node_id).
+    #[must_use]
+    pub fn max_edge_id(&self) -> Option<EdgeId> {
+        if self.preserves_ids() {
+            return self.max_edge_id;
+        }
+        self.rel_tables_by_id
+            .iter()
+            .enumerate()
+            .filter(|(_, rt)| rt.num_edges() > 0)
+            .filter_map(|(rid, rt)| {
+                let rel_table_id = u16::try_from(rid).ok()?;
+                Some(id::encode_edge_id(rel_table_id, rt.num_edges() as u64 - 1))
+            })
+            .max()
     }
 
     /// Resolves an input `NodeId` to (table_id, offset).
@@ -350,6 +499,21 @@ impl CompactStore {
     }
 
     /// Approximate heap cost of the ID maps.
+    /// Rough heap cost of the property hash indexes: each entry is a
+    /// `HashableValue` key plus one `NodeId` per matching row.
+    fn property_index_memory_bytes(&self) -> usize {
+        self.property_value_indexes
+            .read()
+            .values()
+            .map(|index| {
+                index
+                    .iter()
+                    .map(|(_, ids)| 40 + ids.len() * 8)
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
     fn id_map_memory_bytes(&self) -> usize {
         // ~24 bytes per entry (key + value) in FxHashMap, plus Vec overhead.
         let node_map = self.node_id_map.as_ref().map_or(0, |m| m.len() * 24);

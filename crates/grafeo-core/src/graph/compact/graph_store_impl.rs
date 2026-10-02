@@ -269,8 +269,23 @@ impl GraphStore for CompactStore {
             .cloned()
     }
 
+    fn has_property_index(&self, property: &str) -> bool {
+        self.property_value_index(&PropertyKey::new(property))
+            .is_some()
+    }
+
     fn find_nodes_by_property(&self, property: &str, value: &Value) -> Vec<NodeId> {
         let key = PropertyKey::new(property);
+
+        // Indexed property: one hash lookup instead of pruning zone maps
+        // and scanning every surviving column.
+        if let Some(index) = self.property_value_index(&key) {
+            return index
+                .get(&grafeo_common::types::HashableValue::new(value.clone()))
+                .cloned()
+                .unwrap_or_default();
+        }
+
         let mut results = Vec::new();
         for nt in &self.node_tables_by_id {
             if let Some(zm) = nt.zone_map(&key)

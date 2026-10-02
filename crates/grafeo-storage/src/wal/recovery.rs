@@ -103,8 +103,33 @@ impl WalRecovery {
     ///
     /// Returns an error if recovery fails.
     pub fn recover_as<R: WalEntry>(&self) -> Result<Vec<R>> {
+        let mut committed = Vec::new();
+        self.recover_committed_as::<R, _>(|records| {
+            committed.extend_from_slice(records);
+            Ok(())
+        })?;
+        Ok(committed)
+    }
+
+    /// Streams committed records in transaction-sized batches.
+    ///
+    /// The callback is invoked once for each committed transaction and once
+    /// for each standalone checkpoint or metadata record. Records from an
+    /// uncommitted or aborted transaction are never exposed. This lets a
+    /// database restore apply arbitrarily long WAL histories while retaining
+    /// only the largest individual transaction, rather than every committed
+    /// record in the history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if recovery or the callback fails.
+    pub fn recover_committed_as<R, F>(&self, consume: F) -> Result<()>
+    where
+        R: WalEntry,
+        F: FnMut(&[R]) -> Result<()>,
+    {
         let checkpoint = self.read_checkpoint_metadata()?;
-        self.recover_internal_as::<R>(checkpoint)
+        self.recover_internal_as::<R, F>(checkpoint, consume)
     }
 
     /// Recovers committed records up to and including the given epoch.
@@ -153,12 +178,16 @@ impl WalRecovery {
         Ok(committed)
     }
 
-    fn recover_internal_as<R: WalEntry>(
+    fn recover_internal_as<R, F>(
         &self,
         checkpoint: Option<CheckpointMetadata>,
-    ) -> Result<Vec<R>> {
+        mut consume: F,
+    ) -> Result<()>
+    where
+        R: WalEntry,
+        F: FnMut(&[R]) -> Result<()>,
+    {
         let mut current_tx_records = Vec::new();
-        let mut committed_records = Vec::new();
 
         // Get all log files in order
         let log_files = self.get_log_files()?;
@@ -204,14 +233,15 @@ impl WalRecovery {
                 match self.read_record_as::<R>(&mut reader) {
                     Ok(Some(record)) => {
                         if record.is_commit() {
-                            committed_records.append(&mut current_tx_records);
-                            committed_records.push(record);
+                            current_tx_records.push(record);
+                            consume(&current_tx_records)?;
+                            current_tx_records.clear();
                         } else if record.is_abort() {
                             current_tx_records.clear();
                         } else if record.is_checkpoint() || record.is_metadata() {
                             // Checkpoint and metadata records (e.g. EpochAdvance)
                             // are not part of any transaction: always include them.
-                            committed_records.push(record);
+                            consume(std::slice::from_ref(&record))?;
                         } else {
                             current_tx_records.push(record);
                         }
@@ -229,7 +259,7 @@ impl WalRecovery {
 
         // Uncommitted records in current_tx_records are discarded
 
-        Ok(committed_records)
+        Ok(())
     }
 
     /// Extracts the sequence number from a WAL log file path.
@@ -435,6 +465,48 @@ mod tests {
 
         // Should have 10 CreateNode + 2 TransactionCommit
         assert_eq!(records.len(), 12);
+    }
+
+    #[test]
+    fn streams_one_committed_transaction_at_a_time() {
+        let dir = tempdir().unwrap();
+        let wal = WalManager::open(dir.path()).unwrap();
+
+        for id in 0..128 {
+            wal.log(&WalRecord::CreateNode {
+                id: NodeId::new(id),
+                labels: vec!["First".to_string()],
+            })
+            .unwrap();
+        }
+        wal.log(&WalRecord::TransactionCommit {
+            transaction_id: TransactionId::new(1),
+        })
+        .unwrap();
+        for id in 128..192 {
+            wal.log(&WalRecord::CreateNode {
+                id: NodeId::new(id),
+                labels: vec!["Second".to_string()],
+            })
+            .unwrap();
+        }
+        wal.log(&WalRecord::TransactionCommit {
+            transaction_id: TransactionId::new(2),
+        })
+        .unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+
+        let recovery = WalRecovery::new(dir.path());
+        let mut batch_lengths = Vec::new();
+        recovery
+            .recover_committed_as::<WalRecord, _>(|records| {
+                batch_lengths.push(records.len());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(batch_lengths, vec![129, 65]);
     }
 
     #[test]

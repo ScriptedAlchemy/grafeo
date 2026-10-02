@@ -41,6 +41,12 @@ use crate::transaction::TransactionManager;
 /// Auto-created by `CREATE SCHEMA` and auto-dropped by `DROP SCHEMA`.
 const SCHEMA_DEFAULT_GRAPH: &str = "__default__";
 
+/// Sentinel stored in `transaction_start_*` until the first delta read.
+///
+/// `node_count()` / `edge_count()` cannot produce this value in-process
+/// (a graph cannot hold `usize::MAX` visible entities).
+const TRANSACTION_START_COUNT_UNSET: usize = usize::MAX;
+
 /// Parses a DDL default-value literal string into a [`Value`].
 ///
 /// Handles string literals (single- or double-quoted), integers, floats,
@@ -161,8 +167,15 @@ pub struct Session {
     /// GC every N commits (0 = disabled).
     gc_interval: usize,
     /// Node count at the start of the current transaction (for PreparedCommit stats).
+    ///
+    /// Snapshotted lazily on first `node_count_delta` read, not at `BEGIN`.
+    /// `node_count()` walks every version chain (O(store)); the only consumer
+    /// is `prepare_commit`, and PENDING writes are invisible to that walk
+    /// anyway. `TRANSACTION_START_COUNT_UNSET` means not yet snapshotted.
     transaction_start_node_count: AtomicUsize,
     /// Edge count at the start of the current transaction (for PreparedCommit stats).
+    ///
+    /// Same laziness contract as `transaction_start_node_count`.
     transaction_start_edge_count: AtomicUsize,
     /// WAL for logging schema changes.
     #[cfg(feature = "wal")]
@@ -3918,11 +3931,13 @@ impl Session {
             return Ok(());
         }
 
-        let active = self.active_lpg_store();
+        // Do not walk the store here. `node_count()` / `edge_count()` visit
+        // every version chain; only `prepare_commit` consumes the snapshot,
+        // and PENDING writes are invisible to those counts anyway.
         self.transaction_start_node_count
-            .store(active.node_count(), Ordering::Relaxed);
+            .store(TRANSACTION_START_COUNT_UNSET, Ordering::Relaxed);
         self.transaction_start_edge_count
-            .store(active.edge_count(), Ordering::Relaxed);
+            .store(TRANSACTION_START_COUNT_UNSET, Ordering::Relaxed);
         let transaction_id = if let Some(level) = isolation_level {
             self.transaction_manager.begin_with_isolation(level)
         } else {
@@ -4439,24 +4454,54 @@ impl Session {
         &self.transaction_manager
     }
 
+    /// Snapshots start counts on first use.
+    ///
+    /// PENDING writes are invisible to `node_count` / `edge_count`, so a
+    /// snapshot taken here matches one taken at `BEGIN` for the transaction's
+    /// own write set. Concurrent committed work between `BEGIN` and first
+    /// read can still change the snapshot, matching the fact that those
+    /// counts never measured this transaction's pending writes.
+    #[cfg(feature = "lpg")]
+    fn snapshot_transaction_start_count(
+        slot: &AtomicUsize,
+        compute: impl FnOnce() -> usize,
+    ) -> usize {
+        let stored = slot.load(Ordering::Relaxed);
+        if stored != TRANSACTION_START_COUNT_UNSET {
+            return stored;
+        }
+        let count = compute();
+        slot.store(count, Ordering::Relaxed);
+        count
+    }
+
     /// Returns the store's current node count and the count at transaction start.
+    ///
+    /// The start count is computed on first call (see field docs), not at
+    /// `BEGIN`, so ordinary begin/commit avoids two O(store) walks.
     #[cfg(feature = "lpg")]
     #[must_use]
     pub(crate) fn node_count_delta(&self) -> (usize, usize) {
-        (
-            self.transaction_start_node_count.load(Ordering::Relaxed),
-            self.active_lpg_store().node_count(),
-        )
+        let active = self.active_lpg_store();
+        let start =
+            Self::snapshot_transaction_start_count(&self.transaction_start_node_count, || {
+                active.node_count()
+            });
+        (start, active.node_count())
     }
 
     /// Returns the store's current edge count and the count at transaction start.
+    ///
+    /// Same laziness contract as [`Self::node_count_delta`].
     #[cfg(feature = "lpg")]
     #[must_use]
     pub(crate) fn edge_count_delta(&self) -> (usize, usize) {
-        (
-            self.transaction_start_edge_count.load(Ordering::Relaxed),
-            self.active_lpg_store().edge_count(),
-        )
+        let active = self.active_lpg_store();
+        let start =
+            Self::snapshot_transaction_start_count(&self.transaction_start_edge_count, || {
+                active.edge_count()
+            });
+        (start, active.edge_count())
     }
 
     /// Prepares the current transaction for a two-phase commit.
@@ -5467,6 +5512,66 @@ mod tests {
 
         session.commit().unwrap();
         assert!(!session.in_transaction());
+    }
+
+    /// `node_count` / `edge_count` walk every version chain. Begin+commit of a
+    /// single write must not call them: commit already settles only the write
+    /// set, and start-count snapshots belong on the prepare_commit path.
+    #[cfg(all(feature = "lpg", debug_assertions))]
+    #[test]
+    fn begin_and_commit_of_one_write_do_not_scan_store_counts() {
+        const SEEDED: usize = 2_048;
+        let db = GrafeoDB::new_in_memory();
+        let mut seeder = db.session();
+        seeder.begin_transaction().unwrap();
+        for _ in 0..SEEDED {
+            seeder.create_node(&["Seed"]);
+        }
+        seeder.commit().unwrap();
+
+        grafeo_core::testing::count_probe::reset();
+        let mut session = db.session();
+        session.begin_transaction().unwrap();
+        session.create_node(&["Probe"]);
+        session.commit().unwrap();
+
+        let scans = grafeo_core::testing::count_probe::node_count_calls()
+            + grafeo_core::testing::count_probe::edge_count_calls();
+        assert_eq!(
+            scans, 0,
+            "begin+commit must not call node_count/edge_count (O(store) walks); observed {scans} calls after seeding {SEEDED} nodes"
+        );
+    }
+
+    /// prepare_commit's `node_count_delta` still reports the committed snapshot.
+    /// PENDING writes are invisible to `node_count`, so a committed-then-mutated
+    /// transaction yields `(N, N)` and `nodes_written == 0`.
+    #[cfg(feature = "lpg")]
+    #[test]
+    fn node_count_delta_preserves_committed_snapshot_under_pending_writes() {
+        const COMMITTED: usize = 8;
+        let db = GrafeoDB::new_in_memory();
+        let mut session = db.session();
+        session.begin_transaction().unwrap();
+        for _ in 0..COMMITTED {
+            session.create_node(&["Seed"]);
+        }
+        session.commit().unwrap();
+
+        session.begin_transaction().unwrap();
+        session.create_node(&["Pending"]);
+        let (start_nodes, current_nodes) = session.node_count_delta();
+        assert_eq!(
+            (start_nodes, current_nodes),
+            (COMMITTED, COMMITTED),
+            "PENDING inserts must not change the prepare_commit count snapshot"
+        );
+
+        let prepared = session.prepare_commit().unwrap();
+        assert_eq!(prepared.info().nodes_written, 0);
+        assert_eq!(prepared.info().edges_written, 0);
+        prepared.commit().unwrap();
+        assert_eq!(db.node_count(), COMMITTED + 1);
     }
 
     #[test]

@@ -333,6 +333,28 @@ impl DictionaryEncoding {
             .and_then(|i| u32::try_from(i).ok())
     }
 
+    /// Rewrites individual dictionary entries in place.
+    ///
+    /// `f` returns `Some(replacement)` for an entry to rewrite and `None`
+    /// to keep it. Codes, entry order, the null bitmap, and every kept
+    /// entry are untouched; when nothing matches, the dictionary is not
+    /// even reallocated. Loaders use this to normalize entries whose
+    /// stored form predates the current encoding.
+    pub(crate) fn remap_entries(&mut self, f: impl Fn(&str) -> Option<String>) {
+        if !self.dictionary.iter().any(|entry| f(entry).is_some()) {
+            return;
+        }
+        let remapped: Vec<Arc<str>> = self
+            .dictionary
+            .iter()
+            .map(|entry| match f(entry) {
+                Some(replacement) => Arc::from(replacement),
+                None => Arc::clone(entry),
+            })
+            .collect();
+        self.dictionary = remapped.into();
+    }
+
     /// Returns the row offsets where the code matches `predicate` and the
     /// row is not null.
     ///
@@ -776,6 +798,41 @@ mod tests {
         let target = dict.encode("x").unwrap();
         let hits = dict.filter_by_code(|c| c == target);
         assert_eq!(hits, vec![0]); // index 2 excluded by null bit
+    }
+
+    #[test]
+    fn test_remap_entries_rewrites_matching_entries_in_place() {
+        let mut b = DictionaryBuilder::new();
+        for s in ["keep", "rewrite-me", "keep", "rewrite-me"] {
+            b.add(s);
+        }
+        let mut dict = b.build();
+        let codes_before = dict.codes();
+
+        dict.remap_entries(|e| (e == "rewrite-me").then(|| "rewritten".to_string()));
+
+        assert_eq!(dict.codes(), codes_before, "codes must not move");
+        assert_eq!(dict.get(0), Some("keep"));
+        assert_eq!(dict.get(1), Some("rewritten"));
+        assert_eq!(dict.get(3), Some("rewritten"));
+        assert_eq!(dict.encode("rewritten"), Some(1));
+        assert_eq!(dict.encode("rewrite-me"), None);
+    }
+
+    #[test]
+    fn test_remap_entries_without_matches_keeps_the_allocation() {
+        let mut b = DictionaryBuilder::new();
+        b.add("a");
+        b.add("b");
+        let mut dict = b.build();
+        let before = Arc::clone(dict.dictionary());
+
+        dict.remap_entries(|_| None);
+
+        assert!(
+            Arc::ptr_eq(&before, dict.dictionary()),
+            "a no-match remap must not reallocate the dictionary"
+        );
     }
 
     #[test]

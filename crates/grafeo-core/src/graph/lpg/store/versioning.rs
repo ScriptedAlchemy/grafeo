@@ -13,6 +13,28 @@ use grafeo_common::mvcc::VersionChain;
 use grafeo_common::mvcc::{ColdVersionRef, HotVersionRef, VersionIndex};
 
 impl LpgStore {
+    pub(super) fn track_node_version(&self, transaction_id: TransactionId, node_id: NodeId) {
+        if transaction_id != TransactionId::SYSTEM {
+            self.pending_version_writes
+                .lock()
+                .entry(transaction_id)
+                .or_default()
+                .nodes
+                .insert(node_id);
+        }
+    }
+
+    pub(super) fn track_edge_version(&self, transaction_id: TransactionId, edge_id: EdgeId) {
+        if transaction_id != TransactionId::SYSTEM {
+            self.pending_version_writes
+                .lock()
+                .entry(transaction_id)
+                .or_default()
+                .edges
+                .insert(edge_id);
+        }
+    }
+
     /// Discards all uncommitted versions created by a transaction.
     ///
     /// This is called during transaction rollback to clean up uncommitted changes.
@@ -21,24 +43,35 @@ impl LpgStore {
     #[doc(hidden)]
     #[cfg(not(feature = "tiered-storage"))]
     pub fn discard_uncommitted_versions(&self, transaction_id: TransactionId) {
+        let writes = self
+            .pending_version_writes
+            .lock()
+            .remove(&transaction_id)
+            .unwrap_or_default();
         // Remove uncommitted node versions
         {
             let mut nodes = self.nodes.write();
-            for chain in nodes.values_mut() {
-                chain.remove_versions_by(transaction_id);
+            for node_id in writes.nodes {
+                if let Some(chain) = nodes.get_mut(&node_id) {
+                    chain.remove_versions_by(transaction_id);
+                    if chain.is_empty() {
+                        nodes.remove(&node_id);
+                    }
+                }
             }
-            // Remove completely empty chains (no versions left)
-            nodes.retain(|_, chain| !chain.is_empty());
         }
 
         // Remove uncommitted edge versions
         {
             let mut edges = self.edges.write();
-            for chain in edges.values_mut() {
-                chain.remove_versions_by(transaction_id);
+            for edge_id in writes.edges {
+                if let Some(chain) = edges.get_mut(&edge_id) {
+                    chain.remove_versions_by(transaction_id);
+                    if chain.is_empty() {
+                        edges.remove(&edge_id);
+                    }
+                }
             }
-            // Remove completely empty chains (no versions left)
-            edges.retain(|_, chain| !chain.is_empty());
         }
 
         // Replay property undo log to restore pre-transaction property values
@@ -92,24 +125,35 @@ impl LpgStore {
     #[doc(hidden)]
     #[cfg(feature = "tiered-storage")]
     pub fn discard_uncommitted_versions(&self, transaction_id: TransactionId) {
+        let writes = self
+            .pending_version_writes
+            .lock()
+            .remove(&transaction_id)
+            .unwrap_or_default();
         // Remove uncommitted node versions
         {
             let mut versions = self.node_versions.write();
-            for index in versions.values_mut() {
-                index.remove_versions_by(transaction_id);
+            for node_id in writes.nodes {
+                if let Some(index) = versions.get_mut(&node_id) {
+                    index.remove_versions_by(transaction_id);
+                    if index.is_empty() {
+                        versions.remove(&node_id);
+                    }
+                }
             }
-            // Remove completely empty indexes (no versions left)
-            versions.retain(|_, index| !index.is_empty());
         }
 
         // Remove uncommitted edge versions
         {
             let mut versions = self.edge_versions.write();
-            for index in versions.values_mut() {
-                index.remove_versions_by(transaction_id);
+            for edge_id in writes.edges {
+                if let Some(index) = versions.get_mut(&edge_id) {
+                    index.remove_versions_by(transaction_id);
+                    if index.is_empty() {
+                        versions.remove(&edge_id);
+                    }
+                }
             }
-            // Remove completely empty indexes (no versions left)
-            versions.retain(|_, index| !index.is_empty());
         }
 
         // Replay property undo log to restore pre-transaction property values
@@ -164,16 +208,25 @@ impl LpgStore {
     #[cfg(not(feature = "tiered-storage"))]
     #[doc(hidden)]
     pub fn finalize_version_epochs(&self, transaction_id: TransactionId, commit_epoch: EpochId) {
+        let writes = self
+            .pending_version_writes
+            .lock()
+            .remove(&transaction_id)
+            .unwrap_or_default();
         {
             let mut nodes = self.nodes.write();
-            for chain in nodes.values_mut() {
-                chain.finalize_epochs(transaction_id, commit_epoch);
+            for node_id in writes.nodes {
+                if let Some(chain) = nodes.get_mut(&node_id) {
+                    chain.finalize_epochs(transaction_id, commit_epoch);
+                }
             }
         }
         {
             let mut edges = self.edges.write();
-            for chain in edges.values_mut() {
-                chain.finalize_epochs(transaction_id, commit_epoch);
+            for edge_id in writes.edges {
+                if let Some(chain) = edges.get_mut(&edge_id) {
+                    chain.finalize_epochs(transaction_id, commit_epoch);
+                }
             }
         }
 
@@ -196,16 +249,25 @@ impl LpgStore {
     #[cfg(feature = "tiered-storage")]
     #[doc(hidden)]
     pub fn finalize_version_epochs(&self, transaction_id: TransactionId, commit_epoch: EpochId) {
+        let writes = self
+            .pending_version_writes
+            .lock()
+            .remove(&transaction_id)
+            .unwrap_or_default();
         {
             let mut versions = self.node_versions.write();
-            for index in versions.values_mut() {
-                index.finalize_epochs(transaction_id, commit_epoch);
+            for node_id in writes.nodes {
+                if let Some(index) = versions.get_mut(&node_id) {
+                    index.finalize_epochs(transaction_id, commit_epoch);
+                }
             }
         }
         {
             let mut versions = self.edge_versions.write();
-            for index in versions.values_mut() {
-                index.finalize_epochs(transaction_id, commit_epoch);
+            for edge_id in writes.edges {
+                if let Some(index) = versions.get_mut(&edge_id) {
+                    index.finalize_epochs(transaction_id, commit_epoch);
+                }
             }
         }
 

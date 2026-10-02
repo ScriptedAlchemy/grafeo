@@ -494,10 +494,15 @@ fn file_grows_and_shrinks_with_data() {
     let large_size = fm.file_size().unwrap();
     assert!(large_size > initial_size, "file should grow with data");
 
-    // Delete most data
+    // Delete most data. Checkpoints are written out-of-place with ping-pong
+    // reclamation: the post-delete generation is appended past the live
+    // (large) one, and only the following checkpoint can drop back to the
+    // bottom of the file and truncate the tail. Two checkpoints therefore
+    // bound the reclamation.
     session
         .execute("MATCH (n:Node) WHERE n.idx > 5 DELETE n")
         .unwrap();
+    db.wal_checkpoint().unwrap();
     db.wal_checkpoint().unwrap();
     let small_size = fm.file_size().unwrap();
     assert!(
@@ -664,14 +669,21 @@ fn corrupt_snapshot_detected_on_open() {
         db.close().unwrap();
     }
 
-    // Corrupt the post-header region at offset 12288 (0x3000). In v1 files
-    // this is the snapshot blob; in v2 files it is the section directory.
-    // Either way, the bytes here are integrity-checked at open and the
-    // corruption must be surfaced rather than masked.
+    // Corrupt the live section-directory page. Checkpoints are written
+    // out-of-place, so the directory lives at the offset the active header
+    // records (falling back to the legacy fixed page for old files); its
+    // bytes are integrity-checked at open and the corruption must be
+    // surfaced rather than masked.
     {
         use std::io::{Seek, SeekFrom, Write};
+        let manager = grafeo_storage::file::GrafeoFileManager::open(&path).unwrap();
+        let mut directory_offset = manager.active_header().directory_offset;
+        if directory_offset == 0 {
+            directory_offset = 12288;
+        }
+        manager.close().unwrap();
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.seek(SeekFrom::Start(12288)).unwrap();
+        file.seek(SeekFrom::Start(directory_offset)).unwrap();
         file.write_all(b"CORRUPTED DATA HERE!!!").unwrap();
     }
 
