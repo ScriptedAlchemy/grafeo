@@ -588,7 +588,8 @@ impl LpgStore {
         }
     }
 
-    /// Deletes a node and all its edges (using latest epoch).
+    /// Deletes a node (using latest epoch). Its edges are not deleted; call
+    /// `delete_node_edges` first for a detach delete.
     pub fn delete_node(&self, id: NodeId) -> bool {
         self.delete_node_at_epoch(id, self.current_epoch())
     }
@@ -630,12 +631,15 @@ impl LpgStore {
             // properties: both read the node's current values.
             #[cfg(feature = "text-index")]
             self.remove_from_all_text_indexes(id);
-            self.remove_node_from_property_indexes(id);
 
             // Remove properties
             drop(nodes); // Release lock before removing properties
             drop(index);
             drop(node_labels);
+            // Drop the node from property indexes while its values are known
+            self.remove_from_all_property_indexes(id);
+            #[cfg(feature = "vector-index")]
+            self.remove_from_all_vector_indexes(id);
             #[cfg(not(feature = "temporal"))]
             self.node_properties.remove_all(id);
             #[cfg(feature = "temporal")]
@@ -690,12 +694,15 @@ impl LpgStore {
             // properties: both read the node's current values.
             #[cfg(feature = "text-index")]
             self.remove_from_all_text_indexes(id);
-            self.remove_node_from_property_indexes(id);
 
             // Remove properties
             drop(versions);
             drop(label_index);
             drop(node_labels);
+            // Drop the node from property indexes while its values are known
+            self.remove_from_all_property_indexes(id);
+            #[cfg(feature = "vector-index")]
+            self.remove_from_all_vector_indexes(id);
             #[cfg(not(feature = "temporal"))]
             self.node_properties.remove_all(id);
             #[cfg(feature = "temporal")]
@@ -792,9 +799,12 @@ impl LpgStore {
             // properties: both read the node's current values.
             #[cfg(feature = "text-index")]
             self.remove_from_all_text_indexes(id);
-            self.remove_node_from_property_indexes(id);
 
             // Remove properties (will be restored on rollback)
+            // Drop the node from property indexes while its values are known
+            self.remove_from_all_property_indexes(id);
+            #[cfg(feature = "vector-index")]
+            self.remove_from_all_vector_indexes(id);
             #[cfg(not(feature = "temporal"))]
             self.node_properties.remove_all(id);
             #[cfg(feature = "temporal")]
@@ -901,9 +911,12 @@ impl LpgStore {
             // properties: both read the node's current values.
             #[cfg(feature = "text-index")]
             self.remove_from_all_text_indexes(id);
-            self.remove_node_from_property_indexes(id);
 
             // Remove properties
+            // Drop the node from property indexes while its values are known
+            self.remove_from_all_property_indexes(id);
+            #[cfg(feature = "vector-index")]
+            self.remove_from_all_vector_indexes(id);
             #[cfg(not(feature = "temporal"))]
             self.node_properties.remove_all(id);
             #[cfg(feature = "temporal")]

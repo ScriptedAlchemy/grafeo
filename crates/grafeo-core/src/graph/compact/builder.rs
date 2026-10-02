@@ -1741,7 +1741,7 @@ impl IncrementalCompactStoreBuilder {
             super::section::SectionStream::begin(sink, super::section::FORMAT_VERSION, true);
         let node_tables = std::mem::take(&mut self.node_tables);
         let mut node_ids = Vec::with_capacity(node_tables.len());
-        stream.write_len(node_tables.len());
+        stream.write_len(node_tables.len())?;
         for table in node_tables {
             let rows = table.node_ids.len();
             let columns = columns_by_key(table.columns);
@@ -1764,7 +1764,7 @@ impl IncrementalCompactStoreBuilder {
 
         let rel_tables = std::mem::take(&mut self.rel_tables);
         let mut edge_entries: Vec<(u64, u16, u64)> = Vec::with_capacity(self.edge_ids.len());
-        stream.write_len(rel_tables.len());
+        stream.write_len(rel_tables.len())?;
         for (index, table) in rel_tables.into_iter().enumerate() {
             let rel_table_id = table_id(index, "relationship").map_err(internal)?;
             let (order, pairs) = csr_order(&table.edges);
@@ -4000,7 +4000,6 @@ mod tests {
     #[test]
     fn string_values_over_64_kib_round_trip_through_the_section() {
         use grafeo_common::storage::Section;
-        use std::sync::Arc;
 
         let key = PropertyKey::new("record");
         let long = Value::from(format!("{}z", "a".repeat(70 * 1024)));
@@ -4043,10 +4042,10 @@ mod tests {
             .push_node(NodeId(1), [label.as_str()], std::iter::empty())
             .unwrap();
         let err = builder.write_section(&mut Vec::new()).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "GRAFEO-V001: Invalid value: a compact section name is limited to 65535 bytes, \
-             got 65536"
+        assert!(
+            err.to_string()
+                .contains("compact store name length: 65536 exceeds the storage format limit"),
+            "{err}"
         );
     }
 
