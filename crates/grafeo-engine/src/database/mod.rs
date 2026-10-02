@@ -74,6 +74,8 @@ use grafeo_storage::wal::{DurabilityMode as WalDurabilityMode, LpgWal, WalConfig
 
 use crate::catalog::Catalog;
 use crate::config::Config;
+#[cfg(all(feature = "compact-store", feature = "lpg"))]
+use crate::memory_usage::CompactBaseMemory;
 use crate::query::cache::QueryCache;
 use crate::session::Session;
 use crate::transaction::TransactionManager;
@@ -979,6 +981,97 @@ impl GrafeoDB {
         })
     }
 
+    /// Writes the rows pushed into `builder` as a complete single-file
+    /// database container at `path`, without a live database.
+    ///
+    /// The file holds exactly what [`close`](Self::close) writes for a
+    /// compacted database — the compact base, an empty LPG overlay, and a
+    /// catalog naming `property_indexes` — produced through the same
+    /// streaming section writer, so [`GrafeoDB::open`] (writable or
+    /// [`Config::read_only`]) reopens it as a layered database whose base is
+    /// the store [`IncrementalCompactStoreBuilder::finish`] would build, with
+    /// those property indexes rebuilt. The compact base streams from the
+    /// builder one column at a time, so building a database from a row
+    /// stream holds neither an LPG and its compaction nor the finished
+    /// columnar store, and takes one container write instead of a WAL plus
+    /// a checkpoint.
+    ///
+    /// Durability is the section writer's: the sections stream to the file,
+    /// the file is synced, then the header is flipped and synced. A process
+    /// that dies before the flip leaves the empty container `create` wrote
+    /// first, which opens as an empty database; one that dies after it
+    /// leaves the finished container. No interruption yields a partially
+    /// populated one, so a caller that needs "complete or absent" writes to
+    /// a staging path and renames the finished file into place. `path` must
+    /// not exist; the write claims it exclusively and releases it before
+    /// returning. The result is validated by reopening the container
+    /// read-only and checking that the header and section directory
+    /// round-trip with the three sections written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `path` exists or on any I/O or serialization
+    /// failure.
+    ///
+    /// [`IncrementalCompactStoreBuilder`]: grafeo_core::graph::compact::IncrementalCompactStoreBuilder
+    /// [`IncrementalCompactStoreBuilder::finish`]: grafeo_core::graph::compact::IncrementalCompactStoreBuilder::finish
+    #[cfg(all(feature = "grafeo-file", feature = "compact-store", feature = "lpg"))]
+    pub fn write_compact_container(
+        path: impl AsRef<Path>,
+        builder: grafeo_core::graph::compact::IncrementalCompactStoreBuilder,
+        property_indexes: impl IntoIterator<Item = String>,
+    ) -> Result<()> {
+        use grafeo_common::storage::{Section, SectionType};
+        use grafeo_common::utils::error::StorageError;
+        use grafeo_core::graph::compact::section::IncrementalCompactStoreSection;
+        use grafeo_core::graph::lpg::LpgStoreSection;
+
+        let path = path.as_ref();
+        let node_count = builder.node_count() as u64;
+        let edge_count = builder.edge_count() as u64;
+
+        let overlay = Arc::new(LpgStore::new().map_err(|e| Error::Internal(e.to_string()))?);
+        for key in property_indexes {
+            overlay.create_property_index(&key);
+        }
+        let base_section = IncrementalCompactStoreSection::new(builder);
+        let overlay_section = LpgStoreSection::new(Arc::clone(&overlay));
+        let catalog_section =
+            catalog_section::CatalogSection::new(Arc::new(Catalog::new()), overlay, || 0);
+        let sections: [&dyn Section; 3] = [&base_section, &overlay_section, &catalog_section];
+
+        {
+            let fm = GrafeoFileManager::create(path)?;
+            fm.write_sections_streaming(&sections, 0, 0, node_count, edge_count)?;
+        }
+
+        let reopened = GrafeoFileManager::open_read_only(path)?;
+        let header = reopened.active_header();
+        let directory = reopened.read_section_directory()?.ok_or_else(|| {
+            Error::Storage(StorageError::Corruption(
+                "written compact container has no section directory".into(),
+            ))
+        })?;
+        let expected = [
+            SectionType::CompactStore,
+            SectionType::LpgStore,
+            SectionType::Catalog,
+        ];
+        if header.node_count != node_count
+            || header.edge_count != edge_count
+            || directory.len() != expected.len()
+            || expected.iter().any(|kind| directory.find(*kind).is_none())
+        {
+            return Err(Error::Storage(StorageError::Corruption(format!(
+                "written compact container did not round-trip: header {}/{} rows, {} sections",
+                header.node_count,
+                header.edge_count,
+                directory.len()
+            ))));
+        }
+        Ok(())
+    }
+
     /// Compacts the database into a two-layer store: columnar base + mutable overlay.
     ///
     /// Takes a snapshot of all nodes and edges from the current store, builds
@@ -1711,6 +1804,47 @@ impl GrafeoDB {
         let mut section = grafeo_core::graph::compact::section::CompactStoreSection::empty();
         section.deserialize(&data)?;
         Ok(section.store().map(|store| (store, None)))
+    }
+
+    /// The compacted base's heap and mapped bytes. The base's column bodies
+    /// are views into its section buffer, which is mapped from the file on
+    /// the zero-copy open and after a spill, and a heap copy otherwise.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    pub(crate) fn compact_base_memory(&self) -> CompactBaseMemory {
+        let Some(layered) = &self.layered_store else {
+            return CompactBaseMemory::default();
+        };
+        let base = layered.base_store_arc();
+        let heap_bytes = base.heap_bytes() + layered.bookkeeping_heap_bytes();
+        let section_bytes = base.section_bytes();
+        if self.compact_base_is_mapped() {
+            CompactBaseMemory {
+                heap_bytes,
+                mapped_bytes: section_bytes,
+            }
+        } else {
+            CompactBaseMemory {
+                heap_bytes: heap_bytes + section_bytes,
+                mapped_bytes: 0,
+            }
+        }
+    }
+
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    fn compact_base_is_mapped(&self) -> bool {
+        #[cfg(feature = "grafeo-file")]
+        if self.compact_base_mmap.lock().is_some() {
+            return true;
+        }
+        #[cfg(feature = "mmap")]
+        if self
+            .compact_tiered
+            .as_ref()
+            .is_some_and(|tiered| tiered.is_on_disk())
+        {
+            return true;
+        }
+        false
     }
 
     /// Rebuilds the compact base on the heap and releases the container
@@ -2651,10 +2785,7 @@ impl GrafeoDB {
             let container_is_current = !layered
                 && !self.container_stale.load(Ordering::Acquire)
                 && !self.store_handle_vended.load(Ordering::Acquire)
-                && self
-                    .wal
-                    .as_ref()
-                    .is_some_and(|wal| wal.record_count() == 0)
+                && self.wal.as_ref().is_some_and(|wal| wal.record_count() == 0)
                 && self.store.as_ref().is_some_and(|store| {
                     let header = fm.active_header();
                     header.epoch == store.current_epoch().0
@@ -3225,8 +3356,10 @@ impl GrafeoDB {
     ///
     /// # Errors
     ///
-    /// Returns an error if the backup chain does not cover the target epoch,
-    /// segment checksums fail, or I/O fails.
+    /// Returns an error if `output_path` or its `<output_path>.wal` sidecar
+    /// already exists (restores never overwrite a database), if the backup
+    /// chain does not cover the target epoch, segment checksums fail, or I/O
+    /// fails.
     #[cfg(all(feature = "wal", feature = "grafeo-file"))]
     pub fn restore_to_epoch(
         backup_dir: &std::path::Path,
@@ -3414,6 +3547,31 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
+    /// Checks that no column name repeats (#371). Bindings read rows by column
+    /// name, so a repeated name would silently drop values. Used by every
+    /// constructor that takes columns and by the streaming open path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryErrorKind::Semantic`] if any column name appears more than
+    /// once in `columns`.
+    pub(crate) fn validate_unique_columns(columns: &[String]) -> Result<()> {
+        // Column lists are short; report the first duplicate in column order.
+        for (idx, name) in columns.iter().enumerate() {
+            if columns[..idx].contains(name) {
+                return Err(Error::Query(QueryError::new(
+                    QueryErrorKind::Semantic,
+                    format!(
+                        "duplicate column name '{name}' in query result: a result cannot carry \
+                         two columns with the same name because name-addressed consumers would \
+                         silently drop one; give the projections distinct aliases (e.g. `AS {name}_2`)"
+                    ),
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Creates a fully empty query result (no columns, no rows).
     #[must_use]
     pub fn empty() -> Self {
@@ -3443,10 +3601,14 @@ impl QueryResult {
     }
 
     /// Creates a new empty query result.
-    #[must_use]
-    pub fn new(columns: Vec<String>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns a semantic error if `columns` contains a repeated column name.
+    pub fn new(columns: Vec<String>) -> Result<Self> {
+        Self::validate_unique_columns(&columns)?;
         let len = columns.len();
-        Self {
+        Ok(Self {
             columns,
             column_types: vec![grafeo_common::types::LogicalType::Any; len],
             rows: Vec::new(),
@@ -3454,16 +3616,20 @@ impl QueryResult {
             rows_scanned: None,
             status_message: None,
             gql_status: grafeo_common::utils::GqlStatus::SUCCESS,
-        }
+        })
     }
 
     /// Creates a new empty query result with column types.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns a semantic error if `columns` contains a repeated column name.
     pub fn with_types(
         columns: Vec<String>,
         column_types: Vec<grafeo_common::types::LogicalType>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Self::validate_unique_columns(&columns)?;
+        Ok(Self {
             columns,
             column_types,
             rows: Vec::new(),
@@ -3471,14 +3637,21 @@ impl QueryResult {
             rows_scanned: None,
             status_message: None,
             gql_status: grafeo_common::utils::GqlStatus::SUCCESS,
-        }
+        })
     }
 
     /// Creates a query result with pre-populated rows.
-    #[must_use]
-    pub fn from_rows(columns: Vec<String>, rows: Vec<Vec<grafeo_common::types::Value>>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns a semantic error if `columns` contains a repeated column name.
+    pub fn from_rows(
+        columns: Vec<String>,
+        rows: Vec<Vec<grafeo_common::types::Value>>,
+    ) -> Result<Self> {
+        Self::validate_unique_columns(&columns)?;
         let len = columns.len();
-        Self {
+        Ok(Self {
             columns,
             column_types: vec![grafeo_common::types::LogicalType::Any; len],
             rows,
@@ -3486,7 +3659,7 @@ impl QueryResult {
             rows_scanned: None,
             status_message: None,
             gql_status: grafeo_common::utils::GqlStatus::SUCCESS,
-        }
+        })
     }
 
     /// Appends a row to this result.
@@ -4245,7 +4418,7 @@ mod tests {
 
     #[test]
     fn test_query_result_new_with_columns() {
-        let result = QueryResult::new(vec!["name".into(), "age".into()]);
+        let result = QueryResult::new(vec!["name".into(), "age".into()]).unwrap();
         assert_eq!(result.column_count(), 2);
         assert_eq!(result.row_count(), 0);
         assert!(result.is_empty());
@@ -4265,15 +4438,53 @@ mod tests {
         let result = QueryResult::with_types(
             vec!["name".into(), "age".into()],
             vec![LogicalType::String, LogicalType::Int64],
-        );
+        )
+        .unwrap();
         assert_eq!(result.column_count(), 2);
         assert_eq!(result.column_types[0], LogicalType::String);
         assert_eq!(result.column_types[1], LogicalType::Int64);
     }
 
     #[test]
+    fn test_query_result_rejects_duplicate_columns() {
+        // The fail-closed result-column uniqueness invariant. A result must
+        // never carry two columns with the same name (name-addressed FFI
+        // consumers would silently drop one), so the column-bearing constructors
+        // fail closed with a structured error that names the duplicate.
+        let dup_new = QueryResult::new(vec!["x".into(), "x".into()]);
+        assert!(dup_new.is_err());
+        assert!(
+            dup_new
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("duplicate column"),
+            "error should name the duplicate column"
+        );
+
+        use grafeo_common::types::LogicalType;
+        assert!(
+            QueryResult::with_types(
+                vec!["a".into(), "a".into()],
+                vec![LogicalType::Any, LogicalType::Any],
+            )
+            .is_err()
+        );
+        assert!(QueryResult::from_rows(vec!["c".into(), "c".into()], vec![]).is_err());
+
+        // Distinct column names still construct successfully.
+        assert!(QueryResult::new(vec!["a".into(), "b".into()]).is_ok());
+        assert!(QueryResult::from_rows(vec!["a".into(), "b".into()], vec![]).is_ok());
+        // The zero/one-column cases are trivially unique.
+        assert!(QueryResult::new(vec![]).is_ok());
+        assert!(QueryResult::new(vec!["only".into()]).is_ok());
+    }
+
+    #[test]
     fn test_query_result_with_metrics() {
-        let result = QueryResult::new(vec!["x".into()]).with_metrics(42.5, 100);
+        let result = QueryResult::new(vec!["x".into()])
+            .unwrap()
+            .with_metrics(42.5, 100);
         assert_eq!(result.execution_time_ms(), Some(42.5));
         assert_eq!(result.rows_scanned(), Some(100));
     }
@@ -4281,7 +4492,7 @@ mod tests {
     #[test]
     fn test_query_result_scalar_success() {
         use grafeo_common::types::Value;
-        let mut result = QueryResult::new(vec!["count".into()]);
+        let mut result = QueryResult::new(vec!["count".into()]).unwrap();
         result.rows.push(vec![Value::Int64(42)]);
 
         let val: i64 = result.scalar().unwrap();
@@ -4292,25 +4503,25 @@ mod tests {
     fn test_query_result_scalar_wrong_shape() {
         use grafeo_common::types::Value;
         // Multiple rows
-        let mut result = QueryResult::new(vec!["x".into()]);
+        let mut result = QueryResult::new(vec!["x".into()]).unwrap();
         result.rows.push(vec![Value::Int64(1)]);
         result.rows.push(vec![Value::Int64(2)]);
         assert!(result.scalar::<i64>().is_err());
 
         // Multiple columns
-        let mut result2 = QueryResult::new(vec!["a".into(), "b".into()]);
+        let mut result2 = QueryResult::new(vec!["a".into(), "b".into()]).unwrap();
         result2.rows.push(vec![Value::Int64(1), Value::Int64(2)]);
         assert!(result2.scalar::<i64>().is_err());
 
         // Empty
-        let result3 = QueryResult::new(vec!["x".into()]);
+        let result3 = QueryResult::new(vec!["x".into()]).unwrap();
         assert!(result3.scalar::<i64>().is_err());
     }
 
     #[test]
     fn test_query_result_iter() {
         use grafeo_common::types::Value;
-        let mut result = QueryResult::new(vec!["x".into()]);
+        let mut result = QueryResult::new(vec!["x".into()]).unwrap();
         result.rows.push(vec![Value::Int64(1)]);
         result.rows.push(vec![Value::Int64(2)]);
 
@@ -4321,7 +4532,7 @@ mod tests {
     #[test]
     fn test_query_result_display() {
         use grafeo_common::types::Value;
-        let mut result = QueryResult::new(vec!["name".into()]);
+        let mut result = QueryResult::new(vec!["name".into()]).unwrap();
         result.rows.push(vec![Value::from("Alix")]);
         let display = result.to_string();
         assert!(display.contains("name"));

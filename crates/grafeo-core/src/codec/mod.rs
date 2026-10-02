@@ -36,6 +36,7 @@ pub mod delta;
 pub mod dictionary;
 #[cfg(feature = "tiered-storage")]
 pub mod epoch_store;
+pub mod limits;
 pub mod runlength;
 pub mod selector;
 #[cfg(feature = "succinct-indexes")]
@@ -62,3 +63,50 @@ pub use epoch_store::{
 // Succinct data structure exports (feature-gated)
 #[cfg(feature = "succinct-indexes")]
 pub use succinct::{EliasFano, SuccinctBitVector, WaveletTree};
+
+/// The buffer a deserialized store's `Bytes`-backed codecs are views into.
+///
+/// A store read from a section keeps its column bodies as slices of that
+/// section's buffer, which is mapped from the file or, on the read path, one
+/// heap copy. Its owner accounts for the buffer once; a codec owns only the
+/// buffers outside it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SectionSpan {
+    start: usize,
+    end: usize,
+}
+
+impl SectionSpan {
+    /// The span of `section`.
+    #[must_use]
+    pub fn of(section: &[u8]) -> Self {
+        let start = section.as_ptr().addr();
+        Self {
+            start,
+            end: start + section.len(),
+        }
+    }
+
+    /// The buffer's length.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Whether no section backs the store.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// Heap bytes `bytes` holds outside this section.
+    #[must_use]
+    pub fn owned_bytes(&self, bytes: &[u8]) -> usize {
+        let start = bytes.as_ptr().addr();
+        if bytes.is_empty() || (start >= self.start && start + bytes.len() <= self.end) {
+            0
+        } else {
+            bytes.len()
+        }
+    }
+}

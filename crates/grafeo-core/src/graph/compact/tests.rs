@@ -5,11 +5,13 @@
 
 use arcstr::ArcStr;
 
+use crate::codec::SectionSpan;
 use crate::graph::Direction;
 use crate::graph::compact::builder::{CompactStoreBuilder, CompactStoreError};
 use crate::graph::compact::id::{decode_edge_id, decode_node_id, encode_node_id};
 use crate::graph::lpg::CompareOp;
 use crate::graph::traits::{GraphStore, GraphStoreSearch};
+use crate::statistics::Statistics;
 use grafeo_common::types::*;
 
 // ---------------------------------------------------------------------------
@@ -702,10 +704,10 @@ fn test_current_epoch_returns_1() {
 }
 
 #[test]
-fn test_memory_bytes_is_nonzero() {
+fn test_heap_bytes_is_nonzero() {
     let store = build_test_store();
     assert!(
-        store.memory_bytes() > 0,
+        store.heap_bytes() > 0,
         "non-empty store should report > 0 bytes"
     );
 }
@@ -745,7 +747,8 @@ fn test_empty_store() {
     assert!(store.get_node(NodeId::new(0)).is_none());
     assert!(store.get_edge(EdgeId::new(0)).is_none());
     assert_eq!(store.current_epoch(), EpochId(1));
-    assert_eq!(store.memory_bytes(), 0);
+    // An empty store holds only its shared statistics allocation.
+    assert_eq!(store.heap_bytes(), 16 + std::mem::size_of::<Statistics>());
 
     let stats = store.statistics();
     assert_eq!(stats.total_nodes, 0);
@@ -943,7 +946,7 @@ fn test_edge_property_access() {
 #[test]
 fn test_memory_bytes_nonzero() {
     let store = build_test_store();
-    assert!(store.memory_bytes() > 0);
+    assert!(store.heap_bytes() > 0);
 }
 
 #[test]
@@ -1212,13 +1215,13 @@ fn test_rel_table_dest_node_id_out_of_bounds() {
 }
 
 #[test]
-fn test_rel_table_memory_bytes_nonzero() {
+fn test_rel_table_heap_bytes_nonzero() {
     let store = build_test_store();
     let rt = store.rel_tables_for_type("LIVES_IN")[0];
-    assert!(rt.memory_bytes() > 0);
+    assert!(rt.heap_bytes(&SectionSpan::default()) > 0);
     // With backward CSR, memory should be higher.
     let knows = store.rel_tables_for_type("KNOWS")[0];
-    assert!(knows.memory_bytes() > 0);
+    assert!(knows.heap_bytes(&SectionSpan::default()) > 0);
 }
 
 #[test]
@@ -1240,14 +1243,14 @@ fn test_rel_table_no_backward_dest_node_id() {
 }
 
 // ---------------------------------------------------------------------------
-// NodeTable: memory_bytes, property-not-found
+// NodeTable: heap_bytes, property-not-found
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_node_table_memory_bytes_nonzero() {
+fn test_node_table_heap_bytes_nonzero() {
     let store = build_test_store();
     let nt = store.node_table("Person").unwrap();
-    assert!(nt.memory_bytes() > 0);
+    assert!(nt.heap_bytes(&SectionSpan::default()) > 0);
 }
 
 #[test]

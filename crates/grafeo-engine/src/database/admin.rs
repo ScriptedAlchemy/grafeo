@@ -151,6 +151,8 @@ impl super::GrafeoDB {
             caches,
             string_pool,
             buffer_manager,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            compact_base: self.compact_base_memory(),
             ..Default::default()
         };
 

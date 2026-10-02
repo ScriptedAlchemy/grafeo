@@ -3,13 +3,16 @@
 //! Each `NodeTable` stores all nodes of a single label as typed columns.
 //! Nodes are addressed by row offset; the `NodeId` encodes (table_id, offset).
 
+use grafeo_common::memory::heap::vec_bytes;
 use grafeo_common::types::{NodeId, PropertyKey, Value};
 use grafeo_common::utils::hash::FxHashMap;
 
 use super::column::ColumnCodec;
+use super::heap::{key_bytes, table_schema_bytes, zone_map_bytes};
 use super::id::encode_node_id;
 use super::schema::TableSchema;
 use super::zone_map::ZoneMap;
+use crate::codec::{BitVector, SectionSpan};
 
 /// Per-label columnar storage for nodes.
 ///
@@ -29,6 +32,12 @@ pub struct NodeTable {
     /// empty after v1/v2 compat reads (Phase 4 will fall back to whole
     /// column scans in that case).
     block_zone_maps: FxHashMap<PropertyKey, Vec<ZoneMap>>,
+    /// Rows that hold no value, per column that has any. A column body has
+    /// no null representation (a padded row decodes as `0`, `""`, or
+    /// `false`), so every read consults this before decoding a row. Dense
+    /// columns, and every column of a store read from a pre-v5 section,
+    /// have no entry.
+    null_masks: FxHashMap<PropertyKey, BitVector>,
     /// Number of rows (nodes) in the table.
     len: usize,
 }
@@ -42,8 +51,16 @@ impl NodeTable {
             columns: FxHashMap::default(),
             zone_maps: FxHashMap::default(),
             block_zone_maps: FxHashMap::default(),
+            null_masks: FxHashMap::default(),
             len: 0,
         }
+    }
+
+    /// Attaches the per-column null masks (see [`Self::is_null`]).
+    #[must_use]
+    pub fn with_null_masks(mut self, null_masks: FxHashMap<PropertyKey, BitVector>) -> Self {
+        self.null_masks = null_masks;
+        self
     }
 
     /// Creates a table from pre-built columns and zone maps with no
@@ -73,6 +90,7 @@ impl NodeTable {
             columns,
             zone_maps,
             block_zone_maps,
+            null_masks: FxHashMap::default(),
             len,
         }
     }
@@ -112,11 +130,27 @@ impl NodeTable {
             .collect()
     }
 
+    /// Whether the node at `offset` holds no value for `key`.
+    ///
+    /// A `true` row is one the builder padded because the node never had the
+    /// property; its column body still decodes to a value there, which no
+    /// read may surface.
+    #[must_use]
+    pub fn is_null(&self, offset: usize, key: &PropertyKey) -> bool {
+        self.null_masks
+            .get(key)
+            .is_some_and(|mask| mask.get(offset).unwrap_or(false))
+    }
+
     /// Returns the decoded property value at the given row offset.
     ///
-    /// Returns `None` if the column does not exist or the offset is out of bounds.
+    /// Returns `None` if the column does not exist, the offset is out of
+    /// bounds, or the node holds no value for `key`.
     #[must_use]
     pub fn get_property(&self, offset: usize, key: &PropertyKey) -> Option<Value> {
+        if self.is_null(offset, key) {
+            return None;
+        }
         self.columns.get(key)?.get(offset)
     }
 
@@ -130,6 +164,9 @@ impl NodeTable {
             return props;
         }
         for (key, col) in &self.columns {
+            if self.is_null(offset, key) {
+                continue;
+            }
             if let Some(value) = col.get(offset) {
                 props.insert(key.clone(), value);
             }
@@ -141,9 +178,13 @@ impl NodeTable {
     ///
     /// This is primarily useful for foreign-key columns where the raw encoded ID
     /// is needed rather than the `Value::Int64` conversion. Returns `None` for
-    /// non-[`BitPacked`](ColumnCodec::BitPacked) columns or out-of-bounds offsets.
+    /// non-[`BitPacked`](ColumnCodec::BitPacked) columns, out-of-bounds
+    /// offsets, or a node that holds no value for `key`.
     #[must_use]
     pub fn get_raw_u64(&self, offset: usize, key: &PropertyKey) -> Option<u64> {
+        if self.is_null(offset, key) {
+            return None;
+        }
         self.columns.get(key)?.get_raw_u64(offset)
     }
 
@@ -192,10 +233,38 @@ impl NodeTable {
         &self.block_zone_maps
     }
 
-    /// Returns an estimate of heap memory used by all columns in bytes.
+    /// Returns the null mask for a column, if the column has any null row.
     #[must_use]
-    pub fn memory_bytes(&self) -> usize {
-        self.columns.values().map(|c| c.heap_bytes()).sum()
+    pub fn null_mask(&self, key: &PropertyKey) -> Option<&BitVector> {
+        self.null_masks.get(key)
+    }
+
+    /// Heap bytes the table owns outside `section`: its schema, every map's
+    /// table, each column's key and body, and the zone maps and null masks.
+    /// Keys are shared across the per-column maps and charged once.
+    #[must_use]
+    pub fn heap_bytes(&self, section: &SectionSpan) -> usize {
+        table_schema_bytes(&self.schema)
+            + self.columns.allocation_size()
+            + self
+                .columns
+                .iter()
+                .map(|(key, column)| key_bytes(key) + column.heap_bytes(section))
+                .sum::<usize>()
+            + self.zone_maps.allocation_size()
+            + self.zone_maps.values().map(zone_map_bytes).sum::<usize>()
+            + self.block_zone_maps.allocation_size()
+            + self
+                .block_zone_maps
+                .values()
+                .map(|blocks| vec_bytes(blocks) + blocks.iter().map(zone_map_bytes).sum::<usize>())
+                .sum::<usize>()
+            + self.null_masks.allocation_size()
+            + self
+                .null_masks
+                .values()
+                .map(|mask| mask.heap_bytes(section))
+                .sum::<usize>()
     }
 }
 

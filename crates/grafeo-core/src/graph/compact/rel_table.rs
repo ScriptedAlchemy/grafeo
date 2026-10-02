@@ -9,8 +9,10 @@ use grafeo_common::utils::hash::FxHashMap;
 
 use super::column::ColumnCodec;
 use super::csr::CsrAdjacency;
+use super::heap::{edge_schema_bytes, key_bytes};
 use super::id::{encode_edge_id, encode_node_id};
 use super::schema::EdgeSchema;
+use crate::codec::{BitVector, SectionSpan};
 
 /// A relationship table holding all edges of a single type.
 ///
@@ -31,6 +33,9 @@ pub struct RelTable {
     bwd: Option<CsrAdjacency>,
     /// Edge properties, keyed by property name, parallel to forward CSR targets.
     properties: FxHashMap<PropertyKey, ColumnCodec>,
+    /// CSR positions that hold no value, per property column that has any
+    /// (see [`NodeTable::null_masks`](super::node_table::NodeTable)).
+    null_masks: FxHashMap<PropertyKey, BitVector>,
     /// Table ID of the source node table.
     src_table_id: u16,
     /// Table ID of the destination node table.
@@ -63,9 +68,31 @@ impl RelTable {
             fwd,
             bwd,
             properties,
+            null_masks: FxHashMap::default(),
             src_table_id,
             dst_table_id,
         }
+    }
+
+    /// Attaches the per-column null masks (see [`Self::is_null`]).
+    #[must_use]
+    pub fn with_null_masks(mut self, null_masks: FxHashMap<PropertyKey, BitVector>) -> Self {
+        self.null_masks = null_masks;
+        self
+    }
+
+    /// Whether the edge at `csr_position` holds no value for `key`.
+    #[must_use]
+    pub fn is_null(&self, csr_position: usize, key: &PropertyKey) -> bool {
+        self.null_masks
+            .get(key)
+            .is_some_and(|mask| mask.get(csr_position).unwrap_or(false))
+    }
+
+    /// Returns the null mask for a property column, if it has any null row.
+    #[must_use]
+    pub fn null_mask(&self, key: &PropertyKey) -> Option<&BitVector> {
+        self.null_masks.get(key)
     }
 
     /// Returns the edge type name (e.g. `"KNOWS"`).
@@ -153,9 +180,13 @@ impl RelTable {
         Some(results)
     }
 
-    /// Returns the property value for a specific edge (by CSR position) and key.
+    /// Returns the property value for a specific edge (by CSR position) and
+    /// key; `None` when the edge holds no value for it.
     #[must_use]
     pub fn get_edge_property(&self, csr_position: usize, key: &PropertyKey) -> Option<Value> {
+        if self.is_null(csr_position, key) {
+            return None;
+        }
         self.properties.get(key)?.get(csr_position)
     }
 
@@ -164,6 +195,9 @@ impl RelTable {
     pub fn get_all_edge_properties(&self, csr_position: usize) -> FxHashMap<PropertyKey, Value> {
         let mut props = FxHashMap::default();
         for (key, col) in &self.properties {
+            if self.is_null(csr_position, key) {
+                continue;
+            }
             if let Some(value) = col.get(csr_position) {
                 props.insert(key.clone(), value);
             }
@@ -224,14 +258,25 @@ impl RelTable {
         &self.properties
     }
 
-    /// Returns an estimate of heap memory used by the CSR structures and
-    /// edge property columns in bytes.
+    /// Heap bytes the table owns outside `section`: its schema, both CSRs,
+    /// and every property column's key, body, and null mask.
     #[must_use]
-    pub fn memory_bytes(&self) -> usize {
-        let fwd_bytes = self.fwd.memory_bytes();
-        let bwd_bytes = self.bwd.as_ref().map_or(0, |b| b.memory_bytes());
-        let prop_bytes: usize = self.properties.values().map(|c| c.heap_bytes()).sum();
-        fwd_bytes + bwd_bytes + prop_bytes
+    pub fn heap_bytes(&self, section: &SectionSpan) -> usize {
+        edge_schema_bytes(&self.schema)
+            + self.fwd.heap_bytes()
+            + self.bwd.as_ref().map_or(0, CsrAdjacency::heap_bytes)
+            + self.properties.allocation_size()
+            + self
+                .properties
+                .iter()
+                .map(|(key, column)| key_bytes(key) + column.heap_bytes(section))
+                .sum::<usize>()
+            + self.null_masks.allocation_size()
+            + self
+                .null_masks
+                .values()
+                .map(|mask| mask.heap_bytes(section))
+                .sum::<usize>()
     }
 }
 

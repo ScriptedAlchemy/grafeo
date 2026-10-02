@@ -62,8 +62,15 @@ pub struct CompactStoreTiered {
 }
 
 enum TierState {
-    /// Store lives entirely on the heap.
-    InMemory(Arc<CompactStore>),
+    /// Store is served from memory the wrapper does not map. Its section
+    /// buffer, if it has one, is the heap copy `reload_to_ram` made when
+    /// `section_on_heap`, and otherwise belongs to whoever handed the
+    /// store over (a mapping the database holds, or none for a store
+    /// built in memory).
+    InMemory {
+        store: Arc<CompactStore>,
+        section_on_heap: bool,
+    },
     /// Store is backed by a mmap'd file. Phase 3c: the entire mmap is
     /// wrapped as a refcounted [`Bytes`] via [`Bytes::from_owner`], and
     /// every column codec inside `store` holds a `Bytes::slice(range)`
@@ -83,7 +90,10 @@ impl CompactStoreTiered {
     #[must_use]
     pub fn new_in_memory(store: Arc<CompactStore>) -> Self {
         Self {
-            state: RwLock::new(TierState::InMemory(store)),
+            state: RwLock::new(TierState::InMemory {
+                store,
+                section_on_heap: false,
+            }),
         }
     }
 
@@ -93,7 +103,7 @@ impl CompactStoreTiered {
     #[must_use]
     pub fn store(&self) -> Arc<CompactStore> {
         match &*self.state.read() {
-            TierState::InMemory(store) => Arc::clone(store),
+            TierState::InMemory { store, .. } => Arc::clone(store),
             TierState::OnDisk { store, .. } => Arc::clone(store),
         }
     }
@@ -109,7 +119,7 @@ impl CompactStoreTiered {
     pub fn path(&self) -> Option<PathBuf> {
         match &*self.state.read() {
             TierState::OnDisk { path, .. } => Some(path.clone()),
-            TierState::InMemory(_) => None,
+            TierState::InMemory { .. } => None,
         }
     }
 
@@ -203,11 +213,14 @@ impl CompactStoreTiered {
         let section = CompactStoreSection::new(Arc::clone(store));
         let bytes = section.serialize()?;
         let mut reloaded = CompactStoreSection::empty();
-        reloaded.deserialize_from_bytes(Bytes::from(bytes))?;
+        reloaded.deserialize_from_bytes(Bytes::from(bytes.into_boxed_slice()))?;
         let new_store = reloaded.store().ok_or_else(|| {
             Error::Internal("empty CompactStoreSection after reload_to_ram".to_string())
         })?;
-        *guard = TierState::InMemory(new_store);
+        *guard = TierState::InMemory {
+            store: new_store,
+            section_on_heap: true,
+        };
         Ok(())
     }
 
@@ -227,17 +240,31 @@ impl CompactStoreTiered {
     /// re-serializes an `OnDisk` tier backed by a spill file this
     /// wrapper owns.
     pub fn rebase_in_memory(&self, store: Arc<CompactStore>) {
-        *self.state.write() = TierState::InMemory(store);
+        *self.state.write() = TierState::InMemory {
+            store,
+            section_on_heap: false,
+        };
     }
 
-    /// Estimated heap memory footprint of the wrapped store, in bytes.
-    ///
-    /// When the state is `OnDisk`, this counts the heap copy alone: the
-    /// mmap bytes live outside the heap and are managed by the OS page
-    /// cache.
+    /// Heap bytes of the wrapped store, including its section buffer when
+    /// that buffer is the heap copy [`reload_to_ram`](Self::reload_to_ram)
+    /// made. A mapped section lives in the OS page cache, not the heap.
     #[must_use]
-    pub fn memory_bytes(&self) -> usize {
-        self.store().memory_bytes()
+    pub fn heap_bytes(&self) -> usize {
+        match &*self.state.read() {
+            TierState::InMemory {
+                store,
+                section_on_heap,
+            } => {
+                store.heap_bytes()
+                    + if *section_on_heap {
+                        store.section_bytes()
+                    } else {
+                        0
+                    }
+            }
+            TierState::OnDisk { store, .. } => store.heap_bytes(),
+        }
     }
 }
 
@@ -313,10 +340,10 @@ mod tests {
     #[test]
     fn in_memory_roundtrip() {
         let store = build_sample_store();
-        let expected = store.memory_bytes();
+        let expected = store.heap_bytes();
         let tiered = CompactStoreTiered::new_in_memory(store);
         assert!(!tiered.is_on_disk());
-        assert_eq!(tiered.memory_bytes(), expected);
+        assert_eq!(tiered.heap_bytes(), expected);
     }
 
     #[test]

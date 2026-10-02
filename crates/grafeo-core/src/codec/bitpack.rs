@@ -23,6 +23,9 @@
 use std::io;
 
 use bytes::{Bytes, BytesMut};
+use grafeo_common::memory::heap::vec_bytes;
+
+use super::SectionSpan;
 
 /// Converts a slice of `u64` words to a refcounted `Bytes` buffer of
 /// little-endian bytes (8 bytes per word). Used by builders that produce
@@ -94,6 +97,13 @@ impl WordStore {
         match self {
             Self::Inline(v) => words_to_bytes(v),
             Self::Mapped(b) => b.clone(),
+        }
+    }
+
+    fn heap_bytes(&self, section: &SectionSpan) -> usize {
+        match self {
+            Self::Inline(v) => vec_bytes(v),
+            Self::Mapped(b) => section.owned_bytes(b),
         }
     }
 }
@@ -388,6 +398,12 @@ impl BitPackedInts {
     #[must_use]
     pub fn bits_per_value(&self) -> u8 {
         self.bits_per_value
+    }
+
+    /// Heap bytes the packed words own outside `section`.
+    #[must_use]
+    pub fn heap_bytes(&self, section: &SectionSpan) -> usize {
+        self.data.heap_bytes(section)
     }
 
     /// Returns the raw packed bytes.

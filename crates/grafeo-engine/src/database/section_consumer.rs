@@ -592,7 +592,7 @@ impl MemoryConsumer for CompactStoreConsumer {
         // When OnDisk, the heap copy of CompactStore is still alive (we
         // deserialized from mmap eagerly). Report its heap bytes in both
         // states; the OS page cache that backs mmap lives outside the heap.
-        self.tiered.upgrade().map_or(0, |t| t.memory_bytes())
+        self.tiered.upgrade().map_or(0, |t| t.heap_bytes())
     }
 
     fn eviction_priority(&self) -> u8 {
@@ -641,7 +641,7 @@ impl MemoryConsumer for CompactStoreConsumer {
 
         let path = self.spill_file().ok_or(SpillError::NoSpillDirectory)?;
 
-        let before = tiered.memory_bytes();
+        let before = tiered.heap_bytes();
         tiered
             .persist_to_mmap(&path)
             .map_err(|e| SpillError::IoError(e.to_string()))?;
@@ -656,7 +656,7 @@ impl MemoryConsumer for CompactStoreConsumer {
             layered.swap_base(tiered.store());
         }
 
-        let after = tiered.memory_bytes();
+        let after = tiered.heap_bytes();
         Ok(before.saturating_sub(after))
     }
 

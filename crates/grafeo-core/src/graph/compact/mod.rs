@@ -16,6 +16,7 @@ pub mod csr;
 pub mod deletions_section;
 pub(crate) mod dict_value;
 mod graph_store_impl;
+mod heap;
 /// Node/edge ID encoding and decoding helpers.
 pub mod id;
 /// Two-layer store: columnar base + mutable LPG overlay.
@@ -34,7 +35,10 @@ mod tests;
 /// Zone maps for skip-pruning predicate evaluation.
 pub mod zone_map;
 
-pub use builder::{CompactStoreBuilder, from_graph_store, from_graph_store_preserving_ids};
+pub use builder::{
+    CompactStoreBuilder, IncrementalCompactStoreBuilder, from_graph_store,
+    from_graph_store_preserving_ids,
+};
 
 use std::sync::Arc;
 
@@ -42,8 +46,12 @@ use arcstr::ArcStr;
 use grafeo_common::types::{EdgeId, HashableValue, NodeId, PropertyKey};
 use grafeo_common::utils::hash::FxHashMap;
 
+use grafeo_common::memory::heap::{arc_slice_bytes, arcstr_bytes, vec_bytes};
+
+use self::heap::{key_bytes, statistics_bytes, value_bytes};
 use self::node_table::NodeTable;
 use self::rel_table::RelTable;
+use crate::codec::SectionSpan;
 use crate::graph::Direction;
 use crate::statistics::Statistics;
 
@@ -100,6 +108,10 @@ pub struct CompactStore {
     /// Derived entirely from the columns, so it is never serialized; the
     /// engine re-declares the indexed properties after a reload.
     property_value_indexes: parking_lot::RwLock<FxHashMap<PropertyKey, Arc<PropertyValueIndex>>>,
+
+    /// The section buffer a deserialized store's column bodies are views
+    /// into; empty for a store built in memory.
+    section: SectionSpan,
 }
 
 /// One property's value-to-nodes map. See
@@ -174,6 +186,7 @@ impl CompactStore {
             max_node_id: None,
             max_edge_id: None,
             property_value_indexes: parking_lot::RwLock::new(FxHashMap::default()),
+            section: SectionSpan::default(),
         }
     }
 
@@ -276,25 +289,52 @@ impl CompactStore {
         results
     }
 
-    /// Returns a rough estimate of heap memory used by the snapshot data
-    /// (node columns + CSR structures + edge property columns), in bytes.
+    /// Heap bytes the store owns: every table, lookup map, and id map, the
+    /// statistics, and the property value indexes.
     ///
-    /// Does not include `FxHashMap` overhead or schema metadata. For precise
-    /// measurement, use a heap profiler.
+    /// A store read from a section keeps its column bodies as views into
+    /// that section's buffer; those bytes are the section's, reported by
+    /// [`section_bytes`](Self::section_bytes), and are not counted here.
     #[must_use]
-    pub fn memory_bytes(&self) -> usize {
-        let node_bytes: usize = self
-            .node_tables_by_id
-            .iter()
-            .map(|nt| nt.memory_bytes())
-            .sum();
-        let rel_bytes: usize = self
-            .rel_tables_by_id
-            .iter()
-            .map(|rt| rt.memory_bytes())
-            .sum();
-        let id_map_bytes = self.id_map_memory_bytes();
-        node_bytes + rel_bytes + id_map_bytes + self.property_index_memory_bytes()
+    pub fn heap_bytes(&self) -> usize {
+        let section = &self.section;
+        let vecs_bytes =
+            |vecs: &Vec<Vec<u16>>| vec_bytes(vecs) + vecs.iter().map(vec_bytes).sum::<usize>();
+        let labels_bytes = |labels: &Vec<ArcStr>| {
+            vec_bytes(labels) + labels.iter().map(arcstr_bytes).sum::<usize>()
+        };
+        vec_bytes(&self.node_tables_by_id)
+            + self
+                .node_tables_by_id
+                .iter()
+                .map(|table| table.heap_bytes(section))
+                .sum::<usize>()
+            + vec_bytes(&self.rel_tables_by_id)
+            + self
+                .rel_tables_by_id
+                .iter()
+                .map(|table| table.heap_bytes(section))
+                .sum::<usize>()
+            // The label and edge-type keys share their allocations with
+            // the id-to-name vectors.
+            + self.label_to_table_id.allocation_size()
+            + self.edge_type_to_rel_id.allocation_size()
+            + self.edge_type_to_rel_id.values().map(vec_bytes).sum::<usize>()
+            + labels_bytes(&self.table_id_to_label)
+            + labels_bytes(&self.rel_table_id_to_type)
+            + vecs_bytes(&self.src_rel_table_ids)
+            + vecs_bytes(&self.dst_rel_table_ids)
+            + statistics_bytes(&self.statistics)
+            + self.id_map_heap_bytes()
+            + self.property_index_heap_bytes()
+    }
+
+    /// Length of the section buffer the column bodies are views into, or 0
+    /// for a store built in memory. The buffer is mapped from the file on
+    /// the zero-copy open and a heap copy otherwise; its holder knows which.
+    #[must_use]
+    pub fn section_bytes(&self) -> usize {
+        self.section.len()
     }
 
     // ── ID-preserving accessors ────────────────────────────────────
@@ -410,6 +450,9 @@ impl CompactStore {
             any_column = true;
             let table_id = nt.table_id();
             for offset in 0..col.len() {
+                if nt.is_null(offset, key) {
+                    continue;
+                }
                 let Some(value) = col.get(offset) else {
                     continue;
                 };
@@ -498,34 +541,38 @@ impl CompactStore {
         }
     }
 
-    /// Approximate heap cost of the ID maps.
-    /// Rough heap cost of the property hash indexes: each entry is a
-    /// `HashableValue` key plus one `NodeId` per matching row.
-    fn property_index_memory_bytes(&self) -> usize {
-        self.property_value_indexes
-            .read()
-            .values()
-            .map(|index| {
-                index
-                    .iter()
-                    .map(|(_, ids)| 40 + ids.len() * 8)
-                    .sum::<usize>()
-            })
-            .sum()
+    /// Heap bytes of the property hash indexes: the index map, each index's
+    /// shared allocation and table, and every value key and id list.
+    fn property_index_heap_bytes(&self) -> usize {
+        let indexes = self.property_value_indexes.read();
+        indexes.allocation_size()
+            + indexes
+                .iter()
+                .map(|(key, index)| {
+                    key_bytes(key)
+                        + arc_slice_bytes::<PropertyValueIndex>(1)
+                        + index.allocation_size()
+                        + index
+                            .iter()
+                            .map(|(value, ids)| value_bytes(&value.0) + vec_bytes(ids))
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
-    fn id_map_memory_bytes(&self) -> usize {
-        // ~24 bytes per entry (key + value) in FxHashMap, plus Vec overhead.
-        let node_map = self.node_id_map.as_ref().map_or(0, |m| m.len() * 24);
-        let edge_map = self.edge_id_map.as_ref().map_or(0, |m| m.len() * 24);
-        let node_rev = self
-            .node_offset_to_id
+    fn id_map_heap_bytes(&self) -> usize {
+        self.node_id_map
             .as_ref()
-            .map_or(0, |v| v.iter().map(|inner| inner.len() * 8).sum());
-        let edge_rev = self
-            .edge_offset_to_id
-            .as_ref()
-            .map_or(0, |v| v.iter().map(|inner| inner.len() * 8).sum());
-        node_map + edge_map + node_rev + edge_rev
+            .map_or(0, FxHashMap::allocation_size)
+            + self
+                .edge_id_map
+                .as_ref()
+                .map_or(0, FxHashMap::allocation_size)
+            + self.node_offset_to_id.as_ref().map_or(0, |offsets| {
+                vec_bytes(offsets) + offsets.iter().map(vec_bytes).sum::<usize>()
+            })
+            + self.edge_offset_to_id.as_ref().map_or(0, |offsets| {
+                vec_bytes(offsets) + offsets.iter().map(vec_bytes).sum::<usize>()
+            })
     }
 }

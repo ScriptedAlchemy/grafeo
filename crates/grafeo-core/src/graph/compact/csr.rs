@@ -3,6 +3,8 @@
 //! For node i, its neighbors are `targets[offsets[i]..offsets[i+1]]`.
 //! Uses u32 for both offsets and targets (max ~4B nodes/edges per table).
 
+use grafeo_common::memory::heap::vec_bytes;
+
 /// Compressed Sparse Row adjacency structure.
 ///
 /// Stores a directed graph in two flat arrays: `offsets` (one per node + 1
@@ -206,14 +208,18 @@ impl CsrAdjacency {
     }
 
     /// Serializes this CSR to a byte buffer.
-    pub fn write_to(&self, buf: &mut Vec<u8>) {
+    ///
+    /// # Errors
+    ///
+    /// Fails if an array length does not fit the format's `u32` fields.
+    pub fn write_to(&self, buf: &mut Vec<u8>) -> grafeo_common::utils::error::Result<()> {
         // offsets
-        write_usize_as_u32(buf, self.offsets.len());
+        write_usize_as_u32(buf, self.offsets.len())?;
         for &o in &self.offsets {
             buf.extend_from_slice(&o.to_le_bytes());
         }
         // targets
-        write_usize_as_u32(buf, self.targets.len());
+        write_usize_as_u32(buf, self.targets.len())?;
         for &t in &self.targets {
             buf.extend_from_slice(&t.to_le_bytes());
         }
@@ -221,13 +227,14 @@ impl CsrAdjacency {
         match &self.edge_data {
             Some(ed) => {
                 buf.push(1);
-                write_usize_as_u32(buf, ed.len());
+                write_usize_as_u32(buf, ed.len())?;
                 for &d in ed {
                     buf.extend_from_slice(&d.to_le_bytes());
                 }
             }
             None => buf.push(0),
         }
+        Ok(())
     }
 
     /// Deserializes a CSR from a byte buffer at the given offset.
@@ -261,21 +268,19 @@ impl CsrAdjacency {
         Ok(Self::from_raw_parts(offsets, targets, edge_data))
     }
 
-    /// Returns the approximate heap memory usage in bytes.
+    /// Heap bytes the offsets, targets, and edge data buffers occupy.
     #[must_use]
-    pub fn memory_bytes(&self) -> usize {
-        self.offsets.len() * std::mem::size_of::<u32>()
-            + self.targets.len() * std::mem::size_of::<u32>()
-            + self
-                .edge_data
-                .as_ref()
-                .map_or(0, |d| d.len() * std::mem::size_of::<u32>())
+    pub fn heap_bytes(&self) -> usize {
+        vec_bytes(&self.offsets)
+            + vec_bytes(&self.targets)
+            + self.edge_data.as_ref().map_or(0, vec_bytes)
     }
 }
 
-fn write_usize_as_u32(buf: &mut Vec<u8>, v: usize) {
-    let n = u32::try_from(v).expect("value exceeds u32::MAX in CSR serialization");
+fn write_usize_as_u32(buf: &mut Vec<u8>, v: usize) -> grafeo_common::utils::error::Result<()> {
+    let n = crate::codec::limits::checked_u32(v, "compact store adjacency size")?;
     buf.extend_from_slice(&n.to_le_bytes());
+    Ok(())
 }
 
 fn read_u32_le(data: &[u8], pos: &mut usize) -> Result<u32, &'static str> {
@@ -340,6 +345,6 @@ mod tests {
         assert_eq!(csr.num_nodes(), 0);
         assert_eq!(csr.num_edges(), 0);
         assert_eq!(csr.source_for_position(0), None);
-        assert_eq!(csr.memory_bytes(), 4); // 1 offset entry (sentinel)
+        assert_eq!(csr.heap_bytes(), 4); // 1 offset entry (sentinel)
     }
 }

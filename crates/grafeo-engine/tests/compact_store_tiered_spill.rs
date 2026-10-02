@@ -51,7 +51,7 @@ fn compact_installs_tiered_wrapper() {
         .compact_tiered()
         .expect("tiered installed after compact()");
     assert!(!tiered.is_on_disk(), "starts in-memory");
-    assert!(tiered.memory_bytes() > 0);
+    assert!(tiered.heap_bytes() > 0);
 
     // LayeredStore and tiered agree on the base Arc right after compact().
     let layered = db
