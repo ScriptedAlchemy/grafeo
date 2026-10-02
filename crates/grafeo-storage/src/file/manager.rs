@@ -586,7 +586,10 @@ impl GrafeoFileManager {
         let dir_offset = Self::directory_location(active);
         let conservative = {
             let file_len = file.metadata()?.len();
-            Some((SECTION_DATA_OFFSET.min(dir_offset), file_len.max(dir_offset + 4096)))
+            Some((
+                SECTION_DATA_OFFSET.min(dir_offset),
+                file_len.max(dir_offset + 4096),
+            ))
         };
 
         file.seek(SeekFrom::Start(dir_offset))?;
@@ -749,7 +752,10 @@ impl GrafeoFileManager {
                     SECTION_WRITE_BUFFER_BYTES,
                     bounded,
                 ));
-                match payload.write_into(&mut writer).and_then(|()| writer.finish()) {
+                match payload
+                    .write_into(&mut writer)
+                    .and_then(|()| writer.finish())
+                {
                     Ok(result) => result,
                     Err(_) if overflowed.get() => return Ok(None),
                     Err(error) => return Err(error),
@@ -767,7 +773,10 @@ impl GrafeoFileManager {
                     SECTION_WRITE_BUFFER_BYTES,
                     bounded,
                 ));
-                match payload.write_into(&mut writer).and_then(|()| writer.finish()) {
+                match payload
+                    .write_into(&mut writer)
+                    .and_then(|()| writer.finish())
+                {
                     Ok(result) => result,
                     Err(_) if overflowed.get() => return Ok(None),
                     Err(error) => return Err(error),
@@ -1056,11 +1065,59 @@ impl GrafeoFileManager {
     /// - The section is not mmap-able (data section)
     /// - The mmap system call fails
     /// - The CRC-32 checksum does not match (corrupt data)
-    #[allow(unsafe_code)]
     pub fn mmap_section(
         &self,
         entry: &grafeo_common::storage::SectionDirectoryEntry,
     ) -> Result<crate::container::MmapSection> {
+        let mmap = self.map_section_bytes(entry)?;
+
+        // Verify CRC on the mmap'd bytes. This reads through the mapping,
+        // which triggers page faults and warms the OS page cache: a free
+        // prefetch disguised as an integrity check.
+        let actual_crc = crc32fast::hash(&mmap);
+        if actual_crc != entry.checksum {
+            return Err(Error::Storage(StorageError::Corruption(format!(
+                "section {:?} CRC mismatch: expected {:#010X}, got {actual_crc:#010X}",
+                entry.section_type, entry.checksum
+            ))));
+        }
+
+        Ok(crate::container::MmapSection::new(
+            mmap,
+            entry.section_type,
+            entry.checksum,
+        ))
+    }
+
+    /// Memory-maps a section whose payload carries its own page checksums,
+    /// without hashing the whole section.
+    ///
+    /// For a payload that verifies itself page by page as it is read, the
+    /// whole-section CRC [`mmap_section`](Self::mmap_section) computes is a
+    /// full read of the section on every open; the caller verifies through
+    /// the payload's page table instead. Same lifecycle as `mmap_section`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the section is not mmap-able or the mmap system
+    /// call fails.
+    pub fn mmap_paged_section(
+        &self,
+        entry: &grafeo_common::storage::SectionDirectoryEntry,
+    ) -> Result<crate::container::MmapSection> {
+        let mmap = self.map_section_bytes(entry)?;
+        Ok(crate::container::MmapSection::new(
+            mmap,
+            entry.section_type,
+            entry.checksum,
+        ))
+    }
+
+    #[allow(unsafe_code)]
+    fn map_section_bytes(
+        &self,
+        entry: &grafeo_common::storage::SectionDirectoryEntry,
+    ) -> Result<memmap2::Mmap> {
         if !entry.flags.mmap_able {
             return Err(Error::Internal(format!(
                 "section {:?} is not mmap-able (data sections must be deserialized)",
@@ -1080,8 +1137,8 @@ impl GrafeoFileManager {
         // SAFETY: We hold an exclusive lock on the `.grafeo` file, preventing
         // concurrent modification by other processes. The mapping is read-only.
         // The section region [offset .. offset+length] was written by
-        // write_sections() and its CRC is verified below before the mmap
-        // is exposed to callers.
+        // write_sections(); each caller verifies its bytes before trusting
+        // them (the whole-section CRC, or the payload's page checksums).
         // reason: section length is bounded by file size, fits in usize on 64-bit targets
         #[allow(clippy::cast_possible_truncation)]
         let section_len = entry.length as usize;
@@ -1092,25 +1149,7 @@ impl GrafeoFileManager {
                 .map(&*file)
         }
         .map_err(Error::Io)?;
-
-        drop(file);
-
-        // Verify CRC on the mmap'd bytes. This reads through the mapping,
-        // which triggers page faults and warms the OS page cache: a free
-        // prefetch disguised as an integrity check.
-        let actual_crc = crc32fast::hash(&mmap);
-        if actual_crc != entry.checksum {
-            return Err(Error::Storage(StorageError::Corruption(format!(
-                "section {:?} CRC mismatch: expected {:#010X}, got {actual_crc:#010X}",
-                entry.section_type, entry.checksum
-            ))));
-        }
-
-        Ok(crate::container::MmapSection::new(
-            mmap,
-            entry.section_type,
-            entry.checksum,
-        ))
+        Ok(mmap)
     }
 
     /// Whether section payloads in this container are encrypted at rest.

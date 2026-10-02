@@ -1031,10 +1031,12 @@ impl GrafeoDB {
         let edge_count = builder.edge_count() as u64;
 
         let overlay = Arc::new(LpgStore::new().map_err(|e| Error::Internal(e.to_string()))?);
+        let mut indexed = Vec::new();
         for key in property_indexes {
             overlay.create_property_index(&key);
+            indexed.push(grafeo_common::types::PropertyKey::new(&key));
         }
-        let base_section = IncrementalCompactStoreSection::new(builder);
+        let base_section = IncrementalCompactStoreSection::new(builder, indexed);
         let overlay_section = LpgStoreSection::new(Arc::clone(&overlay));
         let catalog_section =
             catalog_section::CatalogSection::new(Arc::new(Catalog::new()), overlay, || 0);
@@ -1780,6 +1782,11 @@ impl GrafeoDB {
         // handing the mapping over means the store is built without a
         // heap copy of the file at all.
         //
+        // A current-version section checksums itself in pages and the
+        // store verifies each page as reads first touch it, so it is
+        // mapped without hashing it whole; an older section is hashed
+        // whole through `mmap_section`, as it always was.
+        //
         // Two reasons to fall back to `read_section_data`:
         //
         // * encryption — `mmap_section` exposes ciphertext and does not
@@ -1792,7 +1799,16 @@ impl GrafeoDB {
         //   reports the same error if the section really is corrupt.
         if compact_base_mmap_enabled()
             && !fm.section_encryption_enabled()
-            && let Ok(mapping) = fm.mmap_section(entry)
+            && let Ok(paged) = fm.mmap_paged_section(entry)
+            && let Ok(mapping) =
+                if grafeo_core::graph::compact::section::CompactStoreSection::is_page_checksummed(
+                    paged.as_bytes(),
+                ) {
+                    Ok(paged)
+                } else {
+                    drop(paged);
+                    fm.mmap_section(entry)
+                }
         {
             let bytes = bytes::Bytes::from_owner(mapping);
             let mut section = grafeo_core::graph::compact::section::CompactStoreSection::empty();
@@ -2690,6 +2706,23 @@ impl GrafeoDB {
     #[must_use]
     pub fn compact_base_is_mmap_backed(&self) -> bool {
         self.compact_base_mmap.lock().is_some()
+    }
+
+    /// The first page checksum failure a read of the compact base found,
+    /// if any.
+    ///
+    /// A sealed compact base is read in place and verified page by page as
+    /// reads first touch it, so corruption surfaces at the read that finds
+    /// it rather than at open. That read returns nothing for the corrupt
+    /// page; a caller that must tell a refused read from an empty one
+    /// checks this after reading.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    #[must_use]
+    pub fn compact_base_integrity_fault(&self) -> Option<String> {
+        self.layered_store
+            .as_ref()?
+            .base_store_arc()
+            .integrity_fault()
     }
 
     /// Returns the query cache.

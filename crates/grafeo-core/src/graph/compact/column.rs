@@ -12,6 +12,7 @@ use bytes::{Bytes, BytesMut};
 use grafeo_common::memory::heap::vec_bytes;
 use grafeo_common::types::Value;
 
+use crate::codec::pages::SectionPages;
 use crate::codec::{BitPackedInts, BitVector, BlockEntry, DictionaryEncoding, SectionSpan};
 
 // ── Phase 3a: Bytes-backed read helpers ──────────────────────────────
@@ -870,10 +871,9 @@ impl ColumnCodec {
             }
             Self::Dict(dict) => {
                 buf.push(1); // discriminant
-                let dict_entries = dict.dictionary();
-                write_usize_as_u32(buf, dict_entries.len());
-                for entry in dict_entries.iter() {
-                    let s = entry.as_ref().as_bytes();
+                write_usize_as_u32(buf, dict.dictionary_size());
+                for entry in dict.entries() {
+                    let s = entry.as_bytes();
                     write_usize_as_u32(buf, s.len());
                     buf.extend_from_slice(s);
                 }
@@ -1092,7 +1092,7 @@ impl ColumnCodec {
     /// (the section format's hard limit), so this is unreachable for
     /// any column built through the public APIs.
     pub fn write_to_v2(&self, buf: &mut Vec<u8>) {
-        let (metas, bodies) = self.emit_blocked_codec(buf);
+        let (metas, bodies) = self.emit_blocked_codec(buf, true);
         write_block_index_and_bodies(buf, &metas, &bodies);
     }
 
@@ -1108,7 +1108,19 @@ impl ColumnCodec {
     ///
     /// Same conditions as [`write_to_v2`](Self::write_to_v2).
     pub fn write_to_v3(&self, buf: &mut Vec<u8>, stats_hint: Option<&[super::zone_map::ZoneMap]>) {
-        let (metas, bodies) = self.emit_blocked_codec(buf);
+        self.write_blocked(buf, stats_hint, true);
+    }
+
+    /// Writes the v3 block layout; a Dict column's entries go inline only
+    /// when `inline_dictionary` is set, and are otherwise written apart by
+    /// [`write_dictionary_regions`].
+    pub(crate) fn write_blocked(
+        &self,
+        buf: &mut Vec<u8>,
+        stats_hint: Option<&[super::zone_map::ZoneMap]>,
+        inline_dictionary: bool,
+    ) {
+        let (metas, bodies) = self.emit_blocked_codec(buf, inline_dictionary);
         let computed;
         let stats: &[super::zone_map::ZoneMap] = match stats_hint {
             Some(hint) if hint.len() == metas.len() => hint,
@@ -1123,7 +1135,11 @@ impl ColumnCodec {
     /// Pushes the discriminant + global params for this codec into
     /// `buf`, then collects per-block bodies and metadata. Shared by
     /// `write_to_v2` and `write_to_v3`.
-    fn emit_blocked_codec(&self, buf: &mut Vec<u8>) -> (Vec<BlockMeta>, Vec<u8>) {
+    fn emit_blocked_codec(
+        &self,
+        buf: &mut Vec<u8>,
+        inline_dictionary: bool,
+    ) -> (Vec<BlockMeta>, Vec<u8>) {
         let block_count = self.block_count();
         let block_rows = crate::codec::DEFAULT_BLOCK_ROWS as usize;
         let mut bodies: Vec<u8> = Vec::new();
@@ -1159,12 +1175,13 @@ impl ColumnCodec {
             }
             Self::Dict(dict) => {
                 buf.push(1);
-                let entries = dict.dictionary();
-                write_usize_as_u32(buf, entries.len());
-                for entry in entries.iter() {
-                    let s = entry.as_ref().as_bytes();
-                    write_usize_as_u32(buf, s.len());
-                    buf.extend_from_slice(s);
+                if inline_dictionary {
+                    write_usize_as_u32(buf, dict.dictionary_size());
+                    for entry in dict.entries() {
+                        let s = entry.as_bytes();
+                        write_usize_as_u32(buf, s.len());
+                        buf.extend_from_slice(s);
+                    }
                 }
                 let codes_bytes = dict.codes_bytes();
                 let total_codes = dict.code_count();
@@ -1494,9 +1511,23 @@ impl ColumnCodec {
         data: &Bytes,
         pos: &mut usize,
     ) -> Result<(Self, Vec<super::zone_map::ZoneMap>), &'static str> {
+        Self::read_blocked(data, pos, None)
+    }
+
+    /// Reads the v3 block layout. With `mapped_dictionary`, a Dict column's
+    /// entries are not inline but served in place from those regions (see
+    /// [`write_dictionary_regions`]).
+    pub(crate) fn read_blocked(
+        data: &Bytes,
+        pos: &mut usize,
+        mapped_dictionary: Option<MappedDictionary>,
+    ) -> Result<(Self, Vec<super::zone_map::ZoneMap>), &'static str> {
         // Phase 3c: same `&Bytes` shape as `read_from_v2`. v3 differs
         // only in that the block index carries inline per-block stats.
         let bytes = data.as_ref();
+        if mapped_dictionary.is_some() && bytes.get(*pos) != Some(&1) {
+            return Err("dictionary regions name a column that is not dictionary-encoded");
+        }
         let discriminant = *bytes.get(*pos).ok_or("truncated codec discriminant")?;
         *pos += 1;
         match discriminant {
@@ -1535,6 +1566,30 @@ impl ColumnCodec {
                     Self::BitPacked(crate::codec::BitPackedInts::pack_with_bits(
                         &all_values,
                         bits,
+                    )),
+                    stats,
+                ))
+            }
+            1 if mapped_dictionary.is_some() => {
+                let (metas, stats, bodies_start) = read_block_index_v3(bytes, pos)?;
+                let total = total_bodies_len(&metas);
+                if bodies_start + total > bytes.len() {
+                    return Err("Dict bodies out of bounds");
+                }
+                let codes_bytes = data.slice(bodies_start..bodies_start + total);
+                *pos = bodies_start + total;
+                let MappedDictionary {
+                    entries,
+                    starts,
+                    pages,
+                } = mapped_dictionary.ok_or("dictionary regions missing")?;
+                Ok((
+                    Self::Dict(DictionaryEncoding::from_mapped_entries(
+                        entries,
+                        starts,
+                        pages,
+                        codes_bytes,
+                        total / 4,
                     )),
                     stats,
                 ))
@@ -1665,6 +1720,44 @@ impl ColumnCodec {
             Self::RawI64(store) => store.heap_bytes(section),
         }
     }
+}
+
+/// A dictionary served in place from a mapped section.
+pub(crate) struct MappedDictionary {
+    /// LE-u32-length-prefixed UTF-8 entries.
+    pub(crate) entries: Bytes,
+    /// One LE u32 offset per entry into `entries`.
+    pub(crate) starts: Bytes,
+    pub(crate) pages: Arc<SectionPages>,
+}
+
+/// Writes a Dict column's entries apart from its codes: `starts` receives
+/// one LE u32 offset per entry into `entries`, which receives each entry as
+/// a LE u32 byte length and its UTF-8 bytes.
+///
+/// # Errors
+///
+/// `Error::Internal` when the entries exceed the 4 GiB a u32 offset or
+/// length addresses.
+pub(crate) fn write_dictionary_regions(
+    dict: &DictionaryEncoding,
+    starts: &mut Vec<u8>,
+    entries: &mut Vec<u8>,
+) -> grafeo_common::utils::error::Result<()> {
+    let too_large = || {
+        grafeo_common::utils::error::Error::Internal(
+            "dictionary entries exceed the 4 GiB a section column addresses".into(),
+        )
+    };
+    for entry in dict.entries() {
+        let start = u32::try_from(entries.len()).map_err(|_| too_large())?;
+        let len = u32::try_from(entry.len()).map_err(|_| too_large())?;
+        starts.extend_from_slice(&start.to_le_bytes());
+        entries.extend_from_slice(&len.to_le_bytes());
+        entries.extend_from_slice(entry.as_bytes());
+    }
+    u32::try_from(entries.len()).map_err(|_| too_large())?;
+    Ok(())
 }
 
 // ── v2 block-index helpers ──────────────────────────────────────
