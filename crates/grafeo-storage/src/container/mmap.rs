@@ -45,7 +45,8 @@ impl MmapSection {
     /// Creates a new `MmapSection`.
     ///
     /// Called internally by `GrafeoFileManager::mmap_section()` after
-    /// CRC verification.
+    /// CRC verification, and by `mmap_paged_section()` for a payload that
+    /// verifies itself page by page.
     pub(crate) fn new(mmap: memmap2::Mmap, section_type: SectionType, checksum: u32) -> Self {
         Self {
             mmap,
@@ -66,7 +67,9 @@ impl MmapSection {
         self.section_type
     }
 
-    /// The CRC-32 checksum of the section data (verified on creation).
+    /// The section directory's CRC-32 of the section data. `mmap_section`
+    /// verifies it on creation; `mmap_paged_section` leaves verification
+    /// to the payload's own page checksums.
     #[must_use]
     pub fn checksum(&self) -> u32 {
         self.checksum

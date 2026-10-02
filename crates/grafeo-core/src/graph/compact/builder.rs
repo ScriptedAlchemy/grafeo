@@ -986,12 +986,7 @@ pub fn from_graph_store_preserving_ids(
 
     let labels = store.all_labels();
     if labels.is_empty() {
-        compact.set_id_maps(
-            FxHashMap::default(),
-            FxHashMap::default(),
-            Vec::new(),
-            Vec::new(),
-        );
+        compact.set_id_maps(Vec::new(), Vec::new());
         return Ok(compact);
     }
 
@@ -1087,7 +1082,6 @@ pub fn from_graph_store_preserving_ids(
     // destination here would reorder equal-source edges relative to the CSR,
     // attaching each preserved EdgeId to another edge's native endpoints.
     let num_rel_tables = compact.rel_tables_by_id.len();
-    let mut edge_id_map: FxHashMap<grafeo_common::types::EdgeId, (u16, u64)> = FxHashMap::default();
     let mut edge_offset_to_id: Vec<Vec<grafeo_common::types::EdgeId>> =
         vec![Vec::new(); num_rel_tables];
 
@@ -1099,7 +1093,6 @@ pub fn from_graph_store_preserving_ids(
 
         let rev = &mut edge_offset_to_id[rel_table_id as usize];
         for (csr_pos, (original_eid, _src, _dst)) in entries.iter().enumerate() {
-            edge_id_map.insert(*original_eid, (rel_table_id, csr_pos as u64));
             while rev.len() <= csr_pos {
                 rev.push(grafeo_common::types::EdgeId::INVALID);
             }
@@ -1107,12 +1100,7 @@ pub fn from_graph_store_preserving_ids(
         }
     }
 
-    compact.set_id_maps(
-        node_id_map,
-        edge_id_map,
-        node_offset_to_id,
-        edge_offset_to_id,
-    );
+    compact.set_id_maps(node_offset_to_id, edge_offset_to_id);
     Ok(compact)
 }
 
@@ -1667,20 +1655,14 @@ impl IncrementalCompactStoreBuilder {
         // order; the source-sorted (stable) order is the forward CSR order
         // `CompactStoreBuilder::build` produces, so each edge id maps to the
         // position its endpoints occupy.
-        let mut edge_id_map: FxHashMap<grafeo_common::types::EdgeId, (u16, u64)> =
-            FxHashMap::default();
-        edge_id_map.reserve(self.edge_ids.len());
         let rel_tables = std::mem::take(&mut self.rel_tables);
         let mut edge_offset_to_id: Vec<Vec<grafeo_common::types::EdgeId>> =
             Vec::with_capacity(rel_tables.len());
         for (index, table) in rel_tables.into_iter().enumerate() {
-            let rel_table_id = table_id(index, "relationship")?;
+            table_id(index, "relationship")?;
             let (order, pairs) = csr_order(&table.edges);
             let ids: Vec<grafeo_common::types::EdgeId> =
                 order.iter().map(|&row| table.edges[row].0).collect();
-            for (position, id) in ids.iter().enumerate() {
-                edge_id_map.insert(*id, (rel_table_id, position as u64));
-            }
             edge_offset_to_id.push(ids);
             let mut r = RelTableBuilder::new(
                 table.edge_type,
@@ -1696,24 +1678,14 @@ impl IncrementalCompactStoreBuilder {
         }
 
         let mut compact = builder.build()?;
-
-        let mut node_id_map: FxHashMap<grafeo_common::types::NodeId, (u16, u64)> =
-            FxHashMap::default();
-        node_id_map.reserve(self.node_positions.len());
-        for (index, ids) in node_ids.iter().enumerate() {
-            let table_id = table_id(index, "node")?;
-            for (offset, id) in ids.iter().enumerate() {
-                node_id_map.insert(*id, (table_id, offset as u64));
-            }
-        }
-
-        compact.set_id_maps(node_id_map, edge_id_map, node_ids, edge_offset_to_id);
+        compact.set_id_maps(node_ids, edge_offset_to_id);
         Ok(compact)
     }
 
     /// Streams the rows as a CompactStore section into `sink`: byte for
-    /// byte what serializing [`finish`](Self::finish)'s store writes, at
-    /// the current section version, without building that store.
+    /// byte what serializing [`finish`](Self::finish)'s store writes once
+    /// `indexed_properties` are enabled on it, at the current section
+    /// version, without building that store.
     ///
     /// Each column is decoded, encoded, written, and dropped before the
     /// next, and each relationship table's adjacency is built only while
@@ -1727,6 +1699,7 @@ impl IncrementalCompactStoreBuilder {
     pub fn write_section(
         mut self,
         sink: &mut dyn std::io::Write,
+        indexed_properties: &[PropertyKey],
     ) -> grafeo_common::utils::error::Result<()> {
         let internal = |error: CompactStoreError| {
             grafeo_common::utils::error::Error::Internal(format!(
@@ -1737,26 +1710,30 @@ impl IncrementalCompactStoreBuilder {
         table_id(self.node_tables.len().saturating_sub(1), "node").map_err(internal)?;
         table_id(self.rel_tables.len().saturating_sub(1), "relationship").map_err(internal)?;
 
-        let mut stream =
-            super::section::SectionStream::begin(sink, super::section::FORMAT_VERSION, true);
+        let mut writer = super::section::SectionWriter::begin(sink, true)?;
         let node_tables = std::mem::take(&mut self.node_tables);
         let mut node_ids = Vec::with_capacity(node_tables.len());
-        stream.write_len(node_tables.len())?;
+        writer.count(node_tables.len())?;
         for table in node_tables {
             let rows = table.node_ids.len();
             let columns = columns_by_key(table.columns);
-            stream.node_table(table.label_key.as_str(), rows, columns.len())?;
+            writer.node_table(table.label_key.as_str(), rows, columns.len())?;
             for (key, column) in columns {
                 let values = self.spool.read(column, rows).map_err(internal)?;
                 let (codec, zone_map, nulls) = encode_inferred_column(&values);
                 drop(values);
                 let block_zone_maps = super::zone_map::compute_block_zone_maps(&codec);
-                stream.node_column(
+                let order = indexed_properties
+                    .contains(&key)
+                    .then(|| super::value_order::build_row_order(&codec, nulls.as_ref()))
+                    .flatten();
+                writer.node_column(
                     &key,
                     zone_map.as_ref(),
                     nulls.as_ref(),
                     &codec,
                     Some(&block_zone_maps),
+                    order.as_ref(),
                 )?;
             }
             node_ids.push(table.node_ids);
@@ -1764,13 +1741,18 @@ impl IncrementalCompactStoreBuilder {
 
         let rel_tables = std::mem::take(&mut self.rel_tables);
         let mut edge_entries: Vec<(u64, u16, u64)> = Vec::with_capacity(self.edge_ids.len());
-        stream.write_len(rel_tables.len())?;
+        let mut edge_positions: Vec<Vec<u64>> = Vec::with_capacity(rel_tables.len());
+        writer.count(rel_tables.len())?;
         for (index, table) in rel_tables.into_iter().enumerate() {
             let rel_table_id = table_id(index, "relationship").map_err(internal)?;
             let (order, pairs) = csr_order(&table.edges);
+            let mut positions = Vec::with_capacity(order.len());
             for (position, &row) in order.iter().enumerate() {
-                edge_entries.push((table.edges[row].0.as_u64(), rel_table_id, position as u64));
+                let id = table.edges[row].0.as_u64();
+                edge_entries.push((id, rel_table_id, position as u64));
+                positions.push(id);
             }
+            edge_positions.push(positions);
             let (fwd, bwd) = rel_adjacency(
                 &pairs,
                 node_ids[table.src_table].len(),
@@ -1780,7 +1762,7 @@ impl IncrementalCompactStoreBuilder {
             .map_err(internal)?;
             drop(pairs);
             let columns = columns_by_key(table.columns);
-            stream.rel_table(
+            writer.rel_table(
                 table.edge_type.as_str(),
                 table_id(table.src_table, "node").map_err(internal)?,
                 table_id(table.dst_table, "node").map_err(internal)?,
@@ -1798,7 +1780,7 @@ impl IncrementalCompactStoreBuilder {
                 );
                 let (codec, _zone_map, nulls) = encode_inferred_column(&values);
                 drop(values);
-                stream.rel_column(&key, nulls.as_ref(), &codec)?;
+                writer.rel_column(&key, nulls.as_ref(), &codec)?;
             }
         }
 
@@ -1811,13 +1793,23 @@ impl IncrementalCompactStoreBuilder {
                     .map(|(offset, id)| (id.as_u64(), table_id, offset as u64)),
             );
         }
-        drop(node_ids);
         node_entries.sort_unstable_by_key(|&(id, _, _)| id);
-        stream.id_map(&node_entries)?;
+        writer.id_records(&node_entries)?;
         drop(node_entries);
+        writer.count(node_ids.len())?;
+        for ids in &node_ids {
+            let ids: Vec<u64> = ids.iter().map(|id| id.as_u64()).collect();
+            writer.reverse_ids(&ids)?;
+        }
+        drop(node_ids);
         edge_entries.sort_unstable_by_key(|&(id, _, _)| id);
-        stream.id_map(&edge_entries)?;
-        stream.finish()
+        writer.id_records(&edge_entries)?;
+        drop(edge_entries);
+        writer.count(edge_positions.len())?;
+        for ids in &edge_positions {
+            writer.reverse_ids(ids)?;
+        }
+        writer.finish()
     }
 }
 
@@ -3881,7 +3873,7 @@ mod tests {
 
     fn streamed_bytes(builder: IncrementalCompactStoreBuilder) -> Vec<u8> {
         let mut bytes = Vec::new();
-        builder.write_section(&mut bytes).unwrap();
+        builder.write_section(&mut bytes, &[]).unwrap();
         bytes
     }
 
@@ -3975,6 +3967,45 @@ mod tests {
         assert_eq!(section_bytes(spooled_store), resident);
     }
 
+    /// A section streamed with indexed properties is the finished store's
+    /// section once those properties are enabled on it, and the store read
+    /// back serves the lookups from the stored order without building one.
+    #[test]
+    fn streamed_indexed_properties_reopen_already_indexed() {
+        use grafeo_common::storage::Section;
+
+        let indexed = [PropertyKey::new("identity"), PropertyKey::new("sparse")];
+        let mut streamed = Vec::new();
+        wide_builder(IncrementalCompactStoreBuilder::new())
+            .write_section(&mut streamed, &indexed)
+            .unwrap();
+        let resident = wide_builder(IncrementalCompactStoreBuilder::new())
+            .finish()
+            .unwrap();
+        resident.enable_property_indexes(indexed.iter().cloned());
+        assert_eq!(streamed, section_bytes(resident));
+
+        let mut restored = super::super::section::CompactStoreSection::empty();
+        restored.deserialize(&streamed).unwrap();
+        let store = restored.store().unwrap();
+        let mut keys = store.indexed_property_keys();
+        keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(keys, indexed.to_vec());
+        let identity = Value::from(format!("entity:{:06}:{}", 1_234, "x".repeat(40)));
+        assert_eq!(
+            store.find_nodes_by_property("identity", &identity),
+            vec![NodeId(1_234)]
+        );
+        assert_eq!(
+            store.find_nodes_by_property("sparse", &Value::Int64(2_100)),
+            vec![NodeId(2_100)]
+        );
+        assert_eq!(
+            store.find_nodes_by_property("sparse", &Value::Int64(2_101)),
+            Vec::<NodeId>::new()
+        );
+    }
+
     /// A key repeated within one row keeps its first value, as the
     /// null-padded column form did.
     #[test]
@@ -4041,7 +4072,7 @@ mod tests {
         builder
             .push_node(NodeId(1), [label.as_str()], std::iter::empty())
             .unwrap();
-        let err = builder.write_section(&mut Vec::new()).unwrap_err();
+        let err = builder.write_section(&mut Vec::new(), &[]).unwrap_err();
         assert!(
             err.to_string()
                 .contains("compact store name length: 65536 exceeds the storage format limit"),
@@ -4055,7 +4086,8 @@ mod tests {
         use grafeo_common::storage::Section;
         let mut builder = IncrementalCompactStoreBuilder::new();
         fixture_builder(&mut builder);
-        let mut section = super::super::section::IncrementalCompactStoreSection::new(builder);
+        let mut section =
+            super::super::section::IncrementalCompactStoreSection::new(builder, Vec::new());
         assert!(section.is_dirty());
         assert_eq!(
             section.serialize().unwrap(),

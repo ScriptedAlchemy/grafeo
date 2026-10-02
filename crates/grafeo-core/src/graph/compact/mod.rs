@@ -19,6 +19,7 @@ mod graph_store_impl;
 mod heap;
 /// Node/edge ID encoding and decoding helpers.
 pub mod id;
+mod id_map;
 /// Two-layer store: columnar base + mutable LPG overlay.
 #[cfg(feature = "lpg")]
 pub mod layered;
@@ -32,6 +33,7 @@ pub mod schema;
 pub mod section;
 #[cfg(test)]
 mod tests;
+mod value_order;
 /// Zone maps for skip-pruning predicate evaluation.
 pub mod zone_map;
 
@@ -43,15 +45,18 @@ pub use builder::{
 use std::sync::Arc;
 
 use arcstr::ArcStr;
-use grafeo_common::types::{EdgeId, HashableValue, NodeId, PropertyKey};
+use grafeo_common::types::{EdgeId, NodeId, PropertyKey};
 use grafeo_common::utils::hash::FxHashMap;
 
 use grafeo_common::memory::heap::{arc_slice_bytes, arcstr_bytes, vec_bytes};
 
-use self::heap::{key_bytes, statistics_bytes, value_bytes};
+use self::heap::{key_bytes, statistics_bytes};
+use self::id_map::IdMap;
 use self::node_table::NodeTable;
 use self::rel_table::RelTable;
+use self::value_order::{RowOrder, build_row_order};
 use crate::codec::SectionSpan;
+use crate::codec::pages::SectionPages;
 use crate::graph::Direction;
 use crate::statistics::Statistics;
 
@@ -82,41 +87,36 @@ pub struct CompactStore {
     statistics: Arc<Statistics>,
 
     // ── ID-preserving maps (for layered store integration) ──────────
-    /// Maps original `NodeId` to (table_id, row_offset). Present when the
-    /// store was built with [`from_graph_store_preserving_ids`].
-    node_id_map: Option<FxHashMap<NodeId, (u16, u64)>>,
-    /// Maps original `EdgeId` to (rel_table_id, csr_position).
-    edge_id_map: Option<FxHashMap<EdgeId, (u16, u64)>>,
-    /// Reverse: table_id index -> vec of original `NodeId` per row offset.
-    node_offset_to_id: Option<Vec<Vec<NodeId>>>,
-    /// Reverse: rel_table_id index -> vec of original `EdgeId` per CSR position.
-    edge_offset_to_id: Option<Vec<Vec<EdgeId>>>,
-    /// Highest preserved `NodeId`, cached from `node_id_map` at the point
-    /// the maps are attached. `None` when not ID-preserving or empty.
-    max_node_id: Option<NodeId>,
-    /// Highest preserved `EdgeId`. See [`max_node_id`](Self::max_node_id).
-    max_edge_id: Option<EdgeId>,
+    /// Original `NodeId`s and their (table_id, row_offset). Present when
+    /// the store preserves the ids of the store it was built from.
+    node_ids: Option<IdMap>,
+    /// Original `EdgeId`s and their (rel_table_id, csr_position).
+    edge_ids: Option<IdMap>,
 
-    /// Hash indexes over node property values: for each indexed property,
-    /// value to the original `NodeId`s that carry it.
+    /// Indexed node properties: for each, every table carrying the
+    /// property with its rows in value order.
     ///
     /// Purely an accelerator for
     /// [`find_nodes_by_property`](crate::graph::traits::GraphStoreSearch::find_nodes_by_property),
     /// which otherwise zone-map-prunes and then scans the surviving
     /// columns — linear in the table, and orders of magnitude slower than
-    /// the `LpgStore` property index it replaces after a compaction.
-    /// Derived entirely from the columns, so it is never serialized; the
-    /// engine re-declares the indexed properties after a reload.
+    /// the `LpgStore` property index it replaces after a compaction. A
+    /// section stores each order beside its column, so a reopened store
+    /// serves them in place.
     property_value_indexes: parking_lot::RwLock<FxHashMap<PropertyKey, Arc<PropertyValueIndex>>>,
 
     /// The section buffer a deserialized store's column bodies are views
     /// into; empty for a store built in memory.
     section: SectionSpan,
+    /// Page checksums of the mapped section the store reads in place,
+    /// verified as reads first touch each page.
+    pages: Option<Arc<SectionPages>>,
 }
 
-/// One property's value-to-nodes map. See
+/// One property's index: `(table_id, rows in value order)` for every node
+/// table carrying the property. See
 /// [`CompactStore::enable_property_indexes`].
-type PropertyValueIndex = FxHashMap<HashableValue, Vec<NodeId>>;
+type PropertyValueIndex = Vec<(u16, RowOrder)>;
 
 impl std::fmt::Debug for CompactStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -179,14 +179,11 @@ impl CompactStore {
             src_rel_table_ids,
             dst_rel_table_ids,
             statistics: Arc::new(statistics),
-            node_id_map: None,
-            edge_id_map: None,
-            node_offset_to_id: None,
-            edge_offset_to_id: None,
-            max_node_id: None,
-            max_edge_id: None,
+            node_ids: None,
+            edge_ids: None,
             property_value_indexes: parking_lot::RwLock::new(FxHashMap::default()),
             section: SectionSpan::default(),
+            pages: None,
         }
     }
 
@@ -343,26 +340,58 @@ impl CompactStore {
     /// [`from_graph_store_preserving_ids`]).
     #[must_use]
     pub fn preserves_ids(&self) -> bool {
-        self.node_id_map.is_some()
+        self.node_ids.is_some()
     }
 
-    /// Attaches ID maps to an already-built `CompactStore`.
+    /// Attaches ID maps from each table's position-ordered original ids.
+    /// `NodeId::INVALID` / `EdgeId::INVALID` positions are padding.
     pub(crate) fn set_id_maps(
         &mut self,
-        node_id_map: FxHashMap<NodeId, (u16, u64)>,
-        edge_id_map: FxHashMap<EdgeId, (u16, u64)>,
-        node_offset_to_id: Vec<Vec<NodeId>>,
-        edge_offset_to_id: Vec<Vec<EdgeId>>,
+        node_positions: Vec<Vec<NodeId>>,
+        edge_positions: Vec<Vec<EdgeId>>,
     ) {
-        // Cache the high-water marks while the maps are in hand: the
-        // layered overlay reads them on every open to seed its allocator,
-        // and re-scanning a million-entry map there is pure waste.
-        self.max_node_id = node_id_map.keys().copied().max();
-        self.max_edge_id = edge_id_map.keys().copied().max();
-        self.node_id_map = Some(node_id_map);
-        self.edge_id_map = Some(edge_id_map);
-        self.node_offset_to_id = Some(node_offset_to_id);
-        self.edge_offset_to_id = Some(edge_offset_to_id);
+        let node_positions = node_positions
+            .into_iter()
+            .map(|ids| ids.iter().map(NodeId::as_u64).collect())
+            .collect();
+        let edge_positions = edge_positions
+            .into_iter()
+            .map(|ids| ids.iter().map(EdgeId::as_u64).collect())
+            .collect();
+        self.attach_id_maps(
+            IdMap::from_positions(node_positions, NodeId::INVALID.as_u64()),
+            IdMap::from_positions(edge_positions, EdgeId::INVALID.as_u64()),
+        );
+    }
+
+    pub(crate) fn attach_id_maps(&mut self, node_ids: IdMap, edge_ids: IdMap) {
+        self.node_ids = Some(node_ids);
+        self.edge_ids = Some(edge_ids);
+    }
+
+    pub(crate) fn id_maps(&self) -> Option<(&IdMap, &IdMap)> {
+        Some((self.node_ids.as_ref()?, self.edge_ids.as_ref()?))
+    }
+
+    /// The first page checksum failure a read of this store's mapped
+    /// section found, if any.
+    ///
+    /// A store read in place from a sealed section verifies each page the
+    /// first time a read touches it. A read that lands on a corrupt page
+    /// returns nothing for that page; this is where its holder learns the
+    /// read was refused rather than empty.
+    #[must_use]
+    pub fn integrity_fault(&self) -> Option<String> {
+        self.pages.as_ref()?.fault().map(str::to_owned)
+    }
+
+    /// Page checksum progress of the mapped section the store reads in
+    /// place: `(verified pages, total pages)`, or `None` for a store that
+    /// is not read in place from a paged section.
+    #[must_use]
+    pub fn verified_pages(&self) -> Option<(usize, usize)> {
+        let pages = self.pages.as_ref()?;
+        Some((pages.verified_pages(), pages.page_count()))
     }
 
     /// Returns the highest `NodeId` the base owns, or `None` when it holds
@@ -373,8 +402,8 @@ impl CompactStore {
     /// tombstone — a base row.
     #[must_use]
     pub fn max_node_id(&self) -> Option<NodeId> {
-        if self.preserves_ids() {
-            return self.max_node_id;
+        if let Some(ids) = &self.node_ids {
+            return ids.max_id().map(NodeId::new);
         }
         // Synthetic IDs: the largest one a table owns is its last row.
         self.node_tables_by_id
@@ -388,22 +417,26 @@ impl CompactStore {
             .max()
     }
 
-    /// Declares which node properties should be served from a hash index,
-    /// building each one now.
+    /// Declares which node properties should be served from an index,
+    /// building each one not already indexed now.
     ///
     /// Mirrors [`LpgStore::create_property_index`](crate::graph::lpg::LpgStore::create_property_index):
     /// the engine calls this with the source store's indexed properties
     /// after a compaction, and again after a reload, so an indexed lookup
-    /// stays O(1) once the rows move into the columnar base instead of
-    /// falling back to a column scan.
+    /// stays a binary search once the rows move into the columnar base
+    /// instead of falling back to a column scan.
     ///
-    /// Re-declaring a property rebuilds it. Properties no table carries
-    /// are ignored.
+    /// The columns are immutable, so an index already present (built here
+    /// or read with the section) is kept as is. Properties no table carries
+    /// in an orderable column are ignored.
     pub fn enable_property_indexes<I>(&self, keys: I)
     where
         I: IntoIterator<Item = PropertyKey>,
     {
         for key in keys {
+            if self.property_value_indexes.read().contains_key(&key) {
+                continue;
+            }
             let Some(index) = self.build_property_value_index(&key) else {
                 continue;
             };
@@ -411,6 +444,17 @@ impl CompactStore {
                 .write()
                 .insert(key, Arc::new(index));
         }
+    }
+
+    /// Installs indexes a section stored beside their columns.
+    pub(crate) fn attach_property_indexes(
+        &mut self,
+        indexes: FxHashMap<PropertyKey, PropertyValueIndex>,
+    ) {
+        *self.property_value_indexes.get_mut() = indexes
+            .into_iter()
+            .map(|(key, index)| (key, Arc::new(index)))
+            .collect();
     }
 
     /// Drops the hash index for `key`, returning whether one existed.
@@ -437,34 +481,20 @@ impl CompactStore {
         self.property_value_indexes.read().get(key).cloned()
     }
 
-    /// Groups every row that carries `key` by its value.
+    /// Orders the rows of every table carrying `key` by value.
     ///
-    /// Returns `None` when no table has a column for the property, so a
-    /// stale index name costs nothing.
+    /// Returns `None` when no table has an orderable column for the
+    /// property, so a stale index name costs nothing.
     fn build_property_value_index(&self, key: &PropertyKey) -> Option<PropertyValueIndex> {
-        let mut any_column = false;
-        let mut index: PropertyValueIndex = FxHashMap::default();
-
-        for nt in &self.node_tables_by_id {
-            let Some(col) = nt.column(key) else { continue };
-            any_column = true;
-            let table_id = nt.table_id();
-            for offset in 0..col.len() {
-                if nt.is_null(offset, key) {
-                    continue;
-                }
-                let Some(value) = col.get(offset) else {
-                    continue;
-                };
-                let node_id = self.to_original_node_id(id::encode_node_id(table_id, offset as u64));
-                index
-                    .entry(HashableValue::new(value))
-                    .or_default()
-                    .push(node_id);
-            }
-        }
-
-        any_column.then_some(index)
+        let index: PropertyValueIndex = self
+            .node_tables_by_id
+            .iter()
+            .filter_map(|nt| {
+                let order = build_row_order(nt.column(key)?, nt.null_mask(key))?;
+                Some((nt.table_id(), order))
+            })
+            .collect();
+        (!index.is_empty()).then_some(index)
     }
 
     /// Returns the highest `EdgeId` the base owns, or `None` when it holds
@@ -473,8 +503,8 @@ impl CompactStore {
     /// See [`max_node_id`](Self::max_node_id).
     #[must_use]
     pub fn max_edge_id(&self) -> Option<EdgeId> {
-        if self.preserves_ids() {
-            return self.max_edge_id;
+        if let Some(ids) = &self.edge_ids {
+            return ids.max_id().map(EdgeId::new);
         }
         self.rel_tables_by_id
             .iter()
@@ -493,8 +523,8 @@ impl CompactStore {
     /// Otherwise, decodes the compact-encoded bits.
     #[inline]
     pub(crate) fn resolve_node(&self, id: NodeId) -> Option<(u16, u64)> {
-        if let Some(ref map) = self.node_id_map {
-            map.get(&id).copied()
+        if let Some(ref map) = self.node_ids {
+            map.resolve(id.as_u64())
         } else {
             Some(id::decode_node_id(id))
         }
@@ -503,8 +533,8 @@ impl CompactStore {
     /// Resolves an input `EdgeId` to (rel_table_id, csr_position).
     #[inline]
     pub(crate) fn resolve_edge(&self, id: EdgeId) -> Option<(u16, u64)> {
-        if let Some(ref map) = self.edge_id_map {
-            map.get(&id).copied()
+        if let Some(ref map) = self.edge_ids {
+            map.resolve(id.as_u64())
         } else {
             Some(id::decode_edge_id(id))
         }
@@ -514,13 +544,10 @@ impl CompactStore {
     /// back to the original preserved ID. No-op when not ID-preserving.
     #[inline]
     pub(crate) fn to_original_node_id(&self, compact_id: NodeId) -> NodeId {
-        if let Some(ref offsets) = self.node_offset_to_id {
+        if let Some(ref map) = self.node_ids {
             let (table_id, offset) = id::decode_node_id(compact_id);
-            offsets
-                .get(table_id as usize)
-                .and_then(|v| v.get(usize::try_from(offset).ok()?))
-                .copied()
-                .unwrap_or(compact_id)
+            map.original(table_id, offset)
+                .map_or(compact_id, NodeId::new)
         } else {
             compact_id
         }
@@ -529,20 +556,17 @@ impl CompactStore {
     /// Translates a compact-encoded `EdgeId` back to the original preserved ID.
     #[inline]
     pub(crate) fn to_original_edge_id(&self, compact_id: EdgeId) -> EdgeId {
-        if let Some(ref offsets) = self.edge_offset_to_id {
+        if let Some(ref map) = self.edge_ids {
             let (rel_table_id, csr_pos) = id::decode_edge_id(compact_id);
-            offsets
-                .get(rel_table_id as usize)
-                .and_then(|v| v.get(usize::try_from(csr_pos).ok()?))
-                .copied()
-                .unwrap_or(compact_id)
+            map.original(rel_table_id, csr_pos)
+                .map_or(compact_id, EdgeId::new)
         } else {
             compact_id
         }
     }
 
-    /// Heap bytes of the property hash indexes: the index map, each index's
-    /// shared allocation and table, and every value key and id list.
+    /// Heap bytes of the property indexes: the index map, each index's
+    /// shared allocation and table list, and every in-memory row order.
     fn property_index_heap_bytes(&self) -> usize {
         let indexes = self.property_value_indexes.read();
         indexes.allocation_size()
@@ -551,28 +575,17 @@ impl CompactStore {
                 .map(|(key, index)| {
                     key_bytes(key)
                         + arc_slice_bytes::<PropertyValueIndex>(1)
-                        + index.allocation_size()
+                        + vec_bytes(index.as_ref())
                         + index
                             .iter()
-                            .map(|(value, ids)| value_bytes(&value.0) + vec_bytes(ids))
+                            .map(|(_, order)| order.heap_bytes())
                             .sum::<usize>()
                 })
                 .sum::<usize>()
     }
 
     fn id_map_heap_bytes(&self) -> usize {
-        self.node_id_map
-            .as_ref()
-            .map_or(0, FxHashMap::allocation_size)
-            + self
-                .edge_id_map
-                .as_ref()
-                .map_or(0, FxHashMap::allocation_size)
-            + self.node_offset_to_id.as_ref().map_or(0, |offsets| {
-                vec_bytes(offsets) + offsets.iter().map(vec_bytes).sum::<usize>()
-            })
-            + self.edge_offset_to_id.as_ref().map_or(0, |offsets| {
-                vec_bytes(offsets) + offsets.iter().map(vec_bytes).sum::<usize>()
-            })
+        self.node_ids.as_ref().map_or(0, IdMap::heap_bytes)
+            + self.edge_ids.as_ref().map_or(0, IdMap::heap_bytes)
     }
 }

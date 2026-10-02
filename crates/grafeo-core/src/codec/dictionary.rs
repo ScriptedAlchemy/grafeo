@@ -28,6 +28,7 @@ use bytes::{Bytes, BytesMut};
 use grafeo_common::memory::heap::{arc_slice_bytes, arc_str_bytes, vec_bytes};
 
 use super::SectionSpan;
+use super::pages::SectionPages;
 
 /// Reads an LE u32 at byte offset `idx * 4`. Returns `None` if out of range.
 #[inline]
@@ -154,6 +155,86 @@ impl NullBitmap {
     }
 }
 
+/// The unique strings of a dictionary.
+#[derive(Debug, Clone)]
+enum DictEntries {
+    Inline(Arc<[Arc<str>]>),
+    /// Entries in place in a mapped section: `starts` holds one LE u32
+    /// offset per entry into `entries`, where each entry is a LE u32 byte
+    /// length followed by its UTF-8 bytes. Each read verifies the pages it
+    /// touches.
+    Mapped {
+        entries: Bytes,
+        starts: Bytes,
+        pages: Arc<SectionPages>,
+    },
+}
+
+impl DictEntries {
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline(entries) => entries.len(),
+            Self::Mapped { starts, .. } => starts.len() / 4,
+        }
+    }
+
+    fn get(&self, code: usize) -> Option<&str> {
+        match self {
+            Self::Inline(entries) => entries.get(code).map(AsRef::as_ref),
+            Self::Mapped {
+                entries,
+                starts,
+                pages,
+            } => {
+                let at = code.checked_mul(4)?;
+                let start_bytes = starts.get(at..at + 4)?;
+                if !pages.verify_slice(start_bytes) {
+                    return None;
+                }
+                let start = u32::from_le_bytes(start_bytes.try_into().ok()?) as usize;
+                let Some(len_bytes) = entries.get(start..start + 4) else {
+                    pages.latch(format!("dictionary entry {code} starts past its region"));
+                    return None;
+                };
+                if !pages.verify_slice(len_bytes) {
+                    return None;
+                }
+                let len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
+                let Some(bytes) = entries.get(start + 4..start + 4 + len) else {
+                    pages.latch(format!("dictionary entry {code} ends past its region"));
+                    return None;
+                };
+                if !pages.verify_slice(bytes) {
+                    return None;
+                }
+                match std::str::from_utf8(bytes) {
+                    Ok(entry) => Some(entry),
+                    Err(_) => {
+                        pages.latch(format!("dictionary entry {code} is not UTF-8"));
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        (0..self.len()).filter_map(|code| self.get(code))
+    }
+
+    fn heap_bytes(&self, section: &SectionSpan) -> usize {
+        match self {
+            Self::Inline(entries) => {
+                arc_slice_bytes::<Arc<str>>(entries.len())
+                    + entries.iter().map(arc_str_bytes).sum::<usize>()
+            }
+            Self::Mapped {
+                entries, starts, ..
+            } => section.owned_bytes(entries) + section.owned_bytes(starts),
+        }
+    }
+}
+
 /// Stores repeated strings efficiently by referencing them with integer codes.
 ///
 /// Each unique string appears once in the dictionary. Values are stored as
@@ -163,7 +244,7 @@ impl NullBitmap {
 #[derive(Debug, Clone)]
 pub struct DictionaryEncoding {
     /// The dictionary of unique strings.
-    dictionary: Arc<[Arc<str>]>,
+    dictionary: DictEntries,
     /// Encoded values: `Inline(Vec<u32>)` or `Mapped(Bytes)`.
     codes: CodeStore,
     /// Number of code values.
@@ -178,7 +259,7 @@ impl DictionaryEncoding {
     pub fn new(dictionary: Arc<[Arc<str>]>, codes: Vec<u32>) -> Self {
         let code_count = codes.len();
         Self {
-            dictionary,
+            dictionary: DictEntries::Inline(dictionary),
             codes: CodeStore::Inline(codes),
             code_count,
             null_bitmap: None,
@@ -195,7 +276,31 @@ impl DictionaryEncoding {
         code_count: usize,
     ) -> Self {
         Self {
-            dictionary,
+            dictionary: DictEntries::Inline(dictionary),
+            codes: CodeStore::Mapped(codes_bytes),
+            code_count,
+            null_bitmap: None,
+        }
+    }
+
+    /// Serves a dictionary in place from a mapped section: `entries` holds
+    /// LE-u32-length-prefixed UTF-8 entries, `starts` one LE u32 offset per
+    /// entry into `entries`, and `codes_bytes` `code_count` LE u32 codes.
+    /// Entry reads verify the pages they touch through `pages`.
+    #[must_use]
+    pub fn from_mapped_entries(
+        entries: Bytes,
+        starts: Bytes,
+        pages: Arc<SectionPages>,
+        codes_bytes: Bytes,
+        code_count: usize,
+    ) -> Self {
+        Self {
+            dictionary: DictEntries::Mapped {
+                entries,
+                starts,
+                pages,
+            },
             codes: CodeStore::Mapped(codes_bytes),
             code_count,
             null_bitmap: None,
@@ -233,8 +338,7 @@ impl DictionaryEncoding {
     /// bitmap own outside `section`.
     #[must_use]
     pub fn heap_bytes(&self, section: &SectionSpan) -> usize {
-        arc_slice_bytes::<Arc<str>>(self.dictionary.len())
-            + self.dictionary.iter().map(arc_str_bytes).sum::<usize>()
+        self.dictionary.heap_bytes(section)
             + self.codes.heap_bytes(section)
             + self
                 .null_bitmap
@@ -242,9 +346,15 @@ impl DictionaryEncoding {
                 .map_or(0, |bitmap| bitmap.heap_bytes(section))
     }
 
-    /// Returns the dictionary.
-    pub fn dictionary(&self) -> &Arc<[Arc<str>]> {
-        &self.dictionary
+    /// Returns the unique string with code `code`.
+    #[must_use]
+    pub fn entry(&self, code: usize) -> Option<&str> {
+        self.dictionary.get(code)
+    }
+
+    /// Iterates the unique strings in code order.
+    pub fn entries(&self) -> impl Iterator<Item = &str> {
+        self.dictionary.iter()
     }
 
     /// Returns the encoded codes as raw LE u32 bytes (always materialised).
@@ -313,7 +423,7 @@ impl DictionaryEncoding {
             return None;
         }
         let code = self.code_at(index)?;
-        self.dictionary.get(code as usize).map(|s| s.as_ref())
+        self.dictionary.get(code as usize)
     }
 
     /// Returns the code at the given index.
@@ -339,12 +449,12 @@ impl DictionaryEncoding {
         let original_size: usize = (0..self.code_count)
             .map(|i| {
                 let code = self.codes.code_at(i).unwrap_or(0) as usize;
-                self.dictionary.get(code).map_or(0, |s| s.len())
+                self.dictionary.get(code).map_or(0, str::len)
             })
             .sum();
 
         // Compressed size: dictionary + codes
-        let dict_size: usize = self.dictionary.iter().map(|s| s.len()).sum();
+        let dict_size: usize = self.dictionary.iter().map(str::len).sum();
         let codes_size = self.codes.byte_len();
         let compressed_size = dict_size + codes_size;
 
@@ -357,10 +467,9 @@ impl DictionaryEncoding {
 
     /// Encodes a lookup value into a code, if it exists in the dictionary.
     pub fn encode(&self, value: &str) -> Option<u32> {
-        self.dictionary
-            .iter()
-            .position(|s| s.as_ref() == value)
-            .and_then(|i| u32::try_from(i).ok())
+        (0..self.dictionary.len())
+            .find(|&code| self.dictionary.get(code) == Some(value))
+            .and_then(|code| u32::try_from(code).ok())
     }
 
     /// Rewrites individual dictionary entries in place.
@@ -374,15 +483,21 @@ impl DictionaryEncoding {
         if !self.dictionary.iter().any(|entry| f(entry).is_some()) {
             return;
         }
-        let remapped: Vec<Arc<str>> = self
-            .dictionary
-            .iter()
-            .map(|entry| match f(entry) {
-                Some(replacement) => Arc::from(replacement),
-                None => Arc::clone(entry),
-            })
-            .collect();
-        self.dictionary = remapped.into();
+        let remapped: Vec<Arc<str>> = match &self.dictionary {
+            DictEntries::Inline(entries) => entries
+                .iter()
+                .map(|entry| match f(entry) {
+                    Some(replacement) => Arc::from(replacement),
+                    None => Arc::clone(entry),
+                })
+                .collect(),
+            DictEntries::Mapped { .. } => self
+                .dictionary
+                .iter()
+                .map(|entry| Arc::from(f(entry).unwrap_or_else(|| entry.to_owned())))
+                .collect(),
+        };
+        self.dictionary = DictEntries::Inline(remapped.into());
     }
 
     /// Returns the row offsets where the code matches `predicate` and the
@@ -807,7 +922,7 @@ mod tests {
         let inline = b.build();
 
         let codes_b = inline.codes_bytes();
-        let dict_arc = inline.dictionary().clone();
+        let dict_arc: Arc<[Arc<str>]> = inline.entries().map(Arc::from).collect();
         let mapped = DictionaryEncoding::from_bytes_storage(dict_arc, codes_b, strings.len());
 
         let target = inline.encode("a").unwrap();
@@ -855,12 +970,13 @@ mod tests {
         b.add("a");
         b.add("b");
         let mut dict = b.build();
-        let before = Arc::clone(dict.dictionary());
+        let before = dict.entry(0).map(str::as_ptr);
 
         dict.remap_entries(|_| None);
 
-        assert!(
-            Arc::ptr_eq(&before, dict.dictionary()),
+        assert_eq!(
+            dict.entry(0).map(str::as_ptr),
+            before,
             "a no-match remap must not reallocate the dictionary"
         );
     }
