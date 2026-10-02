@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use bytes::Bytes;
 use grafeo_common::storage::section::{Section, SectionType};
 use grafeo_common::types::{EdgeId, NodeId, PropertyKey};
-use grafeo_common::utils::error::Error;
 use grafeo_common::utils::hash::FxHashMap;
 use parking_lot::RwLock;
 
@@ -22,9 +21,11 @@ use super::rel_table::RelTable;
 use super::schema::{ColumnDef, ColumnType, EdgeSchema, TableSchema};
 use super::value_order::RowOrder;
 use super::zone_map::ZoneMap;
+use crate::codec::limits::{checked_u16, checked_u32};
 use crate::codec::pages::{PageCrcWriter, SectionPages};
 use crate::codec::{BitVector, SectionSpan};
 use crate::statistics::{EdgeTypeStatistics, LabelStatistics, Statistics};
+use grafeo_common::utils::error::Error;
 
 /// Magic bytes identifying a CompactStore section.
 const MAGIC: [u8; 4] = *b"GCST";
@@ -224,7 +225,7 @@ impl CompactStoreSection {
 
         let mut stream = SectionStream::begin(sink, version, store.preserves_ids());
 
-        stream.write_len(store.node_tables_by_id.len());
+        stream.write_len(store.node_tables_by_id.len())?;
         for nt in &store.node_tables_by_id {
             let columns = sorted_by_key(nt.columns());
             stream.node_table(nt.label(), nt.len(), columns.len())?;
@@ -240,7 +241,7 @@ impl CompactStoreSection {
             }
         }
 
-        stream.write_len(store.rel_tables_by_id.len());
+        stream.write_len(store.rel_tables_by_id.len())?;
         for rt in &store.rel_tables_by_id {
             let properties = sorted_by_key(rt.properties());
             stream.rel_table(
@@ -295,7 +296,7 @@ fn write_store(
     let mut writer = SectionWriter::begin(sink, store.preserves_ids())?;
     let indexes = store.property_value_indexes.read();
 
-    writer.count(store.node_tables_by_id.len());
+    writer.count(store.node_tables_by_id.len())?;
     for nt in &store.node_tables_by_id {
         let columns = sorted_by_key(nt.columns());
         writer.node_table(nt.label(), nt.len(), columns.len())?;
@@ -317,7 +318,7 @@ fn write_store(
         }
     }
 
-    writer.count(store.rel_tables_by_id.len());
+    writer.count(store.rel_tables_by_id.len())?;
     for rt in &store.rel_tables_by_id {
         let properties = sorted_by_key(rt.properties());
         writer.rel_table(
@@ -336,7 +337,7 @@ fn write_store(
     if let Some((nodes, edges)) = store.id_maps() {
         for map in [nodes, edges] {
             writer.id_records(&id_records(map)?)?;
-            writer.count(map.table_count());
+            writer.count(map.table_count())?;
             for table in 0..map.table_count() {
                 writer.reverse_ids(&reverse_ids(map, table)?)?;
             }
@@ -406,8 +407,8 @@ impl<'a> SectionWriter<'a> {
     }
 
     /// Writes a table or entry count into the metadata.
-    pub(crate) fn count(&mut self, count: usize) {
-        write_len(&mut self.meta, count);
+    pub(crate) fn count(&mut self, count: usize) -> grafeo_common::utils::error::Result<()> {
+        write_len(&mut self.meta, count)
     }
 
     /// Opens a node table whose `column_count` columns follow in ascending
@@ -419,8 +420,8 @@ impl<'a> SectionWriter<'a> {
         column_count: usize,
     ) -> grafeo_common::utils::error::Result<()> {
         write_name(&mut self.meta, label)?;
-        write_len(&mut self.meta, rows);
-        write_len(&mut self.meta, column_count);
+        write_len(&mut self.meta, rows)?;
+        write_len(&mut self.meta, column_count)?;
         Ok(())
     }
 
@@ -438,7 +439,7 @@ impl<'a> SectionWriter<'a> {
         write_name(&mut self.meta, key.as_str())?;
         if let Some(zm) = zone_map {
             self.meta.push(1);
-            write_zone_map(&mut self.meta, zm);
+            write_zone_map(&mut self.meta, zm)?;
         } else {
             self.meta.push(0);
         }
@@ -465,7 +466,7 @@ impl<'a> SectionWriter<'a> {
         block_zone_maps: Option<&[ZoneMap]>,
     ) -> grafeo_common::utils::error::Result<()> {
         write_null_mask(&mut self.scratch, FORMAT_VERSION, null_mask)?;
-        codec.write_blocked(&mut self.scratch, block_zone_maps, false);
+        codec.write_blocked(&mut self.scratch, block_zone_maps, false)?;
         self.scratch_region()?;
         match codec {
             ColumnCodec::Dict(dict) => {
@@ -496,15 +497,15 @@ impl<'a> SectionWriter<'a> {
         write_name(&mut self.meta, edge_type)?;
         write_u16(&mut self.meta, src_table_id);
         write_u16(&mut self.meta, dst_table_id);
-        fwd.write_to(&mut self.scratch);
+        fwd.write_to(&mut self.scratch)?;
         if let Some(bwd) = bwd {
             self.scratch.push(1);
-            bwd.write_to(&mut self.scratch);
+            bwd.write_to(&mut self.scratch)?;
         } else {
             self.scratch.push(0);
         }
         self.scratch_region()?;
-        write_len(&mut self.meta, property_count);
+        write_len(&mut self.meta, property_count)?;
         Ok(())
     }
 
@@ -611,8 +612,8 @@ impl<'a> SectionStream<'a> {
     }
 
     /// Writes a table count.
-    pub(crate) fn write_len(&mut self, len: usize) {
-        write_len(&mut self.buf, len);
+    pub(crate) fn write_len(&mut self, len: usize) -> grafeo_common::utils::error::Result<()> {
+        write_len(&mut self.buf, len)
     }
 
     /// Opens a node table whose `column_count` columns follow in ascending
@@ -624,8 +625,8 @@ impl<'a> SectionStream<'a> {
         column_count: usize,
     ) -> grafeo_common::utils::error::Result<()> {
         write_name(&mut self.buf, label)?;
-        write_len(&mut self.buf, rows);
-        write_len(&mut self.buf, column_count);
+        write_len(&mut self.buf, rows)?;
+        write_len(&mut self.buf, column_count)?;
         Ok(())
     }
 
@@ -641,12 +642,12 @@ impl<'a> SectionStream<'a> {
         write_name(&mut self.buf, key.as_str())?;
         if let Some(zm) = zone_map {
             self.buf.push(1);
-            write_zone_map(&mut self.buf, zm);
+            write_zone_map(&mut self.buf, zm)?;
         } else {
             self.buf.push(0);
         }
         write_null_mask(&mut self.buf, self.version, null_mask)?;
-        write_codec(codec, &mut self.buf, self.version, block_zone_maps);
+        write_codec(codec, &mut self.buf, self.version, block_zone_maps)?;
         // Column granularity: a single wide column is the smallest unit
         // this encoder can emit without rewriting the sibling-module
         // writers.
@@ -667,15 +668,15 @@ impl<'a> SectionStream<'a> {
         write_name(&mut self.buf, edge_type)?;
         write_u16(&mut self.buf, src_table_id);
         write_u16(&mut self.buf, dst_table_id);
-        fwd.write_to(&mut self.buf);
+        fwd.write_to(&mut self.buf)?;
         if let Some(bwd) = bwd {
             self.buf.push(1);
-            bwd.write_to(&mut self.buf);
+            bwd.write_to(&mut self.buf)?;
         } else {
             self.buf.push(0);
         }
         drain_chunk(&mut self.buf, &mut *self.sink, &mut self.crc, false)?;
-        write_len(&mut self.buf, property_count);
+        write_len(&mut self.buf, property_count)?;
         Ok(())
     }
 
@@ -689,7 +690,7 @@ impl<'a> SectionStream<'a> {
     ) -> grafeo_common::utils::error::Result<()> {
         write_name(&mut self.buf, key.as_str())?;
         write_null_mask(&mut self.buf, self.version, null_mask)?;
-        write_codec(codec, &mut self.buf, self.version, None);
+        write_codec(codec, &mut self.buf, self.version, None)?;
         drain_chunk(&mut self.buf, &mut *self.sink, &mut self.crc, false)
     }
 
@@ -699,7 +700,7 @@ impl<'a> SectionStream<'a> {
         &mut self,
         entries: &[(u64, u16, u64)],
     ) -> grafeo_common::utils::error::Result<()> {
-        write_len(&mut self.buf, entries.len());
+        write_len(&mut self.buf, entries.len())?;
         for &(id, table, offset) in entries {
             write_u64(&mut self.buf, id);
             write_u16(&mut self.buf, table);
@@ -773,7 +774,7 @@ fn write_codec(
     buf: &mut Vec<u8>,
     version: u8,
     block_stats_hint: Option<&[ZoneMap]>,
-) {
+) -> grafeo_common::utils::error::Result<()> {
     match version {
         FORMAT_VERSION_V1 => codec.write_to(buf),
         FORMAT_VERSION_V2 => codec.write_to_v2(buf),
@@ -1540,38 +1541,36 @@ fn write_u64(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
-fn write_len(buf: &mut Vec<u8>, v: usize) {
-    let n = u32::try_from(v).expect("length exceeds u32::MAX in compact section");
+fn write_len(buf: &mut Vec<u8>, v: usize) -> grafeo_common::utils::error::Result<()> {
+    let n = checked_u32(v, "compact store length")?;
     buf.extend_from_slice(&n.to_le_bytes());
+    Ok(())
 }
 
 /// Writes a table label, property key, or edge type behind its `u16` length.
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidValue`] for a name longer than `u16::MAX` bytes.
+/// Returns a serialization error for a name longer than `u16::MAX` bytes.
 fn write_name(buf: &mut Vec<u8>, name: &str) -> grafeo_common::utils::error::Result<()> {
-    let len = u16::try_from(name.len()).map_err(|_| {
-        Error::InvalidValue(format!(
-            "a compact section name is limited to {} bytes, got {}",
-            u16::MAX,
-            name.len()
-        ))
-    })?;
-    write_u16(buf, len);
+    write_u16(buf, checked_u16(name.len(), "compact store name length")?);
     buf.extend_from_slice(name.as_bytes());
     Ok(())
 }
 
-fn write_zone_map(buf: &mut Vec<u8>, zm: &ZoneMap) {
-    write_len(buf, zm.null_count);
-    write_len(buf, zm.row_count);
+fn write_zone_map(buf: &mut Vec<u8>, zm: &ZoneMap) -> grafeo_common::utils::error::Result<()> {
+    write_len(buf, zm.null_count)?;
+    write_len(buf, zm.row_count)?;
     // Encode min/max as (tag, value) pairs.
-    write_optional_value(buf, &zm.min);
-    write_optional_value(buf, &zm.max);
+    write_optional_value(buf, &zm.min)?;
+    write_optional_value(buf, &zm.max)?;
+    Ok(())
 }
 
-fn write_optional_value(buf: &mut Vec<u8>, v: &Option<grafeo_common::types::Value>) {
+fn write_optional_value(
+    buf: &mut Vec<u8>,
+    v: &Option<grafeo_common::types::Value>,
+) -> grafeo_common::utils::error::Result<()> {
     match v {
         None => buf.push(0),
         Some(grafeo_common::types::Value::Int64(n)) => {
@@ -1599,6 +1598,7 @@ fn write_optional_value(buf: &mut Vec<u8>, v: &Option<grafeo_common::types::Valu
             buf.push(0);
         }
     }
+    Ok(())
 }
 
 // ── Read helpers ───────────────────────────────────────────────────
@@ -1963,6 +1963,46 @@ mod tests {
         let restored = section2.store().unwrap();
         assert_eq!(restored.node_count(), 0);
         assert_eq!(restored.edge_count(), 0);
+    }
+
+    /// Names are stored with a u16 length: one over 64 KiB is a serialization
+    /// error (it used to panic), and names at the limit still round-trip.
+    #[test]
+    fn test_name_over_u16_limit_is_an_error_not_a_panic() {
+        let too_long = "x".repeat(usize::from(u16::MAX) + 1);
+        for (what, store) in [
+            ("label", {
+                let store = LpgStore::new().unwrap();
+                store.create_node(&[too_long.as_str()]);
+                store
+            }),
+            ("property key", {
+                let store = LpgStore::new().unwrap();
+                let n = store.create_node(&["Person"]);
+                store.set_node_property(n, &too_long, Value::Int64(1));
+                store
+            }),
+        ] {
+            let compact = from_graph_store_preserving_ids(&store).unwrap();
+            let err = CompactStoreSection::new(Arc::new(compact))
+                .serialize()
+                .expect_err(what);
+            assert!(
+                err.to_string().contains("compact store name length: 65536"),
+                "{what}: {err}"
+            );
+        }
+
+        let at_limit = "x".repeat(usize::from(u16::MAX));
+        let store = LpgStore::new().unwrap();
+        store.create_node(&[at_limit.as_str()]);
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let bytes = CompactStoreSection::new(Arc::new(compact))
+            .serialize()
+            .unwrap();
+        let mut restored = CompactStoreSection::empty();
+        restored.deserialize(&bytes).unwrap();
+        assert_eq!(restored.store().unwrap().node_count(), 1);
     }
 
     #[test]

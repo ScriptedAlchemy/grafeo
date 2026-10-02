@@ -1713,7 +1713,7 @@ impl IncrementalCompactStoreBuilder {
         let mut writer = super::section::SectionWriter::begin(sink, true)?;
         let node_tables = std::mem::take(&mut self.node_tables);
         let mut node_ids = Vec::with_capacity(node_tables.len());
-        writer.count(node_tables.len());
+        writer.count(node_tables.len())?;
         for table in node_tables {
             let rows = table.node_ids.len();
             let columns = columns_by_key(table.columns);
@@ -1742,7 +1742,7 @@ impl IncrementalCompactStoreBuilder {
         let rel_tables = std::mem::take(&mut self.rel_tables);
         let mut edge_entries: Vec<(u64, u16, u64)> = Vec::with_capacity(self.edge_ids.len());
         let mut edge_positions: Vec<Vec<u64>> = Vec::with_capacity(rel_tables.len());
-        writer.count(rel_tables.len());
+        writer.count(rel_tables.len())?;
         for (index, table) in rel_tables.into_iter().enumerate() {
             let rel_table_id = table_id(index, "relationship").map_err(internal)?;
             let (order, pairs) = csr_order(&table.edges);
@@ -1796,7 +1796,7 @@ impl IncrementalCompactStoreBuilder {
         node_entries.sort_unstable_by_key(|&(id, _, _)| id);
         writer.id_records(&node_entries)?;
         drop(node_entries);
-        writer.count(node_ids.len());
+        writer.count(node_ids.len())?;
         for ids in &node_ids {
             let ids: Vec<u64> = ids.iter().map(|id| id.as_u64()).collect();
             writer.reverse_ids(&ids)?;
@@ -1805,7 +1805,7 @@ impl IncrementalCompactStoreBuilder {
         edge_entries.sort_unstable_by_key(|&(id, _, _)| id);
         writer.id_records(&edge_entries)?;
         drop(edge_entries);
-        writer.count(edge_positions.len());
+        writer.count(edge_positions.len())?;
         for ids in &edge_positions {
             writer.reverse_ids(ids)?;
         }
@@ -4073,10 +4073,10 @@ mod tests {
             .push_node(NodeId(1), [label.as_str()], std::iter::empty())
             .unwrap();
         let err = builder.write_section(&mut Vec::new(), &[]).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "GRAFEO-V001: Invalid value: a compact section name is limited to 65535 bytes, \
-             got 65536"
+        assert!(
+            err.to_string()
+                .contains("compact store name length: 65536 exceeds the storage format limit"),
+            "{err}"
         );
     }
 
