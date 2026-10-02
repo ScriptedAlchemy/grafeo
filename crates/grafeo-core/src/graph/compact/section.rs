@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use bytes::Bytes;
 use grafeo_common::storage::section::{Section, SectionType};
 use grafeo_common::types::{EdgeId, NodeId, PropertyKey};
+use grafeo_common::utils::error::Error;
 use grafeo_common::utils::hash::FxHashMap;
 use parking_lot::RwLock;
 
@@ -194,7 +195,7 @@ impl CompactStoreSection {
         stream.write_len(store.node_tables_by_id.len());
         for nt in &store.node_tables_by_id {
             let columns = sorted_by_key(nt.columns());
-            stream.node_table(nt.label(), nt.len(), columns.len());
+            stream.node_table(nt.label(), nt.len(), columns.len())?;
             let zone_maps = nt.zone_maps();
             for (key, codec) in columns {
                 stream.node_column(
@@ -291,10 +292,16 @@ impl<'a> SectionStream<'a> {
 
     /// Opens a node table whose `column_count` columns follow in ascending
     /// key order.
-    pub(crate) fn node_table(&mut self, label: &str, rows: usize, column_count: usize) {
-        write_str(&mut self.buf, label);
+    pub(crate) fn node_table(
+        &mut self,
+        label: &str,
+        rows: usize,
+        column_count: usize,
+    ) -> grafeo_common::utils::error::Result<()> {
+        write_name(&mut self.buf, label)?;
         write_len(&mut self.buf, rows);
         write_len(&mut self.buf, column_count);
+        Ok(())
     }
 
     /// Writes one node column and drains it.
@@ -306,7 +313,7 @@ impl<'a> SectionStream<'a> {
         codec: &ColumnCodec,
         block_zone_maps: Option<&[ZoneMap]>,
     ) -> grafeo_common::utils::error::Result<()> {
-        write_str(&mut self.buf, key.as_str());
+        write_name(&mut self.buf, key.as_str())?;
         if let Some(zm) = zone_map {
             self.buf.push(1);
             write_zone_map(&mut self.buf, zm);
@@ -332,7 +339,7 @@ impl<'a> SectionStream<'a> {
         bwd: Option<&CsrAdjacency>,
         property_count: usize,
     ) -> grafeo_common::utils::error::Result<()> {
-        write_str(&mut self.buf, edge_type);
+        write_name(&mut self.buf, edge_type)?;
         write_u16(&mut self.buf, src_table_id);
         write_u16(&mut self.buf, dst_table_id);
         fwd.write_to(&mut self.buf);
@@ -355,7 +362,7 @@ impl<'a> SectionStream<'a> {
         null_mask: Option<&BitVector>,
         codec: &ColumnCodec,
     ) -> grafeo_common::utils::error::Result<()> {
-        write_str(&mut self.buf, key.as_str());
+        write_name(&mut self.buf, key.as_str())?;
         write_null_mask(&mut self.buf, self.version, null_mask)?;
         write_codec(codec, &mut self.buf, self.version, None);
         drain_chunk(&mut self.buf, &mut *self.sink, &mut self.crc, false)
@@ -913,11 +920,22 @@ fn write_len(buf: &mut Vec<u8>, v: usize) {
     buf.extend_from_slice(&n.to_le_bytes());
 }
 
-fn write_str(buf: &mut Vec<u8>, s: &str) {
-    let bytes = s.as_bytes();
-    let slen = u16::try_from(bytes.len()).expect("string exceeds u16::MAX in compact section");
-    write_u16(buf, slen);
-    buf.extend_from_slice(bytes);
+/// Writes a table label, property key, or edge type behind its `u16` length.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidValue`] for a name longer than `u16::MAX` bytes.
+fn write_name(buf: &mut Vec<u8>, name: &str) -> grafeo_common::utils::error::Result<()> {
+    let len = u16::try_from(name.len()).map_err(|_| {
+        Error::InvalidValue(format!(
+            "a compact section name is limited to {} bytes, got {}",
+            u16::MAX,
+            name.len()
+        ))
+    })?;
+    write_u16(buf, len);
+    buf.extend_from_slice(name.as_bytes());
+    Ok(())
 }
 
 fn write_zone_map(buf: &mut Vec<u8>, zm: &ZoneMap) {
@@ -940,10 +958,17 @@ fn write_optional_value(buf: &mut Vec<u8>, v: &Option<grafeo_common::types::Valu
             buf.push(2);
             buf.push(u8::from(*b));
         }
-        Some(grafeo_common::types::Value::String(s)) => {
-            buf.push(3);
-            write_str(buf, s.as_str());
-        }
+        Some(grafeo_common::types::Value::String(s)) => match u16::try_from(s.len()) {
+            Ok(len) => {
+                buf.push(3);
+                write_u16(buf, len);
+                buf.extend_from_slice(s.as_bytes());
+            }
+            // The column holds the value whole; only this bound, which the
+            // u16 length cannot carry, is written absent, and an absent
+            // bound never prunes.
+            Err(_) => buf.push(0),
+        },
         Some(_) => {
             // Unsupported type for zone map: write as absent.
             buf.push(0);

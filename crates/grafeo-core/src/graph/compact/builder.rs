@@ -1745,7 +1745,7 @@ impl IncrementalCompactStoreBuilder {
         for table in node_tables {
             let rows = table.node_ids.len();
             let columns = columns_by_key(table.columns);
-            stream.node_table(table.label_key.as_str(), rows, columns.len());
+            stream.node_table(table.label_key.as_str(), rows, columns.len())?;
             for (key, column) in columns {
                 let values = self.spool.read(column, rows).map_err(internal)?;
                 let (codec, zone_map, nulls) = encode_inferred_column(&values);
@@ -3992,6 +3992,62 @@ mod tests {
         let store = builder.finish().unwrap();
         assert_eq!(store.get_node_property(NodeId(1), &key), Some(first));
         assert_eq!(store.get_node_property(NodeId(2), &key), Some(second));
+    }
+
+    /// String values longer than a section's `u16` name length round-trip
+    /// whole through the streamed and the resident section writers, and a
+    /// predicate against them still finds their rows.
+    #[test]
+    fn string_values_over_64_kib_round_trip_through_the_section() {
+        use grafeo_common::storage::Section;
+        use std::sync::Arc;
+
+        let key = PropertyKey::new("record");
+        let long = Value::from(format!("{}z", "a".repeat(70 * 1024)));
+        let longest = Value::from(format!("{}z", "b".repeat(80 * 1024)));
+        let short = Value::from("m");
+        let build = || {
+            let mut builder = IncrementalCompactStoreBuilder::new();
+            for (id, value) in [(1, &long), (2, &short), (3, &longest)] {
+                builder
+                    .push_node(NodeId(id), ["Entity"], [(&key, value)])
+                    .unwrap();
+            }
+            builder
+        };
+        let streamed = streamed_bytes(build());
+        assert_eq!(streamed, section_bytes(build().finish().unwrap()));
+
+        let mut restored = super::super::section::CompactStoreSection::empty();
+        restored.deserialize(&streamed).unwrap();
+        let store = restored.store().unwrap();
+        for (id, value) in [(1, &long), (2, &short), (3, &longest)] {
+            assert_eq!(
+                store.get_node_property(NodeId(id), &key),
+                Some(value.clone())
+            );
+        }
+        assert_eq!(
+            store.find_nodes_by_property(key.as_str(), &longest),
+            vec![NodeId(3)]
+        );
+    }
+
+    /// A label, property key, or edge type the section cannot name is a
+    /// typed write error.
+    #[test]
+    fn a_name_over_64_kib_is_a_typed_section_error() {
+        let label = "L".repeat(usize::from(u16::MAX) + 1);
+        let mut builder = IncrementalCompactStoreBuilder::new();
+        builder
+            .push_node(NodeId(1), [label.as_str()], std::iter::empty())
+            .unwrap();
+        let err = builder.write_section(&mut Vec::new()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "GRAFEO-V001: Invalid value: a compact section name is limited to 65535 bytes, \
+             got 65536"
+        );
     }
 
     /// The streamed section is single-use and write-only.
