@@ -4,7 +4,9 @@
 //! mapped section is file-backed page cache and is reported apart.
 //!
 //! This binary counts every allocation, so the bytes an open leaves live are
-//! the reference the report is held to.
+//! the reference the report is held to. Both are measured against the open
+//! of an empty sealed container, so the engine's fixed skeleton (plan
+//! caches, file manager, overlay) is not mistaken for the base's heap.
 //!
 //! ```bash
 //! cargo test -p grafeo-engine \
@@ -139,11 +141,18 @@ fn open_measured(path: &Path, mapped: bool) -> (GrafeoDB, usize, MemoryUsage) {
     (db, live, usage)
 }
 
-fn assert_reports_live(live: usize, usage: &MemoryUsage) {
+/// Holds the reported growth over the empty container's open to the live
+/// growth, within 10%.
+fn assert_reports_live(
+    (live, usage): (usize, &MemoryUsage),
+    (empty_live, empty): (usize, &MemoryUsage),
+) {
+    let grown = live - empty_live;
+    let reported = usage.total_bytes - empty.total_bytes;
     assert!(
-        usage.total_bytes * 10 >= live * 9 && usage.total_bytes * 10 <= live * 11,
-        "the open left {live} bytes live but memory_usage reports {}: {usage:?}",
-        usage.total_bytes
+        reported * 10 >= grown * 9 && reported * 10 <= grown * 11,
+        "the open left {grown} bytes live over an empty container but memory_usage reports \
+         {reported} more: {usage:?}"
     );
 }
 
@@ -155,6 +164,17 @@ fn a_reopened_compact_base_reports_the_heap_its_open_left_live() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("sealed.grafeo");
     write_container(&path);
+    let empty_path = dir.path().join("empty.grafeo");
+    GrafeoDB::write_compact_container(
+        &empty_path,
+        IncrementalCompactStoreBuilder::new(),
+        ["key".to_owned()],
+    )
+    .expect("write empty container");
+    let (empty, empty_mapped_live, empty_mapped) = open_measured(&empty_path, true);
+    drop(empty);
+    let (empty, empty_copied_live, empty_copied) = open_measured(&empty_path, false);
+    drop(empty);
 
     let (db, mapped_live, mapped) = open_measured(&path, true);
     assert_eq!(u64::try_from(db.graph_store().node_count()), Ok(ENTITIES));
@@ -162,8 +182,8 @@ fn a_reopened_compact_base_reports_the_heap_its_open_left_live() {
     let (db, copied_live, copied) = open_measured(&path, false);
     assert_eq!(u64::try_from(db.graph_store().node_count()), Ok(ENTITIES));
 
-    assert_reports_live(mapped_live, &mapped);
-    assert_reports_live(copied_live, &copied);
+    assert_reports_live((mapped_live, &mapped), (empty_mapped_live, &empty_mapped));
+    assert_reports_live((copied_live, &copied), (empty_copied_live, &empty_copied));
     assert_eq!(copied.compact_base.mapped_bytes, 0);
     assert!(mapped.compact_base.mapped_bytes > 0);
     assert_eq!(

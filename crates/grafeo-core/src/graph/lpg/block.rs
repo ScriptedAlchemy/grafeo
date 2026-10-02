@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use arcstr::ArcStr;
 use smallvec::SmallVec;
 
+use crate::codec::limits::{checked_u16, checked_u32};
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, Value};
 use grafeo_common::utils::error::{Error, Result};
 
@@ -248,9 +249,10 @@ impl StringTableBuilder {
     }
 
     fn insert_new(&mut self, s: ArcStr) -> u32 {
-        // reason: string table size bounded by section limits, fits u32
-        #[allow(clippy::cast_possible_truncation)]
-        let idx = self.strings.len() as u32;
+        // More than u32::MAX strings cannot be held in memory in practice; if it
+        // ever happens the index saturates and `serialize` rejects the table
+        // before anything is written.
+        let idx = u32::try_from(self.strings.len()).unwrap_or(u32::MAX);
         self.packed_len += 4 + s.len();
         self.strings.push(s.clone());
         self.index.insert(s, idx);
@@ -274,20 +276,19 @@ impl StringTableBuilder {
     }
 
     /// Serializes the string table: [count:u32] [offsets:u32*count] [packed strings]
-    fn serialize(&self) -> Vec<u8> {
-        // reason: string table counts and offsets within a section fit u32
-        #[allow(clippy::cast_possible_truncation)]
-        let count = self.strings.len() as u32;
+    ///
+    /// # Errors
+    ///
+    /// Fails if the string count, a string's length or the packed size does
+    /// not fit the format's `u32` fields.
+    fn serialize(&self) -> Result<Vec<u8>> {
+        let count = checked_u32(self.strings.len(), "LPG string table count")?;
         let mut packed = Vec::with_capacity(self.packed_len);
         let mut offsets = Vec::with_capacity(self.strings.len());
         for s in &self.strings {
-            // reason: packed buffer and string lengths bounded by section size, fit u32
-            #[allow(clippy::cast_possible_truncation)]
-            offsets.push(packed.len() as u32);
+            offsets.push(checked_u32(packed.len(), "LPG string table size")?);
             let bytes = s.as_bytes();
-            // reason: individual string lengths bounded by section size, fit u32
-            #[allow(clippy::cast_possible_truncation)]
-            packed.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            packed.extend_from_slice(&checked_u32(bytes.len(), "LPG string length")?.to_le_bytes());
             packed.extend_from_slice(bytes);
         }
 
@@ -297,7 +298,7 @@ impl StringTableBuilder {
             buf.extend_from_slice(&off.to_le_bytes());
         }
         buf.extend_from_slice(&packed);
-        buf
+        Ok(buf)
     }
 }
 
@@ -354,7 +355,7 @@ impl<'a> StringTableReader<'a> {
 /// Encodes a `Value` into the binary format used in property columns.
 ///
 /// Format: [tag:u8] [payload:variable]
-fn encode_value(val: &Value, strings: &mut StringTableBuilder, buf: &mut Vec<u8>) {
+fn encode_value(val: &Value, strings: &mut StringTableBuilder, buf: &mut Vec<u8>) -> Result<()> {
     match val {
         Value::Null => buf.push(ValueTag::Null as u8),
         Value::Bool(b) => {
@@ -376,9 +377,7 @@ fn encode_value(val: &Value, strings: &mut StringTableBuilder, buf: &mut Vec<u8>
         }
         Value::Bytes(b) => {
             buf.push(ValueTag::Bytes as u8);
-            // reason: serialized value sizes within a section fit u32
-            #[allow(clippy::cast_possible_truncation)]
-            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&checked_u32(b.len(), "LPG bytes value length")?.to_le_bytes());
             buf.extend_from_slice(b);
         }
         Value::Date(d) => {
@@ -408,46 +407,36 @@ fn encode_value(val: &Value, strings: &mut StringTableBuilder, buf: &mut Vec<u8>
         }
         Value::List(items) => {
             buf.push(ValueTag::List as u8);
-            // reason: collection sizes within a section fit u32
-            #[allow(clippy::cast_possible_truncation)]
-            buf.extend_from_slice(&(items.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&checked_u32(items.len(), "LPG list length")?.to_le_bytes());
             for item in items.iter() {
-                encode_value(item, strings, buf);
+                encode_value(item, strings, buf)?;
             }
         }
         Value::Map(map) => {
             buf.push(ValueTag::Map as u8);
-            // reason: map sizes within a section fit u32
-            #[allow(clippy::cast_possible_truncation)]
-            buf.extend_from_slice(&(map.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&checked_u32(map.len(), "LPG map size")?.to_le_bytes());
             for (key, val) in map.iter() {
                 let key_idx = strings.intern_arc(key.as_arc());
                 buf.extend_from_slice(&key_idx.to_le_bytes());
-                encode_value(val, strings, buf);
+                encode_value(val, strings, buf)?;
             }
         }
         Value::Vector(v) => {
             buf.push(ValueTag::Vector as u8);
-            // reason: vector dimension within a section fits u32
-            #[allow(clippy::cast_possible_truncation)]
-            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&checked_u32(v.len(), "LPG vector dimension")?.to_le_bytes());
             for f in v.iter() {
                 buf.extend_from_slice(&f.to_le_bytes());
             }
         }
         Value::Path { nodes, edges } => {
             buf.push(ValueTag::Path as u8);
-            // reason: path node count within a section fits u32
-            #[allow(clippy::cast_possible_truncation)]
-            buf.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&checked_u32(nodes.len(), "LPG path node count")?.to_le_bytes());
             for n in nodes.iter() {
-                encode_value(n, strings, buf);
+                encode_value(n, strings, buf)?;
             }
-            // reason: path edge count within a section fits u32
-            #[allow(clippy::cast_possible_truncation)]
-            buf.extend_from_slice(&(edges.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&checked_u32(edges.len(), "LPG path edge count")?.to_le_bytes());
             for e in edges.iter() {
-                encode_value(e, strings, buf);
+                encode_value(e, strings, buf)?;
             }
         }
         // GCounter and OnCounter: encode as Map for forward compatibility
@@ -455,6 +444,7 @@ fn encode_value(val: &Value, strings: &mut StringTableBuilder, buf: &mut Vec<u8>
             buf.push(ValueTag::Null as u8);
         }
     }
+    Ok(())
 }
 
 /// Shared-string view of a serialized string table.
@@ -469,9 +459,9 @@ impl ArcStringTable {
     fn new(reader: &StringTableReader<'_>) -> Result<Self> {
         let mut strings = Vec::with_capacity(reader.count as usize);
         for i in 0..reader.count {
-            let s = reader.get(i).ok_or_else(|| {
-                Error::Serialization(format!("invalid string table entry {i}"))
-            })?;
+            let s = reader
+                .get(i)
+                .ok_or_else(|| Error::Serialization(format!("invalid string table entry {i}")))?;
             strings.push(ArcStr::from(s));
         }
         Ok(Self { strings })
@@ -872,15 +862,13 @@ pub(crate) fn write_source_blocks_into(
     // currently visited entity is materialized beside them.
     let mut node_buf = Vec::with_capacity(source.node_count() * 8);
     let mut label_buf = Vec::new();
-    // reason: node and label counts within a section fit u32/u16
-    #[allow(clippy::cast_possible_truncation)]
-    label_buf.extend_from_slice(&(source.node_count() as u32).to_le_bytes());
+    label_buf.extend_from_slice(&checked_u32(source.node_count(), "LPG node count")?.to_le_bytes());
     let mut node_property_columns = property_column_builders(node_property_keys, &mut strings);
     source.visit_nodes(&mut |node| {
         node_buf.extend_from_slice(&node.id.as_u64().to_le_bytes());
-        // reason: label count per node is bounded, fits u16
-        #[allow(clippy::cast_possible_truncation)]
-        label_buf.extend_from_slice(&(node.labels.len() as u16).to_le_bytes());
+        label_buf.extend_from_slice(
+            &checked_u16(node.labels.len(), "LPG labels per node")?.to_le_bytes(),
+        );
         for label in &node.labels {
             let idx = strings.intern_arc(label);
             label_buf.extend_from_slice(&idx.to_le_bytes());
@@ -890,7 +878,7 @@ pub(crate) fn write_source_blocks_into(
             &node.properties,
             &mut node_property_columns,
             &mut strings,
-        );
+        )?;
         Ok(())
     })?;
 
@@ -909,7 +897,7 @@ pub(crate) fn write_source_blocks_into(
             &edge.properties,
             &mut edge_property_columns,
             &mut strings,
-        );
+        )?;
         Ok(())
     })?;
 
@@ -922,19 +910,19 @@ pub(crate) fn write_source_blocks_into(
     })?;
 
     let mut blocks: Vec<(BlockType, Vec<u8>, u32, u32)> = vec![
-        (BlockType::StringTable, strings.serialize(), 0, 0),
+        (BlockType::StringTable, strings.serialize()?, 0, 0),
         (BlockType::NodeData, node_buf, 0, 0),
         (BlockType::EdgeData, edge_buf, 0, 0),
         (BlockType::LabelAssignment, label_buf, 0, 0),
     ]; // (type, data, key_idx, sub_type)
-    blocks.extend(node_property_columns.into_iter().map(|column| {
+    for column in node_property_columns {
         let key_index = column.key_index;
-        (BlockType::PropertyColumn, column.finish(), key_index, 0)
-    }));
-    blocks.extend(edge_property_columns.into_iter().map(|column| {
+        blocks.push((BlockType::PropertyColumn, column.finish()?, key_index, 0));
+    }
+    for column in edge_property_columns {
         let key_index = column.key_index;
-        (BlockType::PropertyColumn, column.finish(), key_index, 1)
-    }));
+        blocks.push((BlockType::PropertyColumn, column.finish()?, key_index, 1));
+    }
     blocks.extend(named_graph_blocks);
 
     // Assemble the final output
@@ -947,6 +935,8 @@ pub(crate) fn write_source_blocks_into(
 
     for (block_type, block_data, key_idx, sub_type) in &blocks {
         let checksum = crc32fast::hash(block_data);
+        // The directory stores u32 offsets and lengths, so an LPG section is
+        // limited to 4 GiB (#392); refuse to write a larger one.
         dir_entries.push(BlockDirEntry {
             block_type: *block_type as u8,
             _reserved: [0; 3],
@@ -966,17 +956,15 @@ pub(crate) fn write_source_blocks_into(
     let mut prologue = Vec::with_capacity(HEADER_SIZE + dir_size);
 
     // Header
-    // reason: section block counts fit u16/u32
-    #[allow(clippy::cast_possible_truncation)]
     let header = SectionHeader {
         magic: LPG_BLOCK_MAGIC,
         version: LPG_BLOCK_VERSION,
         flags: 0,
-        block_count: block_count as u16,
+        block_count: checked_u16(block_count, "LPG block count")?,
         node_count: source.node_count() as u64,
         edge_count: source.edge_count() as u64,
         epoch,
-        named_graph_count: source.named_graph_count() as u32,
+        named_graph_count: checked_u32(source.named_graph_count(), "LPG named graph count")?,
         _reserved: [0; 28],
     };
     header.write_to(&mut prologue);
@@ -1087,25 +1075,23 @@ impl PropertyColumnBuilder {
         entity_id: u64,
         versions: &[(EpochId, Value)],
         strings: &mut StringTableBuilder,
-    ) {
+    ) -> Result<()> {
         self.entry_count += 1;
         self.data.extend_from_slice(&entity_id.to_le_bytes());
-        // reason: version count per entity is bounded, fits u16
-        #[allow(clippy::cast_possible_truncation)]
-        self.data
-            .extend_from_slice(&(versions.len() as u16).to_le_bytes());
+        self.data.extend_from_slice(
+            &checked_u16(versions.len(), "LPG property version count")?.to_le_bytes(),
+        );
         for (epoch, value) in versions {
             self.data.extend_from_slice(&epoch.as_u64().to_le_bytes());
-            encode_value(value, strings, &mut self.data);
+            encode_value(value, strings, &mut self.data)?;
         }
+        Ok(())
     }
 
-    fn finish(mut self) -> Vec<u8> {
-        // reason: property column entry counts fit u32 within a section
-        #[allow(clippy::cast_possible_truncation)]
-        let entry_count = self.entry_count as u32;
+    fn finish(mut self) -> Result<Vec<u8>> {
+        let entry_count = checked_u32(self.entry_count, "LPG property column entry count")?;
         self.data[..std::mem::size_of::<u32>()].copy_from_slice(&entry_count.to_le_bytes());
-        self.data
+        Ok(self.data)
     }
 }
 
@@ -1126,17 +1112,17 @@ fn append_entity_properties(
     properties: &[(PropertyKey, BlockPropertyVersions)],
     columns: &mut [PropertyColumnBuilder],
     strings: &mut StringTableBuilder,
-) {
+) -> Result<()> {
     for (key, versions) in properties {
         if versions.is_empty() {
             continue;
         }
-        if let Ok(index) =
-            columns.binary_search_by(|column| column.key.as_str().cmp(key.as_str()))
+        if let Ok(index) = columns.binary_search_by(|column| column.key.as_str().cmp(key.as_str()))
         {
-            columns[index].append(entity_id, versions, strings);
+            columns[index].append(entity_id, versions, strings)?;
         }
     }
+    Ok(())
 }
 
 // ── Reader ─────────────────────────────────────────────────────────
@@ -1236,9 +1222,8 @@ pub(crate) fn read_blocks(
     let strings = ArcStringTable::new(&strings)?;
 
     // Read node data (cap capacity to prevent OOM from untrusted header)
-    // reason: on 64-bit targets u64 == usize; on 32-bit, capacity is capped by .min()
-    #[allow(clippy::cast_possible_truncation)]
-    let mut nodes = Vec::with_capacity((header.node_count as usize).min(data.len() / 8));
+    let node_count = usize::try_from(header.node_count).unwrap_or(usize::MAX);
+    let mut nodes = Vec::with_capacity(node_count.min(data.len() / 8));
     if let Some(entry) = dir_entries
         .iter()
         .find(|e| e.block_type == BlockType::NodeData as u8)
@@ -1257,9 +1242,8 @@ pub(crate) fn read_blocks(
     }
 
     // Read edge data
-    // reason: on 64-bit targets u64 == usize; on 32-bit, capacity is capped by .min()
-    #[allow(clippy::cast_possible_truncation)]
-    let mut edges = Vec::with_capacity((header.edge_count as usize).min(data.len() / 28));
+    let edge_count = usize::try_from(header.edge_count).unwrap_or(usize::MAX);
+    let mut edges = Vec::with_capacity(edge_count.min(data.len() / 28));
     if let Some(entry) = dir_entries
         .iter()
         .find(|e| e.block_type == BlockType::EdgeData as u8)
@@ -1465,7 +1449,10 @@ mod tests {
                         "name".into(),
                         smallvec::smallvec![(EpochId::new(1), Value::String("Gus".into()))],
                     ),
-                    ("age".into(), smallvec::smallvec![(EpochId::new(1), Value::Int64(30))]),
+                    (
+                        "age".into(),
+                        smallvec::smallvec![(EpochId::new(1), Value::Int64(30))],
+                    ),
                 ],
             },
         ];
@@ -1536,7 +1523,10 @@ mod tests {
         use grafeo_common::types::{Date, Duration, Time, Timestamp, ZonedDatetime};
 
         let props = vec![
-            ("null_val".into(), smallvec::smallvec![(EpochId::new(0), Value::Null)]),
+            (
+                "null_val".into(),
+                smallvec::smallvec![(EpochId::new(0), Value::Null)],
+            ),
             (
                 "bool_val".into(),
                 smallvec::smallvec![(EpochId::new(0), Value::Bool(true))],
@@ -1791,6 +1781,108 @@ mod tests {
         .unwrap();
     }
 
+    // ── Format limits (#392): refuse to write what cannot be read back ──
+
+    fn write_error(nodes: &[BlockNode]) -> String {
+        match write_blocks(nodes, &[], &[], 1) {
+            Ok(data) => panic!("expected a serialization error, wrote {} bytes", data.len()),
+            Err(err) => {
+                assert!(matches!(err, Error::Serialization(_)), "{err:?}");
+                err.to_string()
+            }
+        }
+    }
+
+    #[test]
+    fn test_too_many_blocks_is_an_error() {
+        // Each named graph is one block; with the 4 fixed blocks, 65,531 graphs
+        // is exactly u16::MAX blocks and one more overflows the u16 count.
+        let graphs = |count: usize| -> Vec<BlockNamedGraph> {
+            (0..count)
+                .map(|i| BlockNamedGraph {
+                    name: format!("g{i}"),
+                    nodes: Vec::new(),
+                    edges: Vec::new(),
+                })
+                .collect()
+        };
+        let at_limit = usize::from(u16::MAX) - 4;
+
+        let err = write_blocks(&[], &[], &graphs(at_limit + 1), 1).unwrap_err();
+        assert!(matches!(err, Error::Serialization(_)), "{err:?}");
+        assert!(err.to_string().contains("LPG block count: 65536"), "{err}");
+
+        let data = write_blocks(&[], &[], &graphs(at_limit), 1).unwrap();
+        read_blocks(&data, &mut |_, _, named, _| {
+            assert_eq!(named.len(), at_limit);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_too_many_labels_on_a_node_is_an_error() {
+        let node = BlockNode {
+            id: NodeId::new(1),
+            labels: (0..=usize::from(u16::MAX))
+                .map(|i| ArcStr::from(format!("L{i}")))
+                .collect(),
+            properties: Vec::new(),
+        };
+        let err = write_error(&[node]);
+        assert!(err.contains("LPG labels per node: 65536"), "{err}");
+    }
+
+    #[test]
+    fn test_too_many_property_versions_is_an_error() {
+        let versions = (0..=u64::from(u16::MAX))
+            .map(|e| (EpochId::new(e), Value::Int64(1)))
+            .collect();
+        let node = BlockNode {
+            id: NodeId::new(1),
+            labels: Vec::new(),
+            properties: vec![("v".into(), versions)],
+        };
+        let err = write_error(std::slice::from_ref(&node));
+        assert!(err.contains("LPG property version count: 65536"), "{err}");
+
+        // Edge property columns have the same limit.
+        let edge = BlockEdge {
+            id: EdgeId::new(1),
+            src: NodeId::new(1),
+            dst: NodeId::new(1),
+            edge_type: "SELF".into(),
+            properties: node.properties,
+        };
+        let node = BlockNode {
+            id: NodeId::new(1),
+            labels: Vec::new(),
+            properties: Vec::new(),
+        };
+        let err = write_blocks(&[node], &[edge], &[], 1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("LPG property version count: 65536"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_block_range_past_end_is_an_error_not_a_panic() {
+        let data = write_blocks(&[], &[], &[], 1).unwrap();
+        // Point the first directory entry near u32::MAX: offset + length would
+        // overflow u32 arithmetic.
+        let mut corrupt = data.clone();
+        let entry = HEADER_SIZE;
+        corrupt[entry + 4..entry + 8].copy_from_slice(&(u32::MAX - 1).to_le_bytes());
+        corrupt[entry + 8..entry + 12].copy_from_slice(&16u32.to_le_bytes());
+        let err = read_blocks(&corrupt, &mut |_, _, _, _| Ok(())).unwrap_err();
+        assert!(
+            err.to_string().contains("extends past end of data"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn test_crc_corruption_detected() {
         let nodes = vec![BlockNode {
@@ -2012,7 +2104,10 @@ mod tests {
                     "bytes_val".into(),
                     smallvec::smallvec![(EpochId::new(0), Value::Bytes(vec![0xDE, 0xAD].into()))],
                 ),
-                ("null_val".into(), smallvec::smallvec![(EpochId::new(0), Value::Null)]),
+                (
+                    "null_val".into(),
+                    smallvec::smallvec![(EpochId::new(0), Value::Null)],
+                ),
                 (
                     "date_val".into(),
                     smallvec::smallvec![(
@@ -2036,7 +2131,10 @@ mod tests {
                 ),
                 (
                     "vector_val".into(),
-                    smallvec::smallvec![(EpochId::new(0), Value::Vector(vec![0.1, 0.2, 0.3].into()))],
+                    smallvec::smallvec![(
+                        EpochId::new(0),
+                        Value::Vector(vec![0.1, 0.2, 0.3].into())
+                    )],
                 ),
             ],
         }];
@@ -2053,8 +2151,9 @@ mod tests {
             );
 
             // Verify each type decoded correctly
-            let find_prop =
-                |name: &str| -> &Value { &props.iter().find(|(k, _)| k.as_str() == name).unwrap().1[0].1 };
+            let find_prop = |name: &str| -> &Value {
+                &props.iter().find(|(k, _)| k.as_str() == name).unwrap().1[0].1
+            };
             assert_eq!(*find_prop("bool_val"), Value::Bool(true));
             assert_eq!(*find_prop("float_val"), Value::Float64(1.234));
             assert_eq!(*find_prop("null_val"), Value::Null);
