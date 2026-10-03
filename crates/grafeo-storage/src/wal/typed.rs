@@ -89,12 +89,8 @@ impl<R: WalEntry> TypedWal<R> {
         ENCODE_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
-            bincode::serde::encode_into_std_write(
-                record,
-                &mut *buf,
-                bincode::config::standard(),
-            )
-            .map_err(|e| Error::Serialization(e.to_string()))?;
+            bincode::serde::encode_into_std_write(record, &mut *buf, bincode::config::standard())
+                .map_err(|e| Error::Serialization(e.to_string()))?;
             let force_sync = record.requires_sync();
             self.manager.write_frame(&buf, force_sync)
         })

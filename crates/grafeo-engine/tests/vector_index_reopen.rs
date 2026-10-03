@@ -70,8 +70,16 @@ fn seed(path: &std::path::Path) {
                 .unwrap();
         }
     }
-    db.create_vector_index(LABEL, PROPERTY, Some(DIMS), Some("cosine"), None, None, None)
-        .expect("build the index once");
+    db.create_vector_index(
+        LABEL,
+        PROPERTY,
+        Some(DIMS),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("build the index once");
     assert!(db.graph_store().has_vector_index(LABEL, PROPERTY));
     assert_eq!(
         db.vector_index_len(LABEL, PROPERTY),
@@ -109,7 +117,8 @@ fn reopen_serves_vector_search_without_rebuilding() {
     );
 
     assert_eq!(
-        db.vector_index_len(LABEL, PROPERTY).expect("restored index"),
+        db.vector_index_len(LABEL, PROPERTY)
+            .expect("restored index"),
         ROWS,
         "the restored topology must cover every indexed row"
     );
@@ -146,8 +155,16 @@ fn restored_index_returns_the_same_neighbours_as_the_persisted_one() {
                     .unwrap();
             }
         }
-        db.create_vector_index(LABEL, PROPERTY, Some(DIMS), Some("cosine"), None, None, None)
-            .unwrap();
+        db.create_vector_index(
+            LABEL,
+            PROPERTY,
+            Some(DIMS),
+            Some("cosine"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let neighbours = neighbours(&db);
         db.close().unwrap();
         neighbours
@@ -203,8 +220,16 @@ fn an_index_over_no_vectors_is_left_absent_for_rebuild() {
         let db = GrafeoDB::with_config(config(&path)).unwrap();
         // Explicit dimensions with no matching rows: grafeo creates the
         // index empty, and it is serialized with an empty topology.
-        db.create_vector_index(LABEL, PROPERTY, Some(DIMS), Some("cosine"), None, None, None)
-            .expect("empty index");
+        db.create_vector_index(
+            LABEL,
+            PROPERTY,
+            Some(DIMS),
+            Some("cosine"),
+            None,
+            None,
+            None,
+        )
+        .expect("empty index");
         assert!(db.graph_store().has_vector_index(LABEL, PROPERTY));
         db.close().unwrap();
     }
@@ -255,7 +280,8 @@ fn restore_reproduces_the_persisted_coverage_exactly() {
 
     let db = GrafeoDB::with_config(config(&path)).unwrap();
     assert_eq!(
-        db.vector_index_len(LABEL, PROPERTY).expect("restored index"),
+        db.vector_index_len(LABEL, PROPERTY)
+            .expect("restored index"),
         live_len,
         "the reopened index must cover exactly what the persisted one covered"
     );
@@ -298,8 +324,16 @@ fn an_index_built_after_open_survives_the_next_reopen() {
         // reaches the WAL. Only the index is built.
         let db = GrafeoDB::with_config(config(&path)).unwrap();
         assert!(!db.graph_store().has_vector_index(LABEL, PROPERTY));
-        db.create_vector_index(LABEL, PROPERTY, Some(DIMS), Some("cosine"), None, None, None)
-            .expect("build the index");
+        db.create_vector_index(
+            LABEL,
+            PROPERTY,
+            Some(DIMS),
+            Some("cosine"),
+            None,
+            None,
+            None,
+        )
+        .expect("build the index");
         assert_eq!(db.vector_index_len(LABEL, PROPERTY), Some(ROWS));
         db.close().unwrap();
     }

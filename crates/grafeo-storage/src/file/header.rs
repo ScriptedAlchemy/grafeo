@@ -159,11 +159,16 @@ fn read_db_header_slot(file: &mut File, slot: u8) -> Result<SlotState> {
 
     let tail_start = buf.len() - DB_HEADER_TAIL_SIZE;
     if buf[tail_start..tail_start + 4] == DB_HEADER_TAIL_MAGIC {
-        let encoded_len =
-            u32::from_le_bytes(buf[tail_start + 4..tail_start + 8].try_into().unwrap_or([0; 4]))
-                as usize;
-        let stored_crc =
-            u32::from_le_bytes(buf[tail_start + 8..tail_start + 12].try_into().unwrap_or([0; 4]));
+        let encoded_len = u32::from_le_bytes(
+            buf[tail_start + 4..tail_start + 8]
+                .try_into()
+                .unwrap_or([0; 4]),
+        ) as usize;
+        let stored_crc = u32::from_le_bytes(
+            buf[tail_start + 8..tail_start + 12]
+                .try_into()
+                .unwrap_or([0; 4]),
+        );
         if encoded_len > tail_start {
             return Ok(SlotState::Invalid(format!(
                 "slot {slot}: tail claims {encoded_len} encoded bytes, page holds {tail_start}"
@@ -449,7 +454,10 @@ mod tests {
         assert_eq!(h0.iteration, 4);
         assert!(h1.is_empty(), "torn slot must read as empty");
         let (_, active) = active_db_header(&h0, &h1);
-        assert_eq!(active.iteration, 4, "must fall back to the committed generation");
+        assert_eq!(
+            active.iteration, 4,
+            "must fall back to the committed generation"
+        );
     }
 
     #[test]
@@ -466,7 +474,8 @@ mod tests {
 
         let err = read_db_headers(&mut file).unwrap_err();
         assert!(
-            err.to_string().contains("both database header slots are damaged"),
+            err.to_string()
+                .contains("both database header slots are damaged"),
             "unexpected error: {err}"
         );
     }

@@ -7,7 +7,12 @@
 //! WAL, and garbage from an aborted out-of-place checkpoint past the live
 //! region.
 
-#![cfg(all(feature = "grafeo-file", feature = "lpg", feature = "gql", feature = "wal"))]
+#![cfg(all(
+    feature = "grafeo-file",
+    feature = "lpg",
+    feature = "gql",
+    feature = "wal"
+))]
 
 use std::io::{Seek, SeekFrom, Write};
 
@@ -56,7 +61,10 @@ fn torn_checkpoint_with_pending_wal_recovers_previous_generation_and_replays() {
     // Simulate the torn checkpoint: an aborted out-of-place data phase is
     // partial section bytes past the live region, with no header flip.
     {
-        let mut file = std::fs::OpenOptions::new().write(true).open(&victim).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&victim)
+            .unwrap();
         file.seek(SeekFrom::Start(committed_len.div_ceil(4096) * 4096))
             .unwrap();
         file.write_all(&[0xDB; 10_000]).unwrap();

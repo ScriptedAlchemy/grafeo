@@ -331,12 +331,12 @@ impl Section for CatalogSection {
         // `version` is the snapshot's first field and a u8, so bincode's
         // standard config puts it in the leading byte. Read the format
         // off that rather than guessing from a failed decode: a v1
-        // payload fed to the v2 decoder can mis-parse rather than error.
+        // payload fed to the v2 decoder can misparse rather than error.
         if found == CATALOG_SECTION_VERSION_V1 {
             let (v1, _): (CatalogSnapshotV1, _) = bincode::serde::decode_from_slice(data, config)
                 .map_err(|e| {
-                    Error::Serialization(format!("Catalog section v1 deserialization failed: {e}"))
-                })?;
+                Error::Serialization(format!("Catalog section v1 deserialization failed: {e}"))
+            })?;
             // v1 files record vector index metadata but carry neither the
             // quantization mode nor a binding token, so their indexes are
             // rebuilt the old way rather than restored. Only the property
@@ -604,8 +604,7 @@ mod tests {
             },
             epoch: 7,
         };
-        let bytes =
-            bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
         assert_eq!(bytes[0], CATALOG_SECTION_VERSION_V1);
 
         let mut section = make_section();
