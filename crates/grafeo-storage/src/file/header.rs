@@ -98,7 +98,7 @@ fn db_header_offset(slot: u8) -> u64 {
 /// [`DB_HEADER_SIZE`] bytes.
 ///
 /// The header slot is the atomic commit point of a checkpoint, so the slot
-/// carries its own authentication: the last [`DB_HEADER_TAIL_SIZE`] bytes
+/// carries its own authentication: the last `DB_HEADER_TAIL_SIZE` bytes
 /// hold a magic tag, the encoded header length, and a CRC-32 over the
 /// encoded bytes. A torn slot write (power loss mid-page) then fails the
 /// CRC and the reader falls back to the other slot instead of trusting

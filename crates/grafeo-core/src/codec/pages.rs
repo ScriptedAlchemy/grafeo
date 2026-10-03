@@ -2,7 +2,7 @@
 //! is read.
 //!
 //! A sealed section is checksummed once, at write time, in fixed
-//! [`PAGE_SIZE`] pages, and the page table travels in the section footer.
+//! `PAGE_SIZE` pages, and the page table travels in the section footer.
 //! An open verifies the footer and the pages its parse reads; every other
 //! page is verified on the first read that touches it. Opening a large
 //! sealed container therefore costs what its first queries read, not a hash

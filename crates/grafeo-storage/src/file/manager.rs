@@ -650,7 +650,7 @@ impl GrafeoFileManager {
     /// Writes sections by streaming each one straight into the container.
     ///
     /// Same on-disk result as [`write_sections`](Self::write_sections),
-    /// but no caller-side `Vec<u8>` per section: each [`Section`] emits
+    /// but no caller-side `Vec<u8>` per section: each [`Section`](grafeo_common::storage::Section) emits
     /// itself into the file through
     /// [`Section::serialize_into`](grafeo_common::storage::Section::serialize_into),
     /// so the transient heap during a full-store persist is bounded by
