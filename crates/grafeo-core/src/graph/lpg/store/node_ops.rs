@@ -284,11 +284,10 @@ impl LpgStore {
         // Allocate record in arena and get offset (create epoch if needed).
         // Kept ahead of the label registration and the version index so that a
         // failure cannot leave a half-created node behind.
-        let offset = {
-            let arena = self.arena_allocator.arena_or_create(epoch)?;
-            let (offset, _stored) = arena.alloc_value_with_offset(record)?;
-            offset
-        };
+        let pin = self.arena_allocator.pin();
+        let (offset, _stored) = pin
+            .arena_or_create(epoch)?
+            .alloc_value_with_offset(record)?;
 
         #[cfg(not(feature = "temporal"))]
         self.register_node_labels(id, labels);
@@ -306,6 +305,7 @@ impl LpgStore {
             versions.insert(id, VersionIndex::with_initial(hot_ref));
         }
         drop(versions);
+        drop(pin);
         self.track_node_version(transaction_id, id);
 
         self.live_node_count.fetch_add(1, Ordering::Relaxed);

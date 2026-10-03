@@ -3,7 +3,7 @@ use crate::graph::lpg::{EdgeRecord, NodeRecord};
 use grafeo_common::memory::AllocError;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, TransactionId};
 #[cfg(feature = "tiered-storage")]
-use grafeo_common::utils::hash::FxHashMap;
+use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::Ordering;
 
 #[cfg(not(feature = "tiered-storage"))]
@@ -324,20 +324,22 @@ impl LpgStore {
     #[cfg(feature = "tiered-storage")]
     #[doc(hidden)]
     pub fn gc_versions(&self, min_epoch: EpochId) {
-        {
-            let mut versions = self.node_versions.write();
-            for index in versions.values_mut() {
-                index.gc(min_epoch);
-            }
-            versions.retain(|_, index| !index.is_empty());
+        // Both version maps stay write-locked through the reclaim: every arena
+        // read happens under one of them, and every new reference is published
+        // under one of them or is covered by an allocation pin.
+        let mut node_versions = self.node_versions.write();
+        let mut edge_versions = self.edge_versions.write();
+        let mut live_arenas = FxHashSet::default();
+        for index in node_versions.values_mut().chain(edge_versions.values_mut()) {
+            index.gc(min_epoch);
+            live_arenas.extend(index.hot_arena_epochs());
         }
-        {
-            let mut versions = self.edge_versions.write();
-            for index in versions.values_mut() {
-                index.gc(min_epoch);
-            }
-            versions.retain(|_, index| !index.is_empty());
-        }
+        node_versions.retain(|_, index| !index.is_empty());
+        edge_versions.retain(|_, index| !index.is_empty());
+        self.arena_allocator
+            .reclaim_unreferenced(min_epoch, &live_arenas);
+        drop(edge_versions);
+        drop(node_versions);
 
         // GC old property and label versions
         #[cfg(feature = "temporal")]
@@ -551,13 +553,17 @@ impl LpgStore {
         self.register_node_labels(id, labels, epoch);
 
         // Allocate record in arena and get offset (create epoch if needed)
-        let arena = self.arena_allocator.arena_or_create(epoch)?;
-        let (offset, _stored) = arena.alloc_value_with_offset(record)?;
+        let pin = self.arena_allocator.pin();
+        let (offset, _stored) = pin
+            .arena_or_create(epoch)?
+            .alloc_value_with_offset(record)?;
 
         // Create HotVersionRef (using SYSTEM tx for recovery)
         let hot_ref = HotVersionRef::new(epoch, epoch, offset, TransactionId::SYSTEM);
-        let mut versions = self.node_versions.write();
-        versions.insert(id, VersionIndex::with_initial(hot_ref));
+        self.node_versions
+            .write()
+            .insert(id, VersionIndex::with_initial(hot_ref));
+        drop(pin);
         self.live_node_count.fetch_add(1, Ordering::Relaxed);
 
         // Update next_node_id if necessary to avoid future collisions
@@ -643,13 +649,17 @@ impl LpgStore {
         let record = EdgeRecord::new(id, src, dst, type_id, epoch);
 
         // Allocate record in arena and get offset (create epoch if needed)
-        let arena = self.arena_allocator.arena_or_create(epoch)?;
-        let (offset, _stored) = arena.alloc_value_with_offset(record)?;
+        let pin = self.arena_allocator.pin();
+        let (offset, _stored) = pin
+            .arena_or_create(epoch)?
+            .alloc_value_with_offset(record)?;
 
         // Create HotVersionRef (using SYSTEM tx for recovery)
         let hot_ref = HotVersionRef::new(epoch, epoch, offset, TransactionId::SYSTEM);
-        let mut versions = self.edge_versions.write();
-        versions.insert(id, VersionIndex::with_initial(hot_ref));
+        self.edge_versions
+            .write()
+            .insert(id, VersionIndex::with_initial(hot_ref));
+        drop(pin);
 
         // Update adjacency
         self.forward_adj.add_edge(src, dst, id);

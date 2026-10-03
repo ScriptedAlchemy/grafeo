@@ -350,7 +350,11 @@ pub struct LpgStore {
     // Rules:
     // - Acquire arena read lock *after* version locks, never before.
     // - Multiple threads may call arena.read_at() concurrently (shared refs only).
-    // - Never acquire arena write lock (alloc_new_chunk) while holding version locks.
+    // - Never wait for a version lock while holding any arena guard.
+    // - When both version locks are held, node_versions comes first.
+    // - gc_versions holds node_versions.write() → edge_versions.write() →
+    //   arena map write lock to free arenas no hot ref reaches. Writers hold an
+    //   arena_allocator.pin() from allocation until the ref is in a version map.
     // - freeze_epoch order: node_versions.read() → arena.read_at(),
     //   then edge_versions.read() → arena.read_at().
     /// Arena allocator for hot data storage.
