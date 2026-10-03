@@ -424,73 +424,31 @@ impl RdfStore {
     /// ring_index_bytes, named_graph_count)`. Recurses into named graphs so the
     /// totals reflect the full RDF memory, not just the default graph.
     ///
-    /// The index-bytes figure is an approximation: each `HashMap` entry is
-    /// charged for a pointer-sized key plus capacity-based Vec overhead. It
-    /// undercounts the per-`Term` heap (a `Term::IRI(String)` carries its
-    /// payload) and overcounts hash-map empty buckets. Good enough to surface
-    /// "RDF is eating the heap" in an introspection breakdown.
+    /// The triple set and index tables are charged their exact allocations,
+    /// and each index entry's triple list its capacity. The per-`Term` heap
+    /// (a `Term::IRI(String)` carries its payload) is not counted.
     #[must_use]
     pub fn heap_memory_bytes(&self) -> (usize, usize, usize, usize, usize) {
+        use grafeo_common::memory::heap::vec_bytes;
         use std::mem::size_of;
 
+        fn index_bytes<K: Eq + std::hash::Hash>(
+            index: &hashbrown::HashMap<K, Vec<Arc<Triple>>, foldhash::fast::RandomState>,
+        ) -> usize {
+            index.allocation_size() + index.values().map(vec_bytes).sum::<usize>()
+        }
+
         let triples = self.triples.read();
-        let triple_arc_bytes = triples.capacity() * (size_of::<Arc<Triple>>() + size_of::<u64>());
-        let triple_payload_bytes = triples.len() * size_of::<Triple>();
+        let triple_bytes = triples.allocation_size() + triples.len() * size_of::<Triple>();
         drop(triples);
 
-        let index_entry = size_of::<(Term, Vec<Arc<Triple>>)>();
-        let composite_entry = size_of::<((Term, Term), Vec<Arc<Triple>>)>();
-
-        let subject_bytes = {
-            let g = self.subject_index.read();
-            g.capacity() * index_entry
-                + g.values()
-                    .map(|v| v.capacity() * size_of::<Arc<Triple>>())
-                    .sum::<usize>()
-        };
-        let predicate_bytes = {
-            let g = self.predicate_index.read();
-            g.capacity() * index_entry
-                + g.values()
-                    .map(|v| v.capacity() * size_of::<Arc<Triple>>())
-                    .sum::<usize>()
-        };
-        let object_bytes = self.object_index.read().as_ref().map_or(0, |g| {
-            g.capacity() * index_entry
-                + g.values()
-                    .map(|v| v.capacity() * size_of::<Arc<Triple>>())
-                    .sum::<usize>()
-        });
-        let sp_bytes = {
-            let g = self.sp_index.read();
-            g.capacity() * composite_entry
-                + g.values()
-                    .map(|v| v.capacity() * size_of::<Arc<Triple>>())
-                    .sum::<usize>()
-        };
-        let po_bytes = {
-            let g = self.po_index.read();
-            g.capacity() * composite_entry
-                + g.values()
-                    .map(|v| v.capacity() * size_of::<Arc<Triple>>())
-                    .sum::<usize>()
-        };
-        let os_bytes = {
-            let g = self.os_index.read();
-            g.capacity() * composite_entry
-                + g.values()
-                    .map(|v| v.capacity() * size_of::<Arc<Triple>>())
-                    .sum::<usize>()
-        };
-
-        let mut triples_and_indexes = triple_arc_bytes
-            + triple_payload_bytes
-            + subject_bytes
-            + predicate_bytes
-            + object_bytes
-            + sp_bytes
-            + po_bytes
-            + os_bytes;
+        let mut triples_and_indexes = triple_bytes
+            + index_bytes(&self.subject_index.read())
+            + index_bytes(&self.predicate_index.read())
+            + self.object_index.read().as_ref().map_or(0, index_bytes)
+            + index_bytes(&self.sp_index.read())
+            + index_bytes(&self.po_index.read())
+            + index_bytes(&self.os_index.read());
 
         let term_dict_bytes = self
             .dictionary_cache

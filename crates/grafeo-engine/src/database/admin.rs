@@ -115,8 +115,8 @@ impl super::GrafeoDB {
     /// Returns a hierarchical memory usage breakdown.
     ///
     /// Walks all internal structures (store, indexes, MVCC chains, caches,
-    /// string pools, buffer manager) and returns estimated heap bytes for each.
-    /// Safe to call concurrently with queries.
+    /// string pools, buffer manager, catalog) and returns estimated heap bytes
+    /// for each. Safe to call concurrently with queries.
     #[must_use]
     pub fn memory_usage(&self) -> crate::memory_usage::MemoryUsage {
         use crate::memory_usage::{BufferManagerMemory, CacheMemory, MemoryUsage};
@@ -151,6 +151,7 @@ impl super::GrafeoDB {
             caches,
             string_pool,
             buffer_manager,
+            catalog_bytes: self.catalog.heap_bytes(),
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             compact_base: self.compact_base_memory(),
             ..Default::default()

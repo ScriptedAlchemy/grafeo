@@ -256,13 +256,13 @@ impl LabelRegistry {
         self.id_to_name.clear();
     }
 
-    /// Estimates heap memory usage in bytes.
+    /// Heap bytes the registry holds; each name's allocation is shared by
+    /// both directions and charged once.
     pub(super) fn heap_bytes(&self) -> usize {
-        let map_bytes = self.name_to_id.capacity()
-            * (std::mem::size_of::<ArcStr>() + std::mem::size_of::<u32>());
-        let vec_bytes = self.id_to_name.capacity() * std::mem::size_of::<ArcStr>();
-        let string_bytes: usize = self.id_to_name.iter().map(|s| s.len()).sum();
-        map_bytes + vec_bytes + string_bytes
+        use grafeo_common::memory::heap::{arcstr_bytes, vec_bytes};
+        self.name_to_id.allocation_size()
+            + vec_bytes(&self.id_to_name)
+            + self.id_to_name.iter().map(arcstr_bytes).sum::<usize>()
     }
 }
 
@@ -350,7 +350,11 @@ pub struct LpgStore {
     // Rules:
     // - Acquire arena read lock *after* version locks, never before.
     // - Multiple threads may call arena.read_at() concurrently (shared refs only).
-    // - Never acquire arena write lock (alloc_new_chunk) while holding version locks.
+    // - Never wait for a version lock while holding any arena guard.
+    // - When both version locks are held, node_versions comes first.
+    // - gc_versions holds node_versions.write() → edge_versions.write() →
+    //   arena map write lock to free arenas no hot ref reaches. Writers hold an
+    //   arena_allocator.pin() from allocation until the ref is in a version map.
     // - freeze_epoch order: node_versions.read() → arena.read_at(),
     //   then edge_versions.read() → arena.read_at().
     /// Arena allocator for hot data storage.

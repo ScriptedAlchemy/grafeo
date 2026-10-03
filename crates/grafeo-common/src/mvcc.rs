@@ -866,44 +866,34 @@ impl VersionIndex {
 
     /// Garbage collects old versions not needed by any active transaction.
     ///
-    /// Keeps versions that might still be visible to transactions at or after `min_epoch`.
+    /// Keeps versions that might still be visible to transactions at or after
+    /// `min_epoch`, applying the same baseline rule as [`VersionChain::gc`]: the
+    /// most recent pre-`min_epoch` version is dropped once its deletion is
+    /// strictly below `min_epoch`, since no reader can see it any more and a
+    /// hot copy would pin its epoch's arena.
     pub fn gc(&mut self, min_epoch: EpochId) {
-        if self.is_empty() {
-            return;
-        }
-
-        // Keep versions that:
-        // 1. Were created at or after min_epoch
-        // 2. The first (most recent) version created before min_epoch
+        let horizon = min_epoch.as_u64();
         let mut found_old_visible = false;
-
-        self.hot.retain(|v| {
-            if v.epoch.as_u64() >= min_epoch.as_u64() {
+        let mut keep = |epoch: EpochId, deleted: Option<EpochId>| {
+            if epoch.as_u64() >= horizon {
                 true
-            } else if !found_old_visible {
-                found_old_visible = true;
-                true
-            } else {
+            } else if found_old_visible {
                 false
+            } else {
+                found_old_visible = true;
+                deleted.is_none_or(|deleted| deleted.as_u64() >= horizon)
             }
-        });
+        };
 
-        // Same for cold, but only if we haven't found an old visible in hot
-        if !found_old_visible {
-            self.cold.retain(|v| {
-                if v.epoch.as_u64() >= min_epoch.as_u64() {
-                    true
-                } else if !found_old_visible {
-                    found_old_visible = true;
-                    true
-                } else {
-                    false
-                }
-            });
-        } else {
-            // All cold versions are older, only keep those >= min_epoch
-            self.cold.retain(|v| v.epoch.as_u64() >= min_epoch.as_u64());
-        }
+        // Hot versions are newer than cold ones, so the baseline is searched
+        // in hot first.
+        self.hot.retain(|v| keep(v.epoch, v.deleted_epoch.get()));
+        self.cold.retain(|v| keep(v.epoch, v.deleted_epoch.get()));
+    }
+
+    /// Returns the arena epochs that hot versions still read from.
+    pub fn hot_arena_epochs(&self) -> impl Iterator<Item = EpochId> + '_ {
+        self.hot.iter().map(|v| v.arena_epoch)
     }
 
     /// Returns epoch IDs of all versions, newest first.
@@ -1316,6 +1306,52 @@ mod tiered_storage_tests {
         // Verify we kept epochs 5 and 3
         assert!(index.visible_at(EpochId::new(5)).is_some());
         assert!(index.visible_at(EpochId::new(3)).is_some());
+    }
+
+    fn index_deleted_at(deleted: Option<u64>) -> VersionIndex {
+        let mut index = VersionIndex::with_initial(HotVersionRef::new(
+            EpochId::new(1),
+            EpochId::new(1),
+            0,
+            TransactionId::new(1),
+        ));
+        if let Some(deleted) = deleted {
+            index.mark_deleted(EpochId::new(deleted), TransactionId::new(2));
+        }
+        index
+    }
+
+    #[test]
+    fn test_version_index_gc_drops_a_baseline_deleted_before_the_horizon() {
+        let mut index = index_deleted_at(Some(2));
+
+        index.gc(EpochId::new(5));
+
+        assert!(index.is_empty());
+        assert_eq!(index.hot_arena_epochs().count(), 0);
+    }
+
+    #[test]
+    fn test_version_index_gc_keeps_a_baseline_deleted_at_the_horizon() {
+        let mut index = index_deleted_at(Some(5));
+
+        index.gc(EpochId::new(5));
+
+        assert_eq!(index.version_count(), 1);
+    }
+
+    #[test]
+    fn test_version_index_gc_keeps_a_live_baseline() {
+        let mut index = index_deleted_at(None);
+
+        index.gc(EpochId::new(5));
+
+        assert_eq!(index.version_count(), 1);
+        assert!(index.visible_at(EpochId::new(5)).is_some());
+        assert_eq!(
+            index.hot_arena_epochs().collect::<Vec<_>>(),
+            [EpochId::new(1)]
+        );
     }
 
     #[test]

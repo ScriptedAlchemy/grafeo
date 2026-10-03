@@ -20,6 +20,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use parking_lot::{Mutex, RwLock};
 
 use grafeo_common::collections::{GrafeoConcurrentMap, grafeo_concurrent_map};
+use grafeo_common::memory::heap::{
+    arc_str_bytes, dash_map_bytes, std_hash_map_bytes, std_hash_set_bytes, string_bytes, vec_bytes,
+};
 use grafeo_common::types::{EdgeTypeId, IndexId, LabelId, PropertyKeyId, Value};
 
 /// The database's schema dictionary - maps names to compact internal IDs.
@@ -50,6 +53,24 @@ impl Catalog {
             indexes: IndexCatalog::new(),
             schema: Some(SchemaCatalog::new()),
         }
+    }
+
+    /// Heap bytes the catalog holds: the name registries, index definitions,
+    /// and schema tables. Type, graph-type, and procedure definitions are
+    /// charged their table slots, not their own fields' heap.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        name_registry_bytes(&self.labels.name_to_id, &self.labels.id_to_name.read())
+            + name_registry_bytes(
+                &self.property_keys.name_to_id,
+                &self.property_keys.id_to_name.read(),
+            )
+            + name_registry_bytes(
+                &self.edge_types.name_to_id,
+                &self.edge_types.id_to_name.read(),
+            )
+            + self.indexes.heap_bytes()
+            + self.schema.as_ref().map_or(0, SchemaCatalog::heap_bytes)
     }
 
     /// Creates a new catalog with schema constraints enabled.
@@ -756,6 +777,16 @@ impl Default for Catalog {
     }
 }
 
+/// Each name's allocation is shared by both directions and charged once.
+fn name_registry_bytes<Id>(
+    name_to_id: &GrafeoConcurrentMap<Arc<str>, Id>,
+    id_to_name: &Vec<Arc<str>>,
+) -> usize {
+    dash_map_bytes(name_to_id, |_, _| 0)
+        + vec_bytes(id_to_name)
+        + id_to_name.iter().map(arc_str_bytes).sum::<usize>()
+}
+
 // === Label Catalog ===
 
 /// Bidirectional mapping between label names and IDs.
@@ -1062,6 +1093,27 @@ impl IndexCatalog {
 
     fn all(&self) -> Vec<IndexDefinition> {
         self.indexes.read().values().cloned().collect()
+    }
+
+    fn heap_bytes(&self) -> usize {
+        let indexes = self.indexes.read();
+        let label_indexes = self.label_indexes.read();
+        let label_property_indexes = self.label_property_indexes.read();
+        let name_index = self.name_index.read();
+        std_hash_map_bytes(&indexes)
+            + indexes
+                .values()
+                .map(|index| string_bytes(&index.name))
+                .sum::<usize>()
+            + std_hash_map_bytes(&label_indexes)
+            + label_indexes.values().map(vec_bytes).sum::<usize>()
+            + std_hash_map_bytes(&label_property_indexes)
+            + label_property_indexes
+                .values()
+                .map(vec_bytes)
+                .sum::<usize>()
+            + std_hash_map_bytes(&name_index)
+            + name_index.keys().map(string_bytes).sum::<usize>()
     }
 }
 
@@ -1855,6 +1907,24 @@ impl SchemaCatalog {
         self.unique_constraints
             .read()
             .contains(&(label, property_key))
+    }
+
+    fn heap_bytes(&self) -> usize {
+        fn keyed<V>(map: &HashMap<String, V>) -> usize {
+            std_hash_map_bytes(map) + map.keys().map(string_bytes).sum::<usize>()
+        }
+        let schemas = self.schemas.read();
+        let bindings = self.graph_type_bindings.read();
+        std_hash_set_bytes(&self.unique_constraints.read())
+            + std_hash_set_bytes(&self.required_properties.read())
+            + keyed(&self.node_types.read())
+            + keyed(&self.edge_types.read())
+            + keyed(&self.graph_types.read())
+            + keyed(&self.procedures.read())
+            + keyed(&bindings)
+            + bindings.values().map(string_bytes).sum::<usize>()
+            + vec_bytes(&schemas)
+            + schemas.iter().map(string_bytes).sum::<usize>()
     }
 }
 

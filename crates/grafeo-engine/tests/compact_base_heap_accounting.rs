@@ -157,6 +157,30 @@ fn assert_reports_live(
 }
 
 #[test]
+fn an_empty_container_open_reports_the_heap_its_open_left_live() {
+    let _measurement = MEASUREMENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("empty.grafeo");
+    GrafeoDB::write_compact_container(
+        &path,
+        IncrementalCompactStoreBuilder::new(),
+        ["key".to_owned()],
+    )
+    .expect("write empty container");
+    for mapped in [true, false] {
+        let (db, live, usage) = open_measured(&path, mapped);
+        assert!(
+            usage.total_bytes * 10 >= live * 9 && usage.total_bytes * 10 <= live * 11,
+            "the open left {live} bytes live but memory_usage reports {}: {usage:?}",
+            usage.total_bytes
+        );
+        drop(db);
+    }
+}
+
+#[test]
 fn a_reopened_compact_base_reports_the_heap_its_open_left_live() {
     let _measurement = MEASUREMENT
         .lock()

@@ -184,11 +184,10 @@ impl LpgStore {
         // Allocate record in arena and get offset (create epoch if needed).
         // Nothing below this point can fail, so the store is never left with a
         // half-created edge.
-        let offset = {
-            let arena = self.arena_allocator.arena_or_create(epoch)?;
-            let (offset, _stored) = arena.alloc_value_with_offset(record)?;
-            offset
-        };
+        let pin = self.arena_allocator.pin();
+        let (offset, _stored) = pin
+            .arena_or_create(epoch)?
+            .alloc_value_with_offset(record)?;
 
         // Uncommitted transactional versions use PENDING epoch so they are
         // invisible to other sessions until the transaction commits.
@@ -209,6 +208,7 @@ impl LpgStore {
             versions.insert(id, VersionIndex::with_initial(hot_ref));
         }
         drop(versions);
+        drop(pin);
         self.track_edge_version(transaction_id, id);
 
         // Update adjacency
@@ -823,11 +823,6 @@ impl LpgStore {
         let base_id = self
             .next_edge_id
             .fetch_add(edges.len() as u64, Ordering::Relaxed);
-        let arena = self
-            .arena_allocator
-            .arena_or_create(epoch)
-            .unwrap_or_else(|error| panic!("failed to create arena for epoch: {error}"));
-
         let mut ids = Vec::with_capacity(edges.len());
         let mut forward_batch = Vec::with_capacity(edges.len());
         let mut backward_batch = Vec::with_capacity(edges.len());
@@ -836,17 +831,24 @@ impl LpgStore {
 
         // Create all edge records under a single versions write lock
         {
+            // The arena guard is taken under the versions lock, never before
+            // it, to keep the documented version-then-arena lock order.
             let mut versions = self.edge_versions.write();
+            let pin = self.arena_allocator.pin();
+            let arena = pin
+                .arena_or_create(epoch)
+                .unwrap_or_else(|error| panic!("failed to create arena for epoch: {error}"));
             for (i, &(src, dst, edge_type)) in edges.iter().enumerate() {
                 let id = EdgeId::new(base_id + i as u64);
                 let type_id = self.get_or_create_edge_type_id(edge_type);
 
                 let record = EdgeRecord::new(id, src, dst, type_id, epoch);
-                let (offset, _stored) = arena
-                    .alloc_value_with_offset(record)
-                    .unwrap_or_else(|error| {
-                        panic!("arena allocation failed for edge record: {error}")
-                    });
+                let (offset, _stored) =
+                    arena
+                        .alloc_value_with_offset(record)
+                        .unwrap_or_else(|error| {
+                            panic!("arena allocation failed for edge record: {error}")
+                        });
                 let hot_ref = HotVersionRef::new(epoch, epoch, offset, TransactionId::SYSTEM);
                 versions.insert(id, VersionIndex::with_initial(hot_ref));
 

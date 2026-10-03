@@ -90,12 +90,16 @@ pub struct MvccMemory {
     pub average_chain_depth: f64,
     /// Maximum version chain depth seen.
     pub max_chain_depth: usize,
+    /// Arena chunks tiered storage keeps versioned node and edge records in.
+    #[serde(default)]
+    pub arena_bytes: usize,
 }
 
 impl MvccMemory {
     /// Recomputes `total_bytes` from child values.
     pub fn compute_total(&mut self) {
-        self.total_bytes = self.node_version_chains_bytes + self.edge_version_chains_bytes;
+        self.total_bytes =
+            self.node_version_chains_bytes + self.edge_version_chains_bytes + self.arena_bytes;
     }
 }
 

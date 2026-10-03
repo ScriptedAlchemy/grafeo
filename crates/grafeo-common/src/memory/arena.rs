@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::RwLock;
 
 use crate::types::EpochId;
+#[cfg(feature = "tiered-storage")]
+use crate::utils::hash::FxHashSet;
 
 /// Default chunk size for arena allocations (1 MB).
 const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
@@ -616,6 +618,42 @@ pub struct ArenaAllocator {
     current_epoch: AtomicUsize,
     /// Default chunk size.
     chunk_size: usize,
+    /// Live [`AllocationPin`]s, each an allocation whose reference may not be
+    /// published yet.
+    #[cfg(feature = "tiered-storage")]
+    pins: AtomicUsize,
+}
+
+/// Holds off [`ArenaAllocator::reclaim_unreferenced`] from the moment a value
+/// is allocated until the caller has published the reference to it, so a
+/// reclaim that cannot see the reference yet never frees its arena.
+#[cfg(feature = "tiered-storage")]
+#[must_use = "dropping the pin lets reclamation free the arena before the reference is published"]
+pub struct AllocationPin<'a> {
+    allocator: &'a ArenaAllocator,
+}
+
+#[cfg(feature = "tiered-storage")]
+impl AllocationPin<'_> {
+    /// Gets or creates the arena for `epoch`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AllocError` if the arena allocation fails.
+    pub fn arena_or_create(
+        &self,
+        epoch: EpochId,
+    ) -> Result<impl std::ops::Deref<Target = Arena> + '_, AllocError> {
+        self.allocator.ensure_epoch(epoch)?;
+        self.allocator.arena(epoch)
+    }
+}
+
+#[cfg(feature = "tiered-storage")]
+impl Drop for AllocationPin<'_> {
+    fn drop(&mut self) {
+        self.allocator.pins.fetch_sub(1, Ordering::Release);
+    }
 }
 
 impl ArenaAllocator {
@@ -638,6 +676,8 @@ impl ArenaAllocator {
             arenas: RwLock::new(hashbrown::HashMap::new()),
             current_epoch: AtomicUsize::new(0),
             chunk_size,
+            #[cfg(feature = "tiered-storage")]
+            pins: AtomicUsize::new(0),
         };
 
         // Create the initial epoch
@@ -717,18 +757,32 @@ impl ArenaAllocator {
         Ok(true)
     }
 
-    /// Gets or creates an arena for a specific epoch.
-    ///
-    /// # Errors
-    ///
-    /// Returns `AllocError` if the arena allocation fails.
+    /// Pins the allocator for one allocate-then-publish sequence. Hold the
+    /// returned pin until the reference to the allocated value is reachable
+    /// by [`Self::reclaim_unreferenced`]'s caller.
     #[cfg(feature = "tiered-storage")]
-    pub fn arena_or_create(
-        &self,
-        epoch: EpochId,
-    ) -> Result<impl std::ops::Deref<Target = Arena> + '_, AllocError> {
-        self.ensure_epoch(epoch)?;
-        self.arena(epoch)
+    pub fn pin(&self) -> AllocationPin<'_> {
+        self.pins.fetch_add(1, Ordering::AcqRel);
+        AllocationPin { allocator: self }
+    }
+
+    /// Frees every arena older than `horizon` that is not in `live`, keeping
+    /// the current epoch's arena. Does nothing while an [`AllocationPin`] is
+    /// held, because its reference may not be in `live` yet.
+    ///
+    /// The caller must exclude every reader and every publisher of arena
+    /// references while collecting `live` and calling this, so that `live`
+    /// holds every reference that can still be followed.
+    #[cfg(feature = "tiered-storage")]
+    pub fn reclaim_unreferenced(&self, horizon: EpochId, live: &FxHashSet<EpochId>) {
+        let mut arenas = self.arenas.write();
+        // A pin taken before this lock was acquired is visible here; a pin
+        // taken after it allocates only once the lock is released.
+        if self.pins.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let current = self.current_epoch();
+        arenas.retain(|&epoch, _| epoch == current || epoch >= horizon || live.contains(&epoch));
     }
 
     /// Allocates in the current epoch.
@@ -876,6 +930,31 @@ mod tests {
         // Memory should decrease
         let after_drop = allocator.total_allocated();
         assert!(after_drop < after_alloc);
+    }
+
+    #[test]
+    #[cfg(feature = "tiered-storage")]
+    fn test_reclaim_unreferenced_frees_only_dead_epochs_below_the_horizon() {
+        let allocator = ArenaAllocator::new().unwrap();
+        let [live, dead, at_horizon] = [2, 3, 5].map(EpochId::new);
+        for epoch in [live, dead, at_horizon] {
+            allocator.ensure_epoch(epoch).unwrap();
+        }
+        let live_set: FxHashSet<EpochId> = [live].into_iter().collect();
+
+        let pin = allocator.pin();
+        allocator.reclaim_unreferenced(at_horizon, &live_set);
+        assert!(
+            allocator.arena(dead).is_ok(),
+            "an in-flight pin must block reclamation"
+        );
+        drop(pin);
+
+        allocator.reclaim_unreferenced(at_horizon, &live_set);
+        assert!(allocator.arena(dead).is_err());
+        assert!(allocator.arena(live).is_ok());
+        assert!(allocator.arena(at_horizon).is_ok());
+        assert!(allocator.arena(allocator.current_epoch()).is_ok());
     }
 
     #[test]
@@ -1188,9 +1267,7 @@ mod tiered_storage_tests {
         struct Aligned16([u8; 64]);
 
         let arena = Arena::with_chunk_size(EpochId::INITIAL, 64).unwrap();
-        let (offset, _) = arena
-            .alloc_value_with_offset(Aligned16([3u8; 64]))
-            .unwrap();
+        let (offset, _) = arena.alloc_value_with_offset(Aligned16([3u8; 64])).unwrap();
         assert_eq!(offset, 0);
         // SAFETY: offset was returned by alloc_value_with_offset for this type and arena
         unsafe {
@@ -1205,7 +1282,9 @@ mod tiered_storage_tests {
         // anything, because `chunks` is only grown when a chunk fills up.
         let arena = Arena::with_chunk_size(EpochId::INITIAL, 1 << 30).unwrap();
         for _ in 0..3 {
-            arena.grow_uniform_chunks(arena.stats().chunk_count).unwrap();
+            arena
+                .grow_uniform_chunks(arena.stats().chunk_count)
+                .unwrap();
         }
         assert_eq!(arena.stats().chunk_count, 4);
 

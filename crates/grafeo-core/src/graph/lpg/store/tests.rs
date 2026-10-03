@@ -1764,3 +1764,58 @@ fn test_clear() {
     assert_eq!(store.node_count(), 1);
     assert!(store.get_node(n3).is_some());
 }
+
+#[test]
+#[cfg(feature = "tiered-storage")]
+fn test_gc_never_frees_an_arena_a_concurrent_writer_is_publishing_into() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let store = Arc::new(LpgStore::new().unwrap());
+    let baseline_arena_bytes = store.arena_allocator.total_allocated();
+    let horizon = EpochId::new(1 << 30);
+    let next_epoch = Arc::new(AtomicU64::new(1));
+    let writers_done = Arc::new(AtomicBool::new(false));
+
+    let gc = {
+        let store = Arc::clone(&store);
+        let writers_done = Arc::clone(&writers_done);
+        std::thread::spawn(move || {
+            while !writers_done.load(Ordering::Acquire) {
+                store.gc_versions(horizon);
+            }
+        })
+    };
+    let writers: Vec<_> = (0..4)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            let next_epoch = Arc::clone(&next_epoch);
+            std::thread::spawn(move || {
+                for _ in 0..2_000 {
+                    // A fresh epoch per node means its arena is referenced by
+                    // nothing else, so a reclaim that misses the in-flight ref
+                    // frees it.
+                    let epoch = EpochId::new(next_epoch.fetch_add(1, Ordering::Relaxed));
+                    let id = store.create_node_versioned(&["N"], epoch, TransactionId::SYSTEM);
+                    let node = store.get_node_at_epoch(id, horizon);
+                    assert_eq!(node.map(|node| node.id), Some(id));
+                    assert!(store.delete_node_at_epoch(id, epoch));
+                }
+            })
+        })
+        .collect();
+    let writer_results: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
+    writers_done.store(true, Ordering::Release);
+    gc.join().unwrap();
+    assert!(
+        writer_results.iter().all(Result::is_ok),
+        "a writer panicked"
+    );
+
+    store.gc_versions(horizon);
+    assert_eq!(store.node_count(), 0);
+    assert_eq!(
+        store.arena_allocator.total_allocated(),
+        baseline_arena_bytes
+    );
+}

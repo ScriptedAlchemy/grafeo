@@ -28,6 +28,7 @@
 //! cache.put_optimized(cache_key, plan);
 //! ```
 
+use grafeo_common::memory::heap::{std_hash_map_bytes, vec_bytes};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -196,12 +197,10 @@ impl<K: Clone + Eq + Hash, V: Clone> LruCache<K, V> {
         self.entries.remove(key).map(|e| e.value)
     }
 
-    /// Estimates heap memory used by this cache (map buckets + access order vec).
+    /// Heap bytes the entry table and access-order buffer hold. Key strings
+    /// and cached plans are not walked.
     fn heap_memory_bytes(&self) -> usize {
-        let entry_size = std::mem::size_of::<K>() + std::mem::size_of::<CacheEntry<V>>() + 1;
-        let map_bytes = self.entries.capacity() * entry_size;
-        let vec_bytes = self.access_order.capacity() * std::mem::size_of::<K>();
-        map_bytes + vec_bytes
+        std_hash_map_bytes(&self.entries) + vec_bytes(&self.access_order)
     }
 }
 
