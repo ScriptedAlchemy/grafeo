@@ -216,10 +216,8 @@ impl GraphStore for CompactStore {
     }
 
     fn node_ids(&self) -> Vec<NodeId> {
-        if let Some(ref map) = self.node_id_map {
-            let mut ids: Vec<NodeId> = map.keys().copied().collect();
-            ids.sort_unstable();
-            ids
+        if let Some(ref map) = self.node_ids {
+            map.ids().map(NodeId::new).collect()
         } else {
             let mut ids = Vec::new();
             for nt in &self.node_tables_by_id {
@@ -277,13 +275,26 @@ impl GraphStore for CompactStore {
     fn find_nodes_by_property(&self, property: &str, value: &Value) -> Vec<NodeId> {
         let key = PropertyKey::new(property);
 
-        // Indexed property: one hash lookup instead of pruning zone maps
-        // and scanning every surviving column.
+        // Indexed property: a binary search per table instead of pruning
+        // zone maps and scanning every surviving column.
         if let Some(index) = self.property_value_index(&key) {
-            return index
-                .get(&grafeo_common::types::HashableValue::new(value.clone()))
-                .cloned()
-                .unwrap_or_default();
+            let mut results = Vec::new();
+            for (table_id, order) in index.iter() {
+                let Some(col) = self
+                    .resolve_node_table(*table_id)
+                    .and_then(|nt| nt.column(&key))
+                else {
+                    continue;
+                };
+                results.extend(
+                    super::value_order::find_eq(col, order, value)
+                        .into_iter()
+                        .map(|offset| {
+                            self.to_original_node_id(encode_node_id(*table_id, offset as u64))
+                        }),
+                );
+            }
+            return results;
         }
 
         let mut results = Vec::new();

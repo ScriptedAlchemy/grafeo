@@ -13,15 +13,19 @@ use grafeo_common::utils::hash::FxHashMap;
 use parking_lot::RwLock;
 
 use super::CompactStore;
-use super::column::ColumnCodec;
+use super::column::{ColumnCodec, MappedDictionary, write_dictionary_regions};
 use super::csr::CsrAdjacency;
+use super::id_map::{IdMap, IdRecord, RECORD_BYTES};
 use super::node_table::NodeTable;
 use super::rel_table::RelTable;
 use super::schema::{ColumnDef, ColumnType, EdgeSchema, TableSchema};
+use super::value_order::RowOrder;
 use super::zone_map::ZoneMap;
 use crate::codec::limits::{checked_u16, checked_u32};
+use crate::codec::pages::{PageCrcWriter, SectionPages};
 use crate::codec::{BitVector, SectionSpan};
 use crate::statistics::{EdgeTypeStatistics, LabelStatistics, Statistics};
+use grafeo_common::utils::error::Error;
 
 /// Magic bytes identifying a CompactStore section.
 const MAGIC: [u8; 4] = *b"GCST";
@@ -36,7 +40,24 @@ const MAGIC: [u8; 4] = *b"GCST";
 /// each node and edge column body, so a row the builder padded because
 /// its node never had the property reads back as absent instead of as
 /// `0`, `""`, or `false`. Column bodies are unchanged from v3/v4.
-pub(crate) const FORMAT_VERSION: u8 = 5;
+///
+/// v6 is laid out to be served in place from a mapping: every bulk part
+/// (column body, dictionary entries, row order, adjacency, id map) is a
+/// region, described by a metadata block at the end, and the section is
+/// checksummed in pages ([`SectionPages`]) instead of by one trailing CRC.
+/// An open verifies the metadata and the regions it decodes; dictionary
+/// entries, id maps, and the row orders of indexed columns are read in
+/// place and verified page by page as reads first touch them.
+pub(crate) const FORMAT_VERSION: u8 = 6;
+
+/// v5 layout: v3/v4 columns with null masks, one trailing CRC.
+const FORMAT_VERSION_V5: u8 = 5;
+
+/// Section header: magic, version, flags.
+const HEADER_BYTES: usize = 6;
+
+/// v6 tail before the page table: metadata offset and length, LE u64.
+const TAIL_BYTES: usize = 16;
 
 /// First version that stores per-column null masks. Columns read from an
 /// older section have no mask, so their padded rows still decode as the
@@ -99,6 +120,14 @@ impl CompactStoreSection {
         }
     }
 
+    /// Whether `data` is a section that carries its own page checksums, so
+    /// a mapped open may skip hashing it whole: reads verify each page the
+    /// first time they touch it.
+    #[must_use]
+    pub fn is_page_checksummed(data: &[u8]) -> bool {
+        data.starts_with(&MAGIC) && data.get(4) == Some(&FORMAT_VERSION)
+    }
+
     /// Marks this section as dirty.
     pub fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Release);
@@ -121,14 +150,15 @@ impl CompactStoreSection {
     ///
     /// # Errors
     ///
-    /// Same error semantics as [`Section::deserialize`].
+    /// `Error::Storage(StorageError::Corruption)` for a section that does
+    /// not decode or fails a checksum it verifies at open.
     pub fn deserialize_from_bytes(
         &mut self,
         data: bytes::Bytes,
     ) -> grafeo_common::utils::error::Result<()> {
         let store = deserialize_compact_store(&data).map_err(|e| {
-            grafeo_common::utils::error::Error::Internal(format!(
-                "CompactStore deserialization failed: {e}"
+            Error::Storage(grafeo_common::utils::error::StorageError::Corruption(
+                format!("CompactStore deserialization failed: {e}"),
             ))
         })?;
         *self.store.write() = Some(Arc::new(store));
@@ -189,6 +219,9 @@ impl CompactStoreSection {
         let store = guard.as_ref().ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal("no CompactStore to serialize".into())
         })?;
+        if version == FORMAT_VERSION {
+            return write_store(store, sink);
+        }
 
         let mut stream = SectionStream::begin(sink, version, store.preserves_ids());
 
@@ -224,27 +257,320 @@ impl CompactStoreSection {
             }
         }
 
-        // Ascending id order: the maps hash with a per-instance random
-        // seed, so their walk order would make two writes of the same store
-        // differ byte for byte.
-        if let Some(ref node_map) = store.node_id_map {
-            let mut entries: Vec<(u64, u16, u64)> = node_map
-                .iter()
-                .map(|(&nid, &(tid, off))| (nid.as_u64(), tid, off))
-                .collect();
-            entries.sort_unstable_by_key(|&(nid, _, _)| nid);
-            stream.id_map(&entries)?;
-        }
-        if let Some(ref edge_map) = store.edge_id_map {
-            let mut entries: Vec<(u64, u16, u64)> = edge_map
-                .iter()
-                .map(|(&eid, &(rtid, pos))| (eid.as_u64(), rtid, pos))
-                .collect();
-            entries.sort_unstable_by_key(|&(eid, _, _)| eid);
-            stream.id_map(&entries)?;
+        if let Some((nodes, edges)) = store.id_maps() {
+            stream.id_map(&id_records(nodes)?)?;
+            stream.id_map(&id_records(edges)?)?;
         }
 
         stream.finish()
+    }
+}
+
+/// An id map's records in ascending id order.
+fn id_records(map: &IdMap) -> grafeo_common::utils::error::Result<Vec<IdRecord>> {
+    (0..map.len())
+        .map(|index| map.record(index).ok_or_else(unreadable_region))
+        .collect()
+}
+
+/// A table's reverse ids in position order.
+fn reverse_ids(map: &IdMap, table: usize) -> grafeo_common::utils::error::Result<Vec<u64>> {
+    let table_id = u16::try_from(table).map_err(|_| unreadable_region())?;
+    (0..map.table_len(table))
+        .map(|position| {
+            map.original(table_id, position as u64)
+                .ok_or_else(unreadable_region)
+        })
+        .collect()
+}
+
+fn unreadable_region() -> Error {
+    Error::Internal("a mapped compact store region failed its page checksum".into())
+}
+
+/// Writes a resident store as a current-version section.
+fn write_store(
+    store: &CompactStore,
+    sink: &mut dyn std::io::Write,
+) -> grafeo_common::utils::error::Result<()> {
+    let mut writer = SectionWriter::begin(sink, store.preserves_ids())?;
+    let indexes = store.property_value_indexes.read();
+
+    writer.count(store.node_tables_by_id.len())?;
+    for nt in &store.node_tables_by_id {
+        let columns = sorted_by_key(nt.columns());
+        writer.node_table(nt.label(), nt.len(), columns.len())?;
+        for (key, codec) in columns {
+            let order = indexes.get(key).and_then(|index| {
+                index
+                    .iter()
+                    .find(|(table_id, _)| *table_id == nt.table_id())
+                    .map(|(_, order)| order)
+            });
+            writer.node_column(
+                key,
+                nt.zone_maps().get(key),
+                nt.null_mask(key),
+                codec,
+                nt.block_zone_maps().get(key).map(Vec::as_slice),
+                order,
+            )?;
+        }
+    }
+
+    writer.count(store.rel_tables_by_id.len())?;
+    for rt in &store.rel_tables_by_id {
+        let properties = sorted_by_key(rt.properties());
+        writer.rel_table(
+            rt.edge_type().as_str(),
+            rt.src_table_id(),
+            rt.dst_table_id(),
+            rt.fwd(),
+            rt.bwd(),
+            properties.len(),
+        )?;
+        for (key, codec) in properties {
+            writer.rel_column(key, rt.null_mask(key), codec)?;
+        }
+    }
+
+    if let Some((nodes, edges)) = store.id_maps() {
+        for map in [nodes, edges] {
+            writer.id_records(&id_records(map)?)?;
+            writer.count(map.table_count())?;
+            for table in 0..map.table_count() {
+                writer.reverse_ids(&reverse_ids(map, table)?)?;
+            }
+        }
+    }
+    drop(indexes);
+    writer.finish()
+}
+
+/// The encoder of the current section layout.
+///
+/// Bulk parts are written to the sink as regions the moment they are
+/// encoded; the metadata that names them is small and collected until
+/// [`finish`](Self::finish) appends it, the tail that locates it, and the
+/// page table. A resident [`CompactStore`] and the incremental builder's
+/// spooled rows both serialize through it, so a section written either
+/// way is the same bytes, and the resident scratch is one column.
+pub(crate) struct SectionWriter<'a> {
+    sink: &'a mut dyn std::io::Write,
+    pages: PageCrcWriter,
+    offset: u64,
+    meta: Vec<u8>,
+    scratch: Vec<u8>,
+}
+
+impl<'a> SectionWriter<'a> {
+    /// Writes the section header.
+    pub(crate) fn begin(
+        sink: &'a mut dyn std::io::Write,
+        preserves_ids: bool,
+    ) -> grafeo_common::utils::error::Result<Self> {
+        let mut writer = Self {
+            sink,
+            pages: PageCrcWriter::new(),
+            offset: 0,
+            meta: Vec::new(),
+            scratch: Vec::with_capacity(CHUNK_TARGET_BYTES),
+        };
+        let mut header = MAGIC.to_vec();
+        header.push(FORMAT_VERSION);
+        header.push(u8::from(preserves_ids));
+        writer.write_raw(&header)?;
+        Ok(writer)
+    }
+
+    fn write_raw(&mut self, bytes: &[u8]) -> grafeo_common::utils::error::Result<()> {
+        self.pages.update(bytes);
+        self.sink.write_all(bytes)?;
+        self.offset += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Writes `bytes` as a region and names it in the metadata.
+    fn region(&mut self, bytes: &[u8]) -> grafeo_common::utils::error::Result<()> {
+        write_u64(&mut self.meta, self.offset);
+        write_u64(&mut self.meta, bytes.len() as u64);
+        self.write_raw(bytes)
+    }
+
+    /// Writes the scratch buffer as a region and clears it.
+    fn scratch_region(&mut self) -> grafeo_common::utils::error::Result<()> {
+        let scratch = std::mem::take(&mut self.scratch);
+        let written = self.region(&scratch);
+        self.scratch = scratch;
+        self.scratch.clear();
+        written
+    }
+
+    /// Writes a table or entry count into the metadata.
+    pub(crate) fn count(&mut self, count: usize) -> grafeo_common::utils::error::Result<()> {
+        write_len(&mut self.meta, count)
+    }
+
+    /// Opens a node table whose `column_count` columns follow in ascending
+    /// key order.
+    pub(crate) fn node_table(
+        &mut self,
+        label: &str,
+        rows: usize,
+        column_count: usize,
+    ) -> grafeo_common::utils::error::Result<()> {
+        write_name(&mut self.meta, label)?;
+        write_len(&mut self.meta, rows)?;
+        write_len(&mut self.meta, column_count)?;
+        Ok(())
+    }
+
+    /// Writes one node column, with the row order that indexes it when the
+    /// property is indexed.
+    pub(crate) fn node_column(
+        &mut self,
+        key: &PropertyKey,
+        zone_map: Option<&ZoneMap>,
+        null_mask: Option<&BitVector>,
+        codec: &ColumnCodec,
+        block_zone_maps: Option<&[ZoneMap]>,
+        order: Option<&RowOrder>,
+    ) -> grafeo_common::utils::error::Result<()> {
+        write_name(&mut self.meta, key.as_str())?;
+        if let Some(zm) = zone_map {
+            self.meta.push(1);
+            write_zone_map(&mut self.meta, zm)?;
+        } else {
+            self.meta.push(0);
+        }
+        self.column_body(null_mask, codec, block_zone_maps)?;
+        match order {
+            Some(order) => {
+                self.meta.push(1);
+                order.write_to(&mut self.scratch);
+                self.scratch_region()
+            }
+            None => {
+                self.meta.push(0);
+                Ok(())
+            }
+        }
+    }
+
+    /// A column's body region (null mask and codec), then a Dict column's
+    /// entry regions.
+    fn column_body(
+        &mut self,
+        null_mask: Option<&BitVector>,
+        codec: &ColumnCodec,
+        block_zone_maps: Option<&[ZoneMap]>,
+    ) -> grafeo_common::utils::error::Result<()> {
+        write_null_mask(&mut self.scratch, FORMAT_VERSION, null_mask)?;
+        codec.write_blocked(&mut self.scratch, block_zone_maps, false)?;
+        self.scratch_region()?;
+        match codec {
+            ColumnCodec::Dict(dict) => {
+                self.meta.push(1);
+                let mut starts = Vec::with_capacity(dict.dictionary_size() * 4);
+                write_dictionary_regions(dict, &mut starts, &mut self.scratch)?;
+                self.region(&starts)?;
+                self.scratch_region()
+            }
+            _ => {
+                self.meta.push(0);
+                Ok(())
+            }
+        }
+    }
+
+    /// Writes a relationship table's adjacency and opens its
+    /// `property_count` columns, which follow in ascending key order.
+    pub(crate) fn rel_table(
+        &mut self,
+        edge_type: &str,
+        src_table_id: u16,
+        dst_table_id: u16,
+        fwd: &CsrAdjacency,
+        bwd: Option<&CsrAdjacency>,
+        property_count: usize,
+    ) -> grafeo_common::utils::error::Result<()> {
+        write_name(&mut self.meta, edge_type)?;
+        write_u16(&mut self.meta, src_table_id);
+        write_u16(&mut self.meta, dst_table_id);
+        fwd.write_to(&mut self.scratch)?;
+        if let Some(bwd) = bwd {
+            self.scratch.push(1);
+            bwd.write_to(&mut self.scratch)?;
+        } else {
+            self.scratch.push(0);
+        }
+        self.scratch_region()?;
+        write_len(&mut self.meta, property_count)?;
+        Ok(())
+    }
+
+    /// Writes one relationship property column.
+    pub(crate) fn rel_column(
+        &mut self,
+        key: &PropertyKey,
+        null_mask: Option<&BitVector>,
+        codec: &ColumnCodec,
+    ) -> grafeo_common::utils::error::Result<()> {
+        write_name(&mut self.meta, key.as_str())?;
+        self.column_body(null_mask, codec, None)
+    }
+
+    /// Writes an id map's records, ascending by id, as one region.
+    pub(crate) fn id_records(
+        &mut self,
+        records: &[IdRecord],
+    ) -> grafeo_common::utils::error::Result<()> {
+        write_u64(&mut self.meta, self.offset);
+        write_u64(&mut self.meta, (records.len() * RECORD_BYTES) as u64);
+        for &(id, table, position) in records {
+            write_u64(&mut self.scratch, id);
+            write_u16(&mut self.scratch, table);
+            write_u64(&mut self.scratch, position);
+            self.drain_scratch(false)?;
+        }
+        self.drain_scratch(true)
+    }
+
+    /// Writes one table's ids in position order as one region.
+    pub(crate) fn reverse_ids(&mut self, ids: &[u64]) -> grafeo_common::utils::error::Result<()> {
+        write_u64(&mut self.meta, self.offset);
+        write_u64(&mut self.meta, (ids.len() * 8) as u64);
+        for &id in ids {
+            write_u64(&mut self.scratch, id);
+            self.drain_scratch(false)?;
+        }
+        self.drain_scratch(true)
+    }
+
+    /// Writes the scratch buffer as part of the open region once it is
+    /// full, or whenever `force` is set.
+    fn drain_scratch(&mut self, force: bool) -> grafeo_common::utils::error::Result<()> {
+        if self.scratch.is_empty() || (!force && self.scratch.len() < CHUNK_TARGET_BYTES) {
+            return Ok(());
+        }
+        let scratch = std::mem::take(&mut self.scratch);
+        let written = self.write_raw(&scratch);
+        self.scratch = scratch;
+        self.scratch.clear();
+        written
+    }
+
+    /// Appends the metadata, the tail locating it, and the page table.
+    pub(crate) fn finish(mut self) -> grafeo_common::utils::error::Result<()> {
+        let meta = std::mem::take(&mut self.meta);
+        let mut tail = Vec::with_capacity(TAIL_BYTES);
+        write_u64(&mut tail, self.offset);
+        write_u64(&mut tail, meta.len() as u64);
+        self.write_raw(&meta)?;
+        self.write_raw(&tail)?;
+        let footer = self.pages.finish()?;
+        self.sink.write_all(&footer)?;
+        Ok(())
     }
 }
 
@@ -556,14 +882,21 @@ impl Section for CompactStoreSection {
 /// different or empty section.
 pub struct IncrementalCompactStoreSection {
     builder: parking_lot::Mutex<Option<super::IncrementalCompactStoreBuilder>>,
+    indexed_properties: Vec<PropertyKey>,
 }
 
 impl IncrementalCompactStoreSection {
-    /// Wraps the rows to be written.
+    /// Wraps the rows to be written, storing a row order beside each node
+    /// column of `indexed_properties` so the written store opens with
+    /// those properties already indexed.
     #[must_use]
-    pub fn new(builder: super::IncrementalCompactStoreBuilder) -> Self {
+    pub fn new(
+        builder: super::IncrementalCompactStoreBuilder,
+        indexed_properties: Vec<PropertyKey>,
+    ) -> Self {
         Self {
             builder: parking_lot::Mutex::new(Some(builder)),
+            indexed_properties,
         }
     }
 }
@@ -592,7 +925,7 @@ impl Section for IncrementalCompactStoreSection {
                 "incremental compact section was already written".into(),
             )
         })?;
-        builder.write_section(sink)
+        builder.write_section(sink, &self.indexed_properties)
     }
 
     fn deserialize(&mut self, _data: &[u8]) -> grafeo_common::utils::error::Result<()> {
@@ -639,7 +972,7 @@ fn read_codec(
         FORMAT_VERSION_V2 => ColumnCodec::read_from_v2(data, pos)
             .map(|c| (c, None))
             .map_err(|e| e.to_string())?,
-        FORMAT_VERSION_V3 | FORMAT_VERSION_V4 | FORMAT_VERSION => {
+        FORMAT_VERSION_V3 | FORMAT_VERSION_V4 | FORMAT_VERSION_V5 => {
             ColumnCodec::read_from_v3(data, pos)
                 .map(|(c, stats)| (c, Some(stats)))
                 .map_err(|e| e.to_string())?
@@ -653,6 +986,181 @@ fn read_codec(
 }
 
 fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, String> {
+    match data_bytes.get(4) {
+        Some(&FORMAT_VERSION) if data_bytes.starts_with(&MAGIC) => deserialize_paged(data_bytes),
+        _ => deserialize_legacy(data_bytes),
+    }
+}
+
+/// One column as a section describes it.
+struct ParsedColumn {
+    key: String,
+    zone_map: Option<ZoneMap>,
+    null_mask: Option<BitVector>,
+    codec: ColumnCodec,
+    block_stats: Option<Vec<ZoneMap>>,
+    order: Option<RowOrder>,
+}
+
+struct ParsedNodeTable {
+    label: String,
+    rows: usize,
+    columns: Vec<ParsedColumn>,
+}
+
+struct ParsedRelTable {
+    edge_type: String,
+    src_tid: u16,
+    dst_tid: u16,
+    fwd: CsrAdjacency,
+    bwd: Option<CsrAdjacency>,
+    columns: Vec<ParsedColumn>,
+}
+
+/// Builds the store the parsed tables describe: tables, lookups,
+/// statistics, and the property indexes whose row orders the section
+/// carried.
+fn assemble(node_tables: Vec<ParsedNodeTable>, rel_tables: Vec<ParsedRelTable>) -> CompactStore {
+    let mut tables = Vec::with_capacity(node_tables.len());
+    let mut label_to_table_id: FxHashMap<arcstr::ArcStr, u16> = FxHashMap::default();
+    let mut table_id_to_label: Vec<arcstr::ArcStr> = Vec::with_capacity(node_tables.len());
+    let mut indexes: FxHashMap<PropertyKey, Vec<(u16, RowOrder)>> = FxHashMap::default();
+
+    for (table_idx, parsed) in node_tables.into_iter().enumerate() {
+        let table_id = u16::try_from(table_idx).unwrap_or(0);
+        let label = arcstr::ArcStr::from(parsed.label.as_str());
+        let mut columns: FxHashMap<PropertyKey, ColumnCodec> = FxHashMap::default();
+        let mut zone_maps: FxHashMap<PropertyKey, ZoneMap> = FxHashMap::default();
+        let mut block_zone_maps: FxHashMap<PropertyKey, Vec<ZoneMap>> = FxHashMap::default();
+        let mut null_masks: FxHashMap<PropertyKey, BitVector> = FxHashMap::default();
+        let mut col_defs = Vec::with_capacity(parsed.columns.len());
+        for column in parsed.columns {
+            let key = PropertyKey::new(&column.key);
+            if let Some(zm) = column.zone_map {
+                zone_maps.insert(key.clone(), zm);
+            }
+            if let Some(mask) = column.null_mask {
+                null_masks.insert(key.clone(), mask);
+            }
+            if let Some(stats) = column.block_stats {
+                block_zone_maps.insert(key.clone(), stats);
+            }
+            if let Some(order) = column.order {
+                indexes
+                    .entry(key.clone())
+                    .or_default()
+                    .push((table_id, order));
+            }
+            col_defs.push(ColumnDef::new(
+                &column.key,
+                infer_column_type_from_codec(&column.codec),
+            ));
+            columns.insert(key, column.codec);
+        }
+        let schema = TableSchema::new(label.as_str(), table_id, col_defs);
+        let table = NodeTable::from_columns_with_block_stats(
+            schema,
+            columns,
+            zone_maps,
+            block_zone_maps,
+            parsed.rows,
+        )
+        .with_null_masks(null_masks);
+        tables.push(table);
+        label_to_table_id.insert(label.clone(), table_id);
+        table_id_to_label.push(label);
+    }
+
+    let mut rels = Vec::with_capacity(rel_tables.len());
+    let mut edge_type_to_rel_id: FxHashMap<arcstr::ArcStr, Vec<u16>> = FxHashMap::default();
+    let mut rel_table_id_to_type: Vec<arcstr::ArcStr> = Vec::with_capacity(rel_tables.len());
+    for (rel_idx, parsed) in rel_tables.into_iter().enumerate() {
+        let rel_table_id = u16::try_from(rel_idx).unwrap_or(0);
+        let edge_type = arcstr::ArcStr::from(parsed.edge_type.as_str());
+        let mut properties: FxHashMap<PropertyKey, ColumnCodec> = FxHashMap::default();
+        let mut null_masks: FxHashMap<PropertyKey, BitVector> = FxHashMap::default();
+        let mut prop_defs = Vec::with_capacity(parsed.columns.len());
+        for column in parsed.columns {
+            let key = PropertyKey::new(&column.key);
+            if let Some(mask) = column.null_mask {
+                null_masks.insert(key.clone(), mask);
+            }
+            prop_defs.push(ColumnDef::new(
+                &column.key,
+                infer_column_type_from_codec(&column.codec),
+            ));
+            properties.insert(key, column.codec);
+        }
+        let src_label = table_id_to_label
+            .get(parsed.src_tid as usize)
+            .cloned()
+            .unwrap_or_default();
+        let dst_label = table_id_to_label
+            .get(parsed.dst_tid as usize)
+            .cloned()
+            .unwrap_or_default();
+        let schema = EdgeSchema::new(
+            edge_type.as_str(),
+            rel_table_id,
+            src_label.as_str(),
+            dst_label.as_str(),
+            prop_defs,
+        );
+        let table = RelTable::new(
+            schema,
+            parsed.fwd,
+            parsed.bwd,
+            properties,
+            parsed.src_tid,
+            parsed.dst_tid,
+        )
+        .with_null_masks(null_masks);
+        edge_type_to_rel_id
+            .entry(edge_type.clone())
+            .or_default()
+            .push(rel_table_id);
+        rel_table_id_to_type.push(edge_type);
+        rels.push(table);
+    }
+
+    let mut stats = Statistics::new();
+    let mut total_nodes = 0u64;
+    let mut total_edges = 0u64;
+    for (idx, nt) in tables.iter().enumerate() {
+        let c = nt.len() as u64;
+        total_nodes += c;
+        stats.update_label(table_id_to_label[idx].as_str(), LabelStatistics::new(c));
+    }
+    let mut edge_counts: FxHashMap<&str, u64> = FxHashMap::default();
+    for (idx, rt) in rels.iter().enumerate() {
+        let c = rt.num_edges() as u64;
+        total_edges += c;
+        *edge_counts
+            .entry(rel_table_id_to_type[idx].as_str())
+            .or_default() += c;
+    }
+    for (et, count) in edge_counts {
+        stats.update_edge_type(et, EdgeTypeStatistics::new(count, 0.0, 0.0));
+    }
+    stats.total_nodes = total_nodes;
+    stats.total_edges = total_edges;
+
+    let mut store = CompactStore::new(
+        tables,
+        label_to_table_id,
+        rels,
+        edge_type_to_rel_id,
+        table_id_to_label,
+        rel_table_id_to_type,
+        stats,
+    );
+    store.attach_property_indexes(indexes);
+    store
+}
+
+/// Reads a section written before the paged layout: one trailing CRC over
+/// everything, columns and id maps inline.
+fn deserialize_legacy(data_bytes: &bytes::Bytes) -> Result<CompactStore, String> {
     let data: &[u8] = data_bytes.as_ref();
     if data.len() < 10 {
         return Err("data too short for CompactStore section".into());
@@ -684,92 +1192,62 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
     pos += 1;
     if !matches!(
         version,
-        FORMAT_VERSION
+        FORMAT_VERSION_V5
             | FORMAT_VERSION_V4
             | FORMAT_VERSION_V3
             | FORMAT_VERSION_V2
             | FORMAT_VERSION_V1
     ) {
         return Err(format!(
-            "unsupported CompactStore section version {version} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION_V3}, {FORMAT_VERSION_V4}, {FORMAT_VERSION})"
+            "unsupported CompactStore section version {version} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION_V3}, {FORMAT_VERSION_V4}, {FORMAT_VERSION_V5}, {FORMAT_VERSION})"
         ));
     }
     let flags = data[pos];
     pos += 1;
     let preserves_ids = flags & 0x01 != 0;
 
-    // Node tables.
     let num_node_tables = read_u32(data, &mut pos)? as usize;
     let mut node_tables = Vec::with_capacity(num_node_tables);
-    let mut label_to_table_id: FxHashMap<arcstr::ArcStr, u16> = FxHashMap::default();
-    let mut table_id_to_label: Vec<arcstr::ArcStr> = Vec::with_capacity(num_node_tables);
-
-    for table_idx in 0..num_node_tables {
-        let table_id = u16::try_from(table_idx).unwrap_or(0);
+    for _ in 0..num_node_tables {
         let label = read_string(data, &mut pos)?;
-        let label = arcstr::ArcStr::from(label.as_str());
-        let row_count = read_u32(data, &mut pos)? as usize;
+        let rows = read_u32(data, &mut pos)? as usize;
         let num_cols = read_u32(data, &mut pos)? as usize;
-
-        let mut columns: FxHashMap<PropertyKey, ColumnCodec> = FxHashMap::default();
-        let mut zone_maps: FxHashMap<PropertyKey, ZoneMap> = FxHashMap::default();
-        let mut block_zone_maps: FxHashMap<PropertyKey, Vec<ZoneMap>> = FxHashMap::default();
-        let mut null_masks: FxHashMap<PropertyKey, BitVector> = FxHashMap::default();
-        let mut col_defs = Vec::with_capacity(num_cols);
-
+        let mut columns = Vec::with_capacity(num_cols);
         for _ in 0..num_cols {
-            let key_str = read_string(data, &mut pos)?;
-            let key = PropertyKey::new(&key_str);
-
+            let key = read_string(data, &mut pos)?;
             let has_zm = *data.get(pos).ok_or("truncated zone map flag")?;
             pos += 1;
-            if has_zm == 1 {
-                let zm = read_zone_map(data, &mut pos)?;
-                zone_maps.insert(key.clone(), zm);
-            }
-            if let Some(mask) = read_null_mask(data, &mut pos, version)? {
-                null_masks.insert(key.clone(), mask);
-            }
-
-            let (codec, maybe_block_stats) =
+            let zone_map = if has_zm == 1 {
+                Some(read_zone_map(data, &mut pos)?)
+            } else {
+                None
+            };
+            let null_mask = read_null_mask(data, &mut pos, version)?;
+            let (codec, block_stats) =
                 read_codec(data_bytes, &mut pos, version).map_err(|e| format!("codec: {e}"))?;
-            if let Some(stats) = maybe_block_stats {
-                block_zone_maps.insert(key.clone(), stats);
-            }
-            let col_type = infer_column_type_from_codec(&codec);
-            col_defs.push(ColumnDef::new(&key_str, col_type));
-            columns.insert(key, codec);
+            columns.push(ParsedColumn {
+                key,
+                zone_map,
+                null_mask,
+                codec,
+                block_stats,
+                order: None,
+            });
         }
-
-        let schema = TableSchema::new(label.as_str(), table_id, col_defs);
-        let table = NodeTable::from_columns_with_block_stats(
-            schema,
+        node_tables.push(ParsedNodeTable {
+            label,
+            rows,
             columns,
-            zone_maps,
-            block_zone_maps,
-            row_count,
-        )
-        .with_null_masks(null_masks);
-        node_tables.push(table);
-        label_to_table_id.insert(label.clone(), table_id);
-        table_id_to_label.push(label);
+        });
     }
 
-    // Relationship tables.
     let num_rel_tables = read_u32(data, &mut pos)? as usize;
     let mut rel_tables = Vec::with_capacity(num_rel_tables);
-    let mut edge_type_to_rel_id: FxHashMap<arcstr::ArcStr, Vec<u16>> = FxHashMap::default();
-    let mut rel_table_id_to_type: Vec<arcstr::ArcStr> = Vec::with_capacity(num_rel_tables);
-
-    for rel_idx in 0..num_rel_tables {
-        let rel_table_id = u16::try_from(rel_idx).unwrap_or(0);
+    for _ in 0..num_rel_tables {
         let edge_type = read_string(data, &mut pos)?;
-        let edge_type = arcstr::ArcStr::from(edge_type.as_str());
         let src_tid = read_u16(data, &mut pos)?;
         let dst_tid = read_u16(data, &mut pos)?;
-
         let fwd = CsrAdjacency::read_from(data, &mut pos).map_err(|e| format!("fwd CSR: {e}"))?;
-
         let has_bwd = *data.get(pos).ok_or("truncated bwd flag")?;
         pos += 1;
         let bwd = if has_bwd == 1 {
@@ -777,131 +1255,279 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
         } else {
             None
         };
-
         let num_props = read_u32(data, &mut pos)? as usize;
-        let mut properties: FxHashMap<PropertyKey, ColumnCodec> = FxHashMap::default();
-        let mut null_masks: FxHashMap<PropertyKey, BitVector> = FxHashMap::default();
-        let mut prop_defs = Vec::with_capacity(num_props);
+        let mut columns = Vec::with_capacity(num_props);
         for _ in 0..num_props {
-            let key_str = read_string(data, &mut pos)?;
-            let key = PropertyKey::new(&key_str);
-            if let Some(mask) = read_null_mask(data, &mut pos, version)? {
-                null_masks.insert(key.clone(), mask);
-            }
+            let key = read_string(data, &mut pos)?;
+            let null_mask = read_null_mask(data, &mut pos, version)?;
             let (codec, _block_stats) = read_codec(data_bytes, &mut pos, version)
                 .map_err(|e| format!("edge codec: {e}"))?;
-            let col_type = infer_column_type_from_codec(&codec);
-            prop_defs.push(ColumnDef::new(&key_str, col_type));
-            properties.insert(key, codec);
+            columns.push(ParsedColumn {
+                key,
+                zone_map: None,
+                null_mask,
+                codec,
+                block_stats: None,
+                order: None,
+            });
         }
-
-        let src_label = table_id_to_label
-            .get(src_tid as usize)
-            .cloned()
-            .unwrap_or_default();
-        let dst_label = table_id_to_label
-            .get(dst_tid as usize)
-            .cloned()
-            .unwrap_or_default();
-
-        let schema = EdgeSchema::new(
-            edge_type.as_str(),
-            rel_table_id,
-            src_label.as_str(),
-            dst_label.as_str(),
-            prop_defs,
-        );
-
-        let table = RelTable::new(schema, fwd, bwd, properties, src_tid, dst_tid)
-            .with_null_masks(null_masks);
-        edge_type_to_rel_id
-            .entry(edge_type.clone())
-            .or_default()
-            .push(rel_table_id);
-        rel_table_id_to_type.push(edge_type);
-        rel_tables.push(table);
+        rel_tables.push(ParsedRelTable {
+            edge_type,
+            src_tid,
+            dst_tid,
+            fwd,
+            bwd,
+            columns,
+        });
     }
 
-    // Compute statistics.
-    let mut stats = Statistics::new();
-    let mut total_nodes = 0u64;
-    let mut total_edges = 0u64;
-    for (idx, nt) in node_tables.iter().enumerate() {
-        let c = nt.len() as u64;
-        total_nodes += c;
-        stats.update_label(table_id_to_label[idx].as_str(), LabelStatistics::new(c));
-    }
-    let mut edge_counts: FxHashMap<&str, u64> = FxHashMap::default();
-    for (idx, rt) in rel_tables.iter().enumerate() {
-        let c = rt.num_edges() as u64;
-        total_edges += c;
-        *edge_counts
-            .entry(rel_table_id_to_type[idx].as_str())
-            .or_default() += c;
-    }
-    for (et, count) in edge_counts {
-        stats.update_edge_type(et, EdgeTypeStatistics::new(count, 0.0, 0.0));
-    }
-    stats.total_nodes = total_nodes;
-    stats.total_edges = total_edges;
-
-    let mut store = CompactStore::new(
-        node_tables,
-        label_to_table_id,
-        rel_tables,
-        edge_type_to_rel_id,
-        table_id_to_label,
-        rel_table_id_to_type,
-        stats,
-    );
-
-    // ID maps.
+    let mut store = assemble(node_tables, rel_tables);
     if preserves_ids {
-        let node_map_len = read_u32(data, &mut pos)? as usize;
-        let mut node_id_map = FxHashMap::with_capacity_and_hasher(node_map_len, Default::default());
-        let num_tables = store.node_tables_by_id.len();
-        let mut node_offset_to_id: Vec<Vec<NodeId>> = vec![Vec::new(); num_tables];
-        for _ in 0..node_map_len {
-            let nid = NodeId::new(read_u64(data, &mut pos)?);
-            let tid = read_u16(data, &mut pos)?;
-            let off = read_u64(data, &mut pos)?;
-            node_id_map.insert(nid, (tid, off));
-            let off_idx = usize::try_from(off).unwrap_or(usize::MAX);
-            if let Some(rev) = node_offset_to_id.get_mut(tid as usize) {
-                while rev.len() <= off_idx {
-                    rev.push(NodeId::INVALID);
-                }
-                rev[off_idx] = nid;
-            }
-        }
-
-        let edge_map_len = read_u32(data, &mut pos)? as usize;
-        let mut edge_id_map = FxHashMap::with_capacity_and_hasher(edge_map_len, Default::default());
-        let num_rel = store.rel_tables_by_id.len();
-        let mut edge_offset_to_id: Vec<Vec<EdgeId>> = vec![Vec::new(); num_rel];
-        for _ in 0..edge_map_len {
-            let eid = EdgeId::new(read_u64(data, &mut pos)?);
-            let rtid = read_u16(data, &mut pos)?;
-            let csr_pos = read_u64(data, &mut pos)?;
-            edge_id_map.insert(eid, (rtid, csr_pos));
-            let pos_idx = usize::try_from(csr_pos).unwrap_or(usize::MAX);
-            if let Some(rev) = edge_offset_to_id.get_mut(rtid as usize) {
-                while rev.len() <= pos_idx {
-                    rev.push(EdgeId::INVALID);
-                }
-                rev[pos_idx] = eid;
-            }
-        }
-
-        store.set_id_maps(
-            node_id_map,
-            edge_id_map,
-            node_offset_to_id,
-            edge_offset_to_id,
+        let nodes = read_legacy_id_records(data, &mut pos)?;
+        let edges = read_legacy_id_records(data, &mut pos)?;
+        store.attach_id_maps(
+            IdMap::from_records(
+                nodes,
+                store.node_tables_by_id.len(),
+                NodeId::INVALID.as_u64(),
+            ),
+            IdMap::from_records(
+                edges,
+                store.rel_tables_by_id.len(),
+                EdgeId::INVALID.as_u64(),
+            ),
         );
     }
     store.section = SectionSpan::of(data_bytes);
+    Ok(store)
+}
 
+/// Reads one inline id map: a count, then `(id, table, position)` records
+/// in ascending id order.
+fn read_legacy_id_records(data: &[u8], pos: &mut usize) -> Result<Vec<IdRecord>, String> {
+    let count = read_u32(data, pos)? as usize;
+    let mut records = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = read_u64(data, pos)?;
+        let table = read_u16(data, pos)?;
+        let position = read_u64(data, pos)?;
+        records.push((id, table, position));
+    }
+    Ok(records)
+}
+
+/// Reads a paged section in place.
+///
+/// The footer, header, and metadata are verified first; then each region
+/// the open decodes (column bodies, null masks, adjacency) is verified
+/// before it is read. Dictionary entries, row orders, and id maps are
+/// handed to the store as unverified views and checked page by page as
+/// reads first touch them.
+fn deserialize_paged(data_bytes: &bytes::Bytes) -> Result<CompactStore, String> {
+    let pages = Arc::new(SectionPages::from_section(data_bytes)?);
+    let body = pages.body().clone();
+    let verify = |start: usize, end: usize| -> Result<(), String> {
+        if pages.verify(start, end) {
+            Ok(())
+        } else {
+            Err(pages
+                .fault()
+                .unwrap_or("section page check failed")
+                .to_owned())
+        }
+    };
+    if body.len() < HEADER_BYTES + TAIL_BYTES {
+        return Err("paged CompactStore section is too short".into());
+    }
+    verify(0, HEADER_BYTES)?;
+    if body[..4] != MAGIC || body[4] != FORMAT_VERSION {
+        return Err("bad paged CompactStore section header".into());
+    }
+    let preserves_ids = body[5] & 0x01 != 0;
+
+    let tail = body.len() - TAIL_BYTES;
+    verify(tail, body.len())?;
+    let mut tail_pos = tail;
+    let meta_start = usize::try_from(read_u64(&body, &mut tail_pos)?)
+        .map_err(|_| "metadata offset exceeds the address space")?;
+    let meta_len = usize::try_from(read_u64(&body, &mut tail_pos)?)
+        .map_err(|_| "metadata length exceeds the address space")?;
+    if meta_start < HEADER_BYTES || meta_start.checked_add(meta_len) != Some(tail) {
+        return Err("paged CompactStore metadata is not where the tail places it".into());
+    }
+    verify(meta_start, tail)?;
+    let meta = &body[meta_start..tail];
+    let mut pos = 0;
+
+    // A region named by the metadata: its bytes, unverified.
+    let region = |pos: &mut usize| -> Result<Bytes, String> {
+        let start = usize::try_from(read_u64(meta, pos)?).map_err(|_| "region offset overflow")?;
+        let len = usize::try_from(read_u64(meta, pos)?).map_err(|_| "region length overflow")?;
+        match start.checked_add(len) {
+            Some(end) if start >= HEADER_BYTES && end <= meta_start => Ok(body.slice(start..end)),
+            _ => Err("region outside the section body".into()),
+        }
+    };
+    // A region the open decodes now: verified before it is read.
+    let eager = |pos: &mut usize| -> Result<Bytes, String> {
+        let bytes = region(pos)?;
+        if pages.verify_slice(&bytes) {
+            Ok(bytes)
+        } else {
+            Err(pages
+                .fault()
+                .unwrap_or("section page check failed")
+                .to_owned())
+        }
+    };
+    let column =
+        |pos: &mut usize, key: String, zone_map: Option<ZoneMap>| -> Result<ParsedColumn, String> {
+            let body = eager(pos)?;
+            let has_dictionary = *meta.get(*pos).ok_or("truncated dictionary flag")?;
+            *pos += 1;
+            let mapped_dictionary = match has_dictionary {
+                0 => None,
+                1 => {
+                    let starts = region(pos)?;
+                    let entries = region(pos)?;
+                    Some(MappedDictionary {
+                        entries,
+                        starts,
+                        pages: Arc::clone(&pages),
+                    })
+                }
+                other => return Err(format!("invalid dictionary flag {other}")),
+            };
+            let mut at = 0;
+            let null_mask = read_null_mask(&body, &mut at, FORMAT_VERSION)?;
+            let (codec, block_stats) = ColumnCodec::read_blocked(&body, &mut at, mapped_dictionary)
+                .map_err(|e| format!("codec {key}: {e}"))?;
+            if at != body.len() {
+                return Err(format!(
+                    "column {key} body has {} trailing bytes",
+                    body.len() - at
+                ));
+            }
+            Ok(ParsedColumn {
+                key,
+                zone_map,
+                null_mask,
+                codec,
+                block_stats: Some(block_stats),
+                order: None,
+            })
+        };
+
+    let num_node_tables = read_u32(meta, &mut pos)? as usize;
+    let mut node_tables = Vec::with_capacity(num_node_tables);
+    for _ in 0..num_node_tables {
+        let label = read_string(meta, &mut pos)?;
+        let rows = read_u32(meta, &mut pos)? as usize;
+        let num_cols = read_u32(meta, &mut pos)? as usize;
+        let mut columns = Vec::with_capacity(num_cols);
+        for _ in 0..num_cols {
+            let key = read_string(meta, &mut pos)?;
+            let has_zm = *meta.get(pos).ok_or("truncated zone map flag")?;
+            pos += 1;
+            let zone_map = match has_zm {
+                0 => None,
+                1 => Some(read_zone_map(meta, &mut pos)?),
+                other => return Err(format!("invalid zone map flag {other}")),
+            };
+            let mut parsed = column(&mut pos, key, zone_map)?;
+            let has_order = *meta.get(pos).ok_or("truncated row order flag")?;
+            pos += 1;
+            parsed.order = match has_order {
+                0 => None,
+                1 => {
+                    let order = RowOrder::mapped(region(&mut pos)?, &pages)?;
+                    if order.len() > rows {
+                        return Err(format!(
+                            "row order of {} names more rows than {rows}",
+                            parsed.key
+                        ));
+                    }
+                    Some(order)
+                }
+                other => return Err(format!("invalid row order flag {other}")),
+            };
+            columns.push(parsed);
+        }
+        node_tables.push(ParsedNodeTable {
+            label,
+            rows,
+            columns,
+        });
+    }
+
+    let num_rel_tables = read_u32(meta, &mut pos)? as usize;
+    let mut rel_tables = Vec::with_capacity(num_rel_tables);
+    for _ in 0..num_rel_tables {
+        let edge_type = read_string(meta, &mut pos)?;
+        let src_tid = read_u16(meta, &mut pos)?;
+        let dst_tid = read_u16(meta, &mut pos)?;
+        let adjacency = eager(&mut pos)?;
+        let mut at = 0;
+        let fwd =
+            CsrAdjacency::read_from(&adjacency, &mut at).map_err(|e| format!("fwd CSR: {e}"))?;
+        let has_bwd = *adjacency.get(at).ok_or("truncated bwd flag")?;
+        at += 1;
+        let bwd = match has_bwd {
+            0 => None,
+            1 => Some(
+                CsrAdjacency::read_from(&adjacency, &mut at)
+                    .map_err(|e| format!("bwd CSR: {e}"))?,
+            ),
+            other => return Err(format!("invalid bwd flag {other}")),
+        };
+        if at != adjacency.len() {
+            return Err(format!("adjacency of {edge_type} has trailing bytes"));
+        }
+        let num_props = read_u32(meta, &mut pos)? as usize;
+        let mut columns = Vec::with_capacity(num_props);
+        for _ in 0..num_props {
+            let key = read_string(meta, &mut pos)?;
+            let mut parsed = column(&mut pos, key, None)?;
+            parsed.block_stats = None;
+            columns.push(parsed);
+        }
+        rel_tables.push(ParsedRelTable {
+            edge_type,
+            src_tid,
+            dst_tid,
+            fwd,
+            bwd,
+            columns,
+        });
+    }
+
+    let mut store = assemble(node_tables, rel_tables);
+    if preserves_ids {
+        let id_map = |pos: &mut usize, tables: usize| -> Result<IdMap, String> {
+            let records = region(pos)?;
+            let reverse_count = read_u32(meta, pos)? as usize;
+            if reverse_count != tables {
+                return Err(format!(
+                    "id map covers {reverse_count} tables, the section holds {tables}"
+                ));
+            }
+            let reverse = (0..reverse_count)
+                .map(|_| region(pos))
+                .collect::<Result<Vec<_>, _>>()?;
+            IdMap::mapped(records, reverse, &pages)
+        };
+        let nodes = id_map(&mut pos, store.node_tables_by_id.len())?;
+        let edges = id_map(&mut pos, store.rel_tables_by_id.len())?;
+        store.attach_id_maps(nodes, edges);
+    }
+    if pos != meta.len() {
+        return Err(format!(
+            "section metadata has {} trailing bytes",
+            meta.len() - pos
+        ));
+    }
+    store.section = SectionSpan::of(data_bytes);
+    store.pages = Some(pages);
     Ok(store)
 }
 
