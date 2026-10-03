@@ -754,13 +754,18 @@ impl LpgStore {
         let mut type_increments: grafeo_common::utils::hash::FxHashMap<u32, i64> =
             grafeo_common::utils::hash::FxHashMap::default();
 
+        // Type ids resolve before the edge lock: `edges_with_type` holds the type map
+        // while it reads the edges, so taking the type map under the edge lock deadlocks.
+        let type_ids: Vec<u32> = edges
+            .iter()
+            .map(|&(_, _, edge_type)| self.get_or_create_edge_type_id(edge_type))
+            .collect();
+
         // Create all edge records under a single edges write lock
         {
             let mut edge_map = self.edges.write();
-            for (i, &(src, dst, edge_type)) in edges.iter().enumerate() {
+            for (i, (&(src, dst, _), &type_id)) in edges.iter().zip(&type_ids).enumerate() {
                 let id = EdgeId::new(base_id + i as u64);
-                let type_id = self.get_or_create_edge_type_id(edge_type);
-
                 let record = EdgeRecord::new(id, src, dst, type_id, epoch);
                 let chain = VersionChain::with_initial(record, epoch, TransactionId::SYSTEM);
                 edge_map.insert(id, chain);
@@ -829,6 +834,13 @@ impl LpgStore {
         let mut type_increments: grafeo_common::utils::hash::FxHashMap<u32, i64> =
             grafeo_common::utils::hash::FxHashMap::default();
 
+        // Type ids resolve before the versions lock: `edges_with_type` holds the type
+        // map while it reads the versions, so taking the type map under it deadlocks.
+        let type_ids: Vec<u32> = edges
+            .iter()
+            .map(|&(_, _, edge_type)| self.get_or_create_edge_type_id(edge_type))
+            .collect();
+
         // Create all edge records under a single versions write lock
         {
             // The arena guard is taken under the versions lock, never before
@@ -838,10 +850,8 @@ impl LpgStore {
             let arena = pin
                 .arena_or_create(epoch)
                 .unwrap_or_else(|error| panic!("failed to create arena for epoch: {error}"));
-            for (i, &(src, dst, edge_type)) in edges.iter().enumerate() {
+            for (i, (&(src, dst, _), &type_id)) in edges.iter().zip(&type_ids).enumerate() {
                 let id = EdgeId::new(base_id + i as u64);
-                let type_id = self.get_or_create_edge_type_id(edge_type);
-
                 let record = EdgeRecord::new(id, src, dst, type_id, epoch);
                 let (offset, _stored) =
                     arena

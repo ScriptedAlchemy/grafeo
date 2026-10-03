@@ -1819,3 +1819,45 @@ fn test_gc_never_frees_an_arena_a_concurrent_writer_is_publishing_into() {
         baseline_arena_bytes
     );
 }
+
+#[test]
+fn test_batch_create_edges_with_new_types_does_not_deadlock_type_scans() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let store = Arc::new(LpgStore::new().unwrap());
+    let a = store.create_node(&["N"]);
+    let b = store.create_node(&["N"]);
+    store.create_edge(a, b, "T0");
+    let writer_done = Arc::new(AtomicBool::new(false));
+
+    let scanner = {
+        let store = Arc::clone(&store);
+        let writer_done = Arc::clone(&writer_done);
+        std::thread::spawn(move || {
+            while !writer_done.load(Ordering::Acquire) {
+                assert!(store.edges_with_type("T0").count() >= 1);
+            }
+        })
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    {
+        let store = Arc::clone(&store);
+        let writer_done = Arc::clone(&writer_done);
+        std::thread::spawn(move || {
+            for i in 0..5_000 {
+                let edge_type = format!("T{}", i + 1);
+                store.batch_create_edges(&[(a, b, edge_type.as_str())]);
+            }
+            writer_done.store(true, Ordering::Release);
+            done_tx.send(()).unwrap();
+        });
+    }
+
+    done_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("batch_create_edges deadlocked against edges_with_type");
+    scanner.join().unwrap();
+    assert_eq!(store.edge_count(), 5_001);
+}
