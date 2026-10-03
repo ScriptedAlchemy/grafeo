@@ -106,13 +106,15 @@ impl LpgStore {
             let node_chain_bytes = node_count * 64;
             let edge_chain_bytes = edge_count * 64;
             let total_chains = node_count + edge_count;
-            let mvcc = MvccMemory {
+            let mut mvcc = MvccMemory {
                 node_version_chains_bytes: node_chain_bytes,
                 edge_version_chains_bytes: edge_chain_bytes,
                 average_chain_depth: if total_chains > 0 { 1.0 } else { 0.0 },
                 max_chain_depth: usize::from(total_chains > 0),
-                total_bytes: node_chain_bytes + edge_chain_bytes,
+                arena_bytes: self.arena_allocator.total_allocated(),
+                ..Default::default()
             };
+            mvcc.compute_total();
             (mvcc, 0)
         }
     }
