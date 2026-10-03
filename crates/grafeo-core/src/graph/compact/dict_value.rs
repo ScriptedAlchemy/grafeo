@@ -56,8 +56,10 @@ fn decode_hex(hex: &str) -> Option<Vec<u8>> {
     if !hex.len().is_multiple_of(2) {
         return None;
     }
-    hex.chunks_exact(2)
-        .map(|pair| Some(nibble(pair[0])? << 4 | nibble(pair[1])?))
+    let (pairs, _) = hex.as_chunks::<2>();
+    pairs
+        .iter()
+        .map(|&[hi, lo]| Some(nibble(hi)? << 4 | nibble(lo)?))
         .collect()
 }
 

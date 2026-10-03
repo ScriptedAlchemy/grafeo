@@ -874,8 +874,8 @@ impl Section for CompactStoreSection {
 }
 
 /// A CompactStore section written straight from an
-/// [`IncrementalCompactStoreBuilder`], one column at a time, without first
-/// building the [`CompactStore`] it describes.
+/// [`IncrementalCompactStoreBuilder`](super::builder::IncrementalCompactStoreBuilder),
+/// one column at a time, without first building the [`CompactStore`] it describes.
 ///
 /// Write-only and single-use: the first serialization consumes the rows, so
 /// a second one — or a read — is refused rather than answered with a

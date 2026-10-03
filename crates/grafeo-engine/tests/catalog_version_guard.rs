@@ -97,7 +97,10 @@ fn corrupted_current_version_store_still_reports_crc_mismatch() {
     // claims the current format but its bytes no longer match the CRC the
     // writer recorded in the section directory.
     let (offset, length, payload) = read_catalog_section(&path);
-    assert!(length > 8, "catalog with a node type is larger than 8 bytes");
+    assert!(
+        length > 8,
+        "catalog with a node type is larger than 8 bytes"
+    );
     {
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.seek(SeekFrom::Start(offset + 8)).unwrap();

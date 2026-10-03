@@ -49,7 +49,9 @@ fn close_without_changes_skips_the_checkpoint() {
     // Reopen, only read, close: the container is already current, so close
     // must not write a new generation.
     let db = open_db(&path);
-    let result = db.execute("MATCH (d:Doc) RETURN count(d) AS total").unwrap();
+    let result = db
+        .execute("MATCH (d:Doc) RETURN count(d) AS total")
+        .unwrap();
     assert_eq!(result.scalar::<i64>().unwrap(), 50);
     db.close().expect("close unchanged store");
 
@@ -61,7 +63,9 @@ fn close_without_changes_skips_the_checkpoint() {
 
     // The skipped checkpoint must leave a fully usable store behind.
     let db = open_db(&path);
-    let result = db.execute("MATCH (d:Doc) RETURN count(d) AS total").unwrap();
+    let result = db
+        .execute("MATCH (d:Doc) RETURN count(d) AS total")
+        .unwrap();
     assert_eq!(result.scalar::<i64>().unwrap(), 50);
     db.close().expect("close after verification");
 }
@@ -82,7 +86,9 @@ fn close_after_mutations_still_checkpoints() {
     );
 
     let db = open_db(&path);
-    let result = db.execute("MATCH (d:Doc) RETURN count(d) AS total").unwrap();
+    let result = db
+        .execute("MATCH (d:Doc) RETURN count(d) AS total")
+        .unwrap();
     assert_eq!(result.scalar::<i64>().unwrap(), 51);
     db.close().expect("close after verification");
 }
@@ -124,7 +130,9 @@ fn close_after_sidecar_replay_still_checkpoints() {
     // Open replays the sidecar; even though this session appends no records
     // of its own, close must persist the replayed rows into the container.
     let db = open_db(&crash_path);
-    let result = db.execute("MATCH (d:Doc) RETURN count(d) AS total").unwrap();
+    let result = db
+        .execute("MATCH (d:Doc) RETURN count(d) AS total")
+        .unwrap();
     assert_eq!(result.scalar::<i64>().unwrap(), 51);
     db.close().expect("close replayed store");
 
@@ -179,8 +187,7 @@ fn close_after_vector_index_build_still_checkpoints() {
     // index shells, which this DB-level API does not create — callers such
     // as TraceDecay re-issue create_vector_index at open — so the durable
     // evidence here is the persisted section itself.)
-    let manager =
-        grafeo_storage::file::GrafeoFileManager::open(&path).expect("open container");
+    let manager = grafeo_storage::file::GrafeoFileManager::open(&path).expect("open container");
     let directory = manager
         .read_section_directory()
         .expect("read section directory")

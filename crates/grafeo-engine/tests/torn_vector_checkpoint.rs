@@ -70,8 +70,16 @@ fn insert_rows(db: &GrafeoDB, rows: std::ops::Range<usize>) {
 fn seed(path: &std::path::Path) {
     let db = GrafeoDB::with_config(config(path)).unwrap();
     insert_rows(&db, 0..ROWS);
-    db.create_vector_index(LABEL, PROPERTY, Some(DIMS), Some("cosine"), None, None, None)
-        .expect("build the index once");
+    db.create_vector_index(
+        LABEL,
+        PROPERTY,
+        Some(DIMS),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("build the index once");
     assert_eq!(db.vector_index_len(LABEL, PROPERTY), Some(ROWS));
     db.close().unwrap();
 }

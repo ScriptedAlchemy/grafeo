@@ -46,18 +46,13 @@ fn main() {
                         ("kind", Value::String("symbol".into())),
                         (
                             "path",
-                            Value::String(
-                                format!("crates/example/src/module_{i}/file.rs").into(),
-                            ),
+                            Value::String(format!("crates/example/src/module_{i}/file.rs").into()),
                         ),
                         (
                             "sequence",
                             Value::Int64(i64::try_from(i).expect("probe sizes fit i64")),
                         ),
-                        (
-                            "payload",
-                            Value::String("x".repeat(96).into()),
-                        ),
+                        ("payload", Value::String("x".repeat(96).into())),
                     ],
                 )
                 .expect("create node");

@@ -78,7 +78,7 @@ fn compacted_base_serves_indexed_lookups(wal_enabled: bool) {
     );
 
     // An unindexed property still works through the scan path.
-    assert!(lookup(&db, "k-0").len() == 1);
+    assert_eq!(lookup(&db, "k-0").len(), 1);
     db.close().unwrap();
 }
 

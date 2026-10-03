@@ -782,9 +782,7 @@ impl GraphStore for LayeredStore {
             .dirty_edge_ids
             .read()
             .iter()
-            .filter(|id| {
-                !deleted_edges.contains(*id) && self.base.load().get_edge(**id).is_some()
-            })
+            .filter(|id| !deleted_edges.contains(*id) && self.base.load().get_edge(**id).is_some())
             .count();
         base_count.saturating_sub(deleted_edges.len() + promoted) + overlay_count
     }
@@ -2196,11 +2194,15 @@ mod tests {
         // it must not appear as a neighbor in either direction.
         assert!(layered.get_node(city).is_some());
         assert!(
-            !layered.neighbors(first, Direction::Outgoing).contains(&city),
+            !layered
+                .neighbors(first, Direction::Outgoing)
+                .contains(&city),
             "tombstoned base edge must not surface its target in neighbors()"
         );
         assert!(
-            !layered.neighbors(city, Direction::Incoming).contains(&first),
+            !layered
+                .neighbors(city, Direction::Incoming)
+                .contains(&first),
             "tombstoned base edge must not surface its source in neighbors()"
         );
     }
@@ -2222,7 +2224,9 @@ mod tests {
         assert!(layered.delete_edge(eid));
 
         assert!(
-            !layered.neighbors(first, Direction::Outgoing).contains(&city),
+            !layered
+                .neighbors(first, Direction::Outgoing)
+                .contains(&city),
             "deleted pre-compaction edge of a promoted node must not appear in neighbors()"
         );
         assert_eq!(layered.edges_from(first, Direction::Outgoing).len(), 0);
@@ -2231,7 +2235,9 @@ mod tests {
         let replacement = layered.create_edge(first, city, "LIVES_IN");
         assert!(layered.get_edge(replacement).is_some());
         assert!(
-            layered.neighbors(first, Direction::Outgoing).contains(&city),
+            layered
+                .neighbors(first, Direction::Outgoing)
+                .contains(&city),
             "a live overlay edge to the same target must still surface it"
         );
     }

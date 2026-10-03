@@ -384,7 +384,7 @@ impl Arena {
     /// whole chunk — an allocation may not straddle two chunks — or if the
     /// epoch has exhausted the 4 GiB flat address space. A value that exactly
     /// fills a chunk is accepted. Returns `AllocError::InvalidAlignment` if
-    /// `T`'s alignment exceeds [`CHUNK_BASE_ALIGN`] or does not divide the
+    /// `T`'s alignment exceeds `CHUNK_BASE_ALIGN` or does not divide the
     /// chunk size: past the base-pointer guarantee, a value's in-chunk offset
     /// would depend on where the system allocator happened to place the
     /// chunk, and a flat address only preserves alignment when the stride is

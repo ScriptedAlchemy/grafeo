@@ -66,8 +66,16 @@ fn restore_is_cheaper_than_rebuild() {
     let db = GrafeoDB::with_config(Config::persistent(&rebuild_path)).unwrap();
     assert!(!db.graph_store().has_vector_index(LABEL, PROPERTY));
     let rebuild_started = Instant::now();
-    db.create_vector_index(LABEL, PROPERTY, Some(DIMS), Some("cosine"), None, None, None)
-        .unwrap();
+    db.create_vector_index(
+        LABEL,
+        PROPERTY,
+        Some(DIMS),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     let rebuild = rebuild_started.elapsed();
     assert_eq!(db.vector_index_len(LABEL, PROPERTY), Some(ROWS));
     let rebuilt_neighbours = neighbours(&db);
@@ -79,8 +87,16 @@ fn restore_is_cheaper_than_rebuild() {
     {
         let db = GrafeoDB::with_config(Config::persistent(&restore_path)).unwrap();
         seed_rows(&db);
-        db.create_vector_index(LABEL, PROPERTY, Some(DIMS), Some("cosine"), None, None, None)
-            .unwrap();
+        db.create_vector_index(
+            LABEL,
+            PROPERTY,
+            Some(DIMS),
+            Some("cosine"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         db.close().unwrap();
     }
     let restore_started = Instant::now();

@@ -33,7 +33,9 @@ const SECTION_TYPES: [SectionType; 4] = [
 fn payload(tag: u8, len: usize) -> Vec<u8> {
     // reason: `i % 251` always fits in u8
     #[allow(clippy::cast_possible_truncation)]
-    (0..len).map(|i| tag.wrapping_add((i % 251) as u8)).collect()
+    (0..len)
+        .map(|i| tag.wrapping_add((i % 251) as u8))
+        .collect()
 }
 
 /// Commits one generation via the production checkpoint path.
@@ -256,7 +258,10 @@ fn store_with_legacy_fixed_directory_layout_still_opens() {
 
     let mut directory = SectionDirectory::new();
     let mut offset = SECTION_DATA_OFFSET;
-    for (section_type, data) in [(SectionType::Catalog, &catalog), (SectionType::LpgStore, &lpg)] {
+    for (section_type, data) in [
+        (SectionType::Catalog, &catalog),
+        (SectionType::LpgStore, &lpg),
+    ] {
         directory
             .upsert(SectionDirectoryEntry {
                 section_type,
