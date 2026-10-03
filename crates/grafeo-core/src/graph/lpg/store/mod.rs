@@ -256,13 +256,13 @@ impl LabelRegistry {
         self.id_to_name.clear();
     }
 
-    /// Estimates heap memory usage in bytes.
+    /// Heap bytes the registry holds; each name's allocation is shared by
+    /// both directions and charged once.
     pub(super) fn heap_bytes(&self) -> usize {
-        let map_bytes = self.name_to_id.capacity()
-            * (std::mem::size_of::<ArcStr>() + std::mem::size_of::<u32>());
-        let vec_bytes = self.id_to_name.capacity() * std::mem::size_of::<ArcStr>();
-        let string_bytes: usize = self.id_to_name.iter().map(|s| s.len()).sum();
-        map_bytes + vec_bytes + string_bytes
+        use grafeo_common::memory::heap::{arcstr_bytes, vec_bytes};
+        self.name_to_id.allocation_size()
+            + vec_bytes(&self.id_to_name)
+            + self.id_to_name.iter().map(arcstr_bytes).sum::<usize>()
     }
 }
 

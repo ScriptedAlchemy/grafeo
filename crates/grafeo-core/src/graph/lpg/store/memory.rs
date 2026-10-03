@@ -1,8 +1,8 @@
 //! Memory introspection for `LpgStore`.
 
 use super::LpgStore;
+use grafeo_common::memory::heap::{arcstr_bytes, dash_map_bytes, vec_bytes};
 use grafeo_common::memory::usage::{IndexMemory, MvccMemory, StoreMemory, StringPoolMemory};
-use std::mem::size_of;
 
 impl LpgStore {
     /// Returns a detailed memory breakdown of the store.
@@ -26,33 +26,15 @@ impl LpgStore {
 
         // Node/edge map overhead (excluding version chain internals, which go to MVCC)
         #[cfg(not(feature = "tiered-storage"))]
-        let (nodes_bytes, edges_bytes) = {
-            let nodes = self.nodes.read();
-            let edges = self.edges.read();
-            let n = nodes.capacity()
-                * (size_of::<grafeo_common::types::NodeId>()
-                    + size_of::<grafeo_common::mvcc::VersionChain<super::super::NodeRecord>>()
-                    + 1);
-            let e = edges.capacity()
-                * (size_of::<grafeo_common::types::EdgeId>()
-                    + size_of::<grafeo_common::mvcc::VersionChain<super::super::EdgeRecord>>()
-                    + 1);
-            (n, e)
-        };
+        let (nodes_bytes, edges_bytes) = (
+            self.nodes.read().allocation_size(),
+            self.edges.read().allocation_size(),
+        );
         #[cfg(feature = "tiered-storage")]
-        let (nodes_bytes, edges_bytes) = {
-            let nv = self.node_versions.read();
-            let ev = self.edge_versions.read();
-            let n = nv.capacity()
-                * (size_of::<grafeo_common::types::NodeId>()
-                    + size_of::<grafeo_common::mvcc::VersionIndex>()
-                    + 1);
-            let e = ev.capacity()
-                * (size_of::<grafeo_common::types::EdgeId>()
-                    + size_of::<grafeo_common::mvcc::VersionIndex>()
-                    + 1);
-            (n, e)
-        };
+        let (nodes_bytes, edges_bytes) = (
+            self.node_versions.read().allocation_size(),
+            self.edge_versions.read().allocation_size(),
+        );
 
         let mut store = StoreMemory {
             nodes_bytes,
@@ -142,55 +124,40 @@ impl LpgStore {
             .as_ref()
             .map_or(0, |adj| adj.heap_memory_bytes());
 
-        // Label index: Vec<FxHashMap<NodeId, ()>>
         let label_idx = self.label_index.read();
-        let label_index_bytes: usize = label_idx
-            .iter()
-            .map(|map| map.capacity() * (size_of::<grafeo_common::types::NodeId>() + 1))
-            .sum::<usize>()
-            + label_idx.capacity()
-                * size_of::<grafeo_common::utils::hash::FxHashMap<grafeo_common::types::NodeId, ()>>(
-                );
+        let label_index_bytes = vec_bytes(&label_idx)
+            + label_idx
+                .iter()
+                .map(hashbrown::HashMap::allocation_size)
+                .sum::<usize>();
         drop(label_idx);
 
-        // Node labels
         let node_labels = self.node_labels.read();
         #[cfg(not(feature = "temporal"))]
-        let node_labels_bytes = node_labels.capacity()
-            * (size_of::<grafeo_common::types::NodeId>()
-                + size_of::<grafeo_common::utils::hash::FxHashSet<u32>>()
-                + 1)
+        let node_labels_bytes = node_labels.allocation_size()
             + node_labels
                 .values()
-                .map(|set| set.capacity() * (size_of::<u32>() + 1))
+                .map(hashbrown::HashSet::allocation_size)
                 .sum::<usize>();
         #[cfg(feature = "temporal")]
-        let node_labels_bytes = node_labels.capacity()
-            * (size_of::<grafeo_common::types::NodeId>()
-                + size_of::<
-                    grafeo_common::temporal::VersionLog<grafeo_common::utils::hash::FxHashSet<u32>>,
-                >()
-                + 1)
+        let node_labels_bytes = node_labels.allocation_size()
             + node_labels
                 .values()
-                .map(|log| log.len() * size_of::<grafeo_common::utils::hash::FxHashSet<u32>>())
+                .map(|log| {
+                    log.len() * std::mem::size_of::<grafeo_common::utils::hash::FxHashSet<u32>>()
+                })
                 .sum::<usize>();
         drop(node_labels);
 
-        // Property indexes
+        // Index keys are clones of the indexed property values and share
+        // their allocations with property storage, so only the tables and
+        // node sets are the index's own.
         let prop_indexes = self.property_indexes.read();
-        let property_index_bytes: usize = prop_indexes
-            .values()
-            .map(|dmap| {
-                // DashMap: approximate as capacity * entry size
-                dmap.len()
-                    * (size_of::<grafeo_common::types::HashableValue>()
-                        + size_of::<
-                            grafeo_common::utils::hash::FxHashSet<grafeo_common::types::NodeId>,
-                        >()
-                        + 32)
-            })
-            .sum();
+        let property_index_bytes = prop_indexes.allocation_size()
+            + prop_indexes
+                .values()
+                .map(|index| dash_map_bytes(index, |_, nodes| nodes.allocation_size()))
+                .sum::<usize>();
         drop(prop_indexes);
 
         // Vector indexes
@@ -252,13 +219,9 @@ impl LpgStore {
 
         let label_registry_bytes = label_reg.heap_bytes();
 
-        // Same for edge types
-        let et_map_bytes = edge_type_to_id.capacity()
-            * (size_of::<arcstr::ArcStr>() + size_of::<u32>() + 1)
-            + edge_type_to_id.keys().map(|s| s.len()).sum::<usize>();
-        let et_vec_bytes = id_to_edge_type.capacity() * size_of::<arcstr::ArcStr>()
-            + id_to_edge_type.iter().map(|s| s.len()).sum::<usize>();
-        let edge_type_registry_bytes = et_map_bytes + et_vec_bytes;
+        let edge_type_registry_bytes = edge_type_to_id.allocation_size()
+            + vec_bytes(&id_to_edge_type)
+            + id_to_edge_type.iter().map(arcstr_bytes).sum::<usize>();
 
         let mut sp = StringPoolMemory {
             label_registry_bytes,

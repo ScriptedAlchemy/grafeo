@@ -26,6 +26,10 @@ pub struct MemoryUsage {
     pub string_pool: StringPoolMemory,
     /// Buffer manager tracked allocations.
     pub buffer_manager: BufferManagerMemory,
+    /// Schema catalog (label, property key, and edge type registries, index
+    /// definitions, constraints, and type definitions).
+    #[serde(default)]
+    pub catalog_bytes: usize,
     /// Columnar base of a compacted store.
     #[serde(default)]
     pub compact_base: CompactBaseMemory,
@@ -46,6 +50,7 @@ impl MemoryUsage {
             + self.caches.total_bytes
             + self.string_pool.total_bytes
             + self.buffer_manager.allocated_bytes
+            + self.catalog_bytes
             + self.compact_base.heap_bytes
             + self.rdf.total_bytes
             + self.cdc.total_bytes;

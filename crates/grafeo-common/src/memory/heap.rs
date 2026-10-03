@@ -6,10 +6,12 @@
 //! classes and page slack are the allocator's own overhead and are not
 //! counted here.
 
-use std::mem::{align_of, size_of};
+use std::hash::{BuildHasher, Hash};
+use std::mem::{align_of, size_of, size_of_val};
 use std::sync::Arc;
 
 use arcstr::ArcStr;
+use dashmap::DashMap;
 
 /// The two reference counts every `Arc` and [`ArcStr`] allocation starts with.
 const REFCOUNT_HEADER_BYTES: usize = 2 * size_of::<usize>();
@@ -80,6 +82,26 @@ pub fn std_hash_map_bytes<K, V, S>(map: &std::collections::HashMap<K, V, S>) -> 
 #[must_use]
 pub fn std_hash_set_bytes<T, S>(set: &std::collections::HashSet<T, S>) -> usize {
     swiss_table_bytes::<T>(set.capacity())
+}
+
+/// Bytes a `DashMap` holds: its array of cache-padded shard locks, which is
+/// allocated even when the map is empty and scales with the shard count,
+/// each shard's table, and the heap `entry_bytes` reports each entry owns.
+#[must_use]
+pub fn dash_map_bytes<K: Eq + Hash, V, S: BuildHasher + Clone>(
+    map: &DashMap<K, V, S>,
+    entry_bytes: impl Fn(&K, &V) -> usize,
+) -> usize {
+    let shards = map.shards();
+    size_of_val(shards)
+        + shards
+            .iter()
+            .map(|shard| shard.read().allocation_info().1.size())
+            .sum::<usize>()
+        + map
+            .iter()
+            .map(|entry| entry_bytes(entry.key(), entry.value()))
+            .sum::<usize>()
 }
 
 fn swiss_table_bytes<T>(capacity: usize) -> usize {
