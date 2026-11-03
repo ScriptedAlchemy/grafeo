@@ -130,6 +130,49 @@ impl NodeTable {
             .collect()
     }
 
+    /// Allocation demand of decoding the properties at one row.
+    pub fn allocation_bytes(&self, offset: usize) -> usize {
+        use std::mem::size_of;
+        if offset >= self.len {
+            return 0;
+        }
+        self.columns.iter().fold(
+            self.columns
+                .len()
+                .saturating_mul(4 * size_of::<(PropertyKey, Value)>()),
+            |bytes, (key, col)| {
+                if self.is_null(offset, key) {
+                    bytes
+                } else {
+                    bytes
+                        .saturating_add(col.allocation_bytes(offset))
+                        .saturating_add(key.as_str().len())
+                }
+            },
+        )
+    }
+
+    /// Visits present properties without building an intermediate property map.
+    pub fn for_each_property(&self, offset: usize, mut visit: impl FnMut(&PropertyKey, Value)) {
+        for (key, col) in &self.columns {
+            if !self.is_null(offset, key)
+                && let Some(value) = col.get(offset)
+            {
+                visit(key, value);
+            }
+        }
+    }
+
+    /// Allocation demand of decoding one property, excluding absent values.
+    pub fn property_allocation_bytes(&self, offset: usize, key: &PropertyKey) -> usize {
+        if self.is_null(offset, key) {
+            return 0;
+        }
+        self.columns
+            .get(key)
+            .map_or(0, |col| col.allocation_bytes(offset))
+    }
+
     /// Whether the node at `offset` holds no value for `key`.
     ///
     /// A `true` row is one the builder padded because the node never had the

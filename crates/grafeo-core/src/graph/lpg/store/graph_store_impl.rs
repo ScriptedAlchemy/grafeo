@@ -20,6 +20,61 @@ use grafeo_common::utils::hash::FxHashMap;
 use std::sync::Arc;
 
 impl GraphStore for LpgStore {
+    fn node_allocation_bytes(&self, id: NodeId) -> Option<usize> {
+        if !self.node_visible(id) {
+            return Some(0);
+        }
+        let labels = self.node_labels.read();
+        #[cfg(not(feature = "temporal"))]
+        let count = labels.get(&id).map_or(0, |labels| labels.len());
+        #[cfg(feature = "temporal")]
+        let count = labels
+            .get(&id)
+            .and_then(|log| log.latest())
+            .map_or(0, |labels| labels.len());
+        Some(
+            self.node_properties
+                .allocation_bytes(id, None)
+                .saturating_add(count.saturating_mul(4 * std::mem::size_of::<ArcStr>())),
+        )
+    }
+
+    fn property_lookup_allocation_bytes(&self, key: &PropertyKey, value: &Value) -> Option<usize> {
+        let indexes = self.property_indexes.read();
+        let index = indexes.get(key)?;
+        let value = grafeo_common::types::HashableValue::new(value.clone());
+        Some(
+            index
+                .get(&value)
+                .map_or(0, |nodes| nodes.len())
+                .saturating_mul(std::mem::size_of::<NodeId>()),
+        )
+    }
+
+    fn edge_allocation_bytes(&self, id: EdgeId) -> Option<usize> {
+        if self.edge_header(id).is_none() {
+            return Some(0);
+        }
+        Some(self.edge_properties.allocation_bytes(id, None))
+    }
+
+    fn node_property_allocation_bytes(&self, id: NodeId, key: &PropertyKey) -> Option<usize> {
+        Some(self.node_properties.allocation_bytes(id, Some(key)))
+    }
+
+    fn label_allocation_bytes(&self) -> Option<usize> {
+        let registry = self.label_registry.read();
+        Some(
+            registry.names().iter().fold(
+                registry
+                    .names()
+                    .len()
+                    .saturating_mul(std::mem::size_of::<String>()),
+                |bytes, label| bytes.saturating_add(label.len()),
+            ),
+        )
+    }
+
     fn get_node(&self, id: NodeId) -> Option<Node> {
         LpgStore::get_node(self, id)
     }

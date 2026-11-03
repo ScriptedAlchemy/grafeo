@@ -137,6 +137,50 @@ pub(crate) fn build_row_order(
     Some(RowOrder::Inline(rows))
 }
 
+/// The number of rows whose value equals `value`, found by binary search
+/// over `order`, mirroring [`find_eq`] without collecting the rows.
+///
+/// `None` when the codec and value are not an orderable pair this index
+/// serves, so the caller can decline rather than assume zero.
+pub(crate) fn equality_count(
+    codec: &ColumnCodec,
+    order: &RowOrder,
+    value: &Value,
+) -> Option<usize> {
+    let entry;
+    let compare: Box<dyn Fn(usize) -> Option<Ordering> + '_> = match (codec, value) {
+        (ColumnCodec::Dict(dict), Value::String(_) | Value::Bytes(_)) => {
+            entry = encode_dict_entry(value);
+            Box::new(|row| {
+                let code = dict.code_at(row)?;
+                Some(dict.entry(code as usize)?.cmp(entry.as_str()))
+            })
+        }
+        (ColumnCodec::BitPacked(packed), &Value::Int64(target)) => {
+            let target = u64::try_from(target).ok()?;
+            Box::new(move |row| Some(packed.get(row)?.cmp(&target)))
+        }
+        (ColumnCodec::RawI64(store), &Value::Int64(target)) => {
+            Box::new(move |row| Some(store.get(row)?.cmp(&target)))
+        }
+        _ => return None,
+    };
+    let bound = |inclusive: bool| -> Option<usize> {
+        let (mut low, mut high) = (0, order.len());
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let ordering = order.row(mid).and_then(&compare)?;
+            if ordering == Ordering::Less || (inclusive && ordering == Ordering::Equal) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        Some(low)
+    };
+    Some(bound(true)?.saturating_sub(bound(false)?))
+}
+
 /// The rows of `codec` whose value equals `value`, in row order, found by
 /// binary search over `order`.
 pub(crate) fn find_eq(codec: &ColumnCodec, order: &RowOrder, value: &Value) -> Vec<usize> {
