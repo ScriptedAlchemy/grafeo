@@ -44,6 +44,38 @@ use std::sync::Arc;
 pub trait GraphStore: Send + Sync {
     // --- Point lookups ---
 
+    /// Allocation demand of materializing a node, without materializing it.
+    ///
+    /// `None` means this store cannot supply allocation metadata. Callers must
+    /// not treat unavailable metadata as a zero-byte read.
+    fn node_allocation_bytes(&self, _id: NodeId) -> Option<usize> {
+        None
+    }
+
+    /// Allocation demand of materializing an edge, or `None` when unavailable.
+    fn edge_allocation_bytes(&self, _id: EdgeId) -> Option<usize> {
+        None
+    }
+
+    /// Allocation demand of one property lookup, including dictionary decoding.
+    fn node_property_allocation_bytes(&self, _id: NodeId, _key: &PropertyKey) -> Option<usize> {
+        None
+    }
+
+    /// Allocation demand of enumerating the label universe.
+    fn label_allocation_bytes(&self) -> Option<usize> {
+        None
+    }
+
+    /// Allocation demand of an indexed equality lookup, or `None` when unavailable.
+    fn property_lookup_allocation_bytes(
+        &self,
+        _key: &PropertyKey,
+        _value: &Value,
+    ) -> Option<usize> {
+        None
+    }
+
     /// Returns a node by ID (latest visible version at current epoch).
     fn get_node(&self, id: NodeId) -> Option<Node>;
 

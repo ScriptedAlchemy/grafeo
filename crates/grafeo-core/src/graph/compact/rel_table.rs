@@ -180,6 +180,36 @@ impl RelTable {
         Some(results)
     }
 
+    /// Allocation demand of decoding the properties at one CSR position.
+    pub fn allocation_bytes(&self, offset: usize) -> usize {
+        use std::mem::size_of;
+        self.properties.iter().fold(
+            self.properties
+                .len()
+                .saturating_mul(4 * size_of::<(PropertyKey, Value)>()),
+            |bytes, (key, col)| {
+                if self.is_null(offset, key) {
+                    bytes
+                } else {
+                    bytes
+                        .saturating_add(col.allocation_bytes(offset))
+                        .saturating_add(key.as_str().len())
+                }
+            },
+        )
+    }
+
+    /// Visits present properties without building an intermediate property map.
+    pub fn for_each_property(&self, offset: usize, mut visit: impl FnMut(&PropertyKey, Value)) {
+        for (key, col) in &self.properties {
+            if !self.is_null(offset, key)
+                && let Some(value) = col.get(offset)
+            {
+                visit(key, value);
+            }
+        }
+    }
+
     /// Returns the property value for a specific edge (by CSR position) and
     /// key; `None` when the edge holds no value for it.
     #[must_use]

@@ -20,7 +20,9 @@ impl LpgStore {
             id_to_type.get(record.type_id as usize)?.clone()
         };
         let mut edge = Edge::new(id, record.src, record.dst, edge_type);
-        edge.properties = self.edge_properties.get_all(id).into_iter().collect();
+        self.edge_properties.for_each(id, |key, value| {
+            edge.set_property(key.clone(), value);
+        });
         Some(edge)
     }
 
@@ -76,11 +78,9 @@ impl LpgStore {
             id_to_type.get(record.type_id as usize)?.clone()
         };
         let mut edge = Edge::new(id, record.src, record.dst, edge_type);
-        edge.properties = self
-            .edge_properties
-            .get_all_at(id, epoch)
-            .into_iter()
-            .collect();
+        self.edge_properties.for_each_at(id, epoch, |key, value| {
+            edge.set_property(key.clone(), value);
+        });
         Some(edge)
     }
 

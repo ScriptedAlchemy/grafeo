@@ -291,6 +291,29 @@ pub enum ColumnCodec {
 }
 
 impl ColumnCodec {
+    /// Reads borrowed codec storage. It never decodes a Value.
+    pub fn allocation_bytes(&self, index: usize) -> usize {
+        use grafeo_common::memory::heap::arc_slice_bytes;
+        use std::mem::size_of;
+        match self {
+            Self::Dict(dict) => dict.get(index).map_or(0, |entry| {
+                // A malformed marker falls back to a literal string. Include
+                // the partial hex vector as well as that fallback allocation.
+                entry
+                    .len()
+                    .saturating_mul(2)
+                    .saturating_add(2 * size_of::<usize>())
+            }),
+            Self::Int8Vector { dimensions, .. } => usize::from(*dimensions)
+                .saturating_mul(size_of::<Value>())
+                .saturating_add(arc_slice_bytes::<Value>(usize::from(*dimensions))),
+            Self::Float32Vector { dimensions, .. } => usize::from(*dimensions)
+                .saturating_mul(size_of::<f32>())
+                .saturating_add(arc_slice_bytes::<f32>(usize::from(*dimensions))),
+            _ => 0,
+        }
+    }
+
     // ── Phase 3a: Bytes-backed constructors ─────────────────────────
 
     /// Constructs a [`RawI64`](Self::RawI64) column from a `Vec<i64>`

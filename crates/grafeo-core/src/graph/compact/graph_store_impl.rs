@@ -19,6 +19,69 @@ use crate::graph::traits::{GraphStore, GraphStoreSearch};
 use crate::statistics::Statistics;
 
 impl GraphStore for CompactStore {
+    fn node_allocation_bytes(&self, id: NodeId) -> Option<usize> {
+        let Some((table, offset)) = self.resolve_node(id) else {
+            return Some(0);
+        };
+        let table = self.resolve_node_table(table)?;
+        Some(
+            table
+                .allocation_bytes(usize::try_from(offset).ok()?)
+                .saturating_add(table.label().len()),
+        )
+    }
+
+    fn edge_allocation_bytes(&self, id: EdgeId) -> Option<usize> {
+        let Some((table, offset)) = self.resolve_edge(id) else {
+            return Some(0);
+        };
+        Some(
+            self.resolve_rel_table(table)?
+                .allocation_bytes(usize::try_from(offset).ok()?),
+        )
+    }
+
+    fn node_property_allocation_bytes(&self, id: NodeId, key: &PropertyKey) -> Option<usize> {
+        let Some((table, offset)) = self.resolve_node(id) else {
+            return Some(0);
+        };
+        Some(
+            self.resolve_node_table(table)?
+                .property_allocation_bytes(usize::try_from(offset).ok()?, key),
+        )
+    }
+
+    fn label_allocation_bytes(&self) -> Option<usize> {
+        Some(
+            self.table_id_to_label.iter().fold(
+                self.table_id_to_label
+                    .len()
+                    .saturating_mul(std::mem::size_of::<String>()),
+                |bytes, label| bytes.saturating_add(label.len()),
+            ),
+        )
+    }
+
+    fn property_lookup_allocation_bytes(&self, key: &PropertyKey, value: &Value) -> Option<usize> {
+        let index = self.property_value_index(key)?;
+        let mut count = 0_usize;
+        for (table, order) in index.iter() {
+            let col = self.resolve_node_table(*table)?.column(key)?;
+            count = count.saturating_add(super::value_order::equality_count(col, order, value)?);
+        }
+        let payload = match value {
+            Value::String(value) => value.len(),
+            Value::Bytes(value) => value.len() * 2,
+            _ => 0,
+        };
+        Some(
+            count
+                .saturating_mul(8 * std::mem::size_of::<NodeId>())
+                .saturating_add(payload.saturating_mul(3))
+                .saturating_add(128),
+        )
+    }
+
     fn get_node(&self, id: NodeId) -> Option<Node> {
         let (table_id, offset) = self.resolve_node(id)?;
         let nt = self.resolve_node_table(table_id)?;
@@ -29,10 +92,7 @@ impl GraphStore for CompactStore {
 
         let mut node = Node::new(id);
         node.add_label(nt.label());
-        let props = nt.get_all_properties(row);
-        for (k, v) in props {
-            node.set_property(k, v);
-        }
+        nt.for_each_property(row, |key, value| node.set_property(key.clone(), value));
         Some(node)
     }
 
@@ -48,10 +108,9 @@ impl GraphStore for CompactStore {
         let edge_type = rt.edge_type().clone();
 
         let mut edge = Edge::new(id, src, dst, edge_type);
-        let props = rt.get_all_edge_properties(pos as usize);
-        for (k, v) in props {
-            edge.set_property(k, v);
-        }
+        rt.for_each_property(pos as usize, |key, value| {
+            edge.set_property(key.clone(), value);
+        });
         Some(edge)
     }
 

@@ -102,7 +102,9 @@ impl LpgStore {
             }
         }
 
-        node.properties = self.node_properties.get_all(id).into_iter().collect();
+        self.node_properties.for_each(id, |key, value| {
+            node.set_property(key.clone(), value);
+        });
         node
     }
 
@@ -181,11 +183,9 @@ impl LpgStore {
             }
         }
 
-        node.properties = self
-            .node_properties
-            .get_all_at(id, epoch)
-            .into_iter()
-            .collect();
+        self.node_properties.for_each_at(id, epoch, |key, value| {
+            node.set_property(key.clone(), value);
+        });
         node
     }
 

@@ -437,6 +437,61 @@ impl LayeredStore {
 // ── GraphStore implementation ──────────────────────────────────────
 
 impl GraphStore for LayeredStore {
+    fn node_allocation_bytes(&self, id: NodeId) -> Option<usize> {
+        Some(
+            self.base
+                .load()
+                .node_allocation_bytes(id)?
+                .saturating_add(self.overlay.load().node_allocation_bytes(id)?),
+        )
+    }
+
+    fn edge_allocation_bytes(&self, id: EdgeId) -> Option<usize> {
+        Some(
+            self.base
+                .load()
+                .edge_allocation_bytes(id)?
+                .saturating_add(self.overlay.load().edge_allocation_bytes(id)?),
+        )
+    }
+
+    fn node_property_allocation_bytes(&self, id: NodeId, key: &PropertyKey) -> Option<usize> {
+        Some(
+            self.base
+                .load()
+                .node_property_allocation_bytes(id, key)?
+                .saturating_add(
+                    self.overlay
+                        .load()
+                        .node_property_allocation_bytes(id, key)?,
+                ),
+        )
+    }
+
+    fn label_allocation_bytes(&self) -> Option<usize> {
+        Some(
+            self.base
+                .load()
+                .label_allocation_bytes()?
+                .saturating_add(self.overlay.load().label_allocation_bytes()?)
+                .saturating_mul(4),
+        )
+    }
+
+    fn property_lookup_allocation_bytes(&self, key: &PropertyKey, value: &Value) -> Option<usize> {
+        Some(
+            self.base
+                .load()
+                .property_lookup_allocation_bytes(key, value)?
+                .saturating_add(
+                    self.overlay
+                        .load()
+                        .property_lookup_allocation_bytes(key, value)?,
+                )
+                .saturating_mul(2),
+        )
+    }
+
     fn get_node(&self, id: NodeId) -> Option<Node> {
         if self.is_node_deleted_from_base(id) {
             return None;

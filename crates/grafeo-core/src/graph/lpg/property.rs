@@ -301,6 +301,30 @@ impl<Id: EntityId> PropertyStorage<Id> {
         }
     }
 
+    /// Allocation demand from borrowed current values, without materializing them.
+    #[must_use]
+    pub fn allocation_bytes(&self, id: Id, key: Option<&PropertyKey>) -> usize {
+        use std::mem::size_of;
+        let columns = self.columns.read();
+        let mut bytes = 0_usize;
+        for (name, col) in columns.iter() {
+            if key.is_some_and(|key| key != name) {
+                continue;
+            }
+            if let Some(value) = col.borrowed(id) {
+                bytes = bytes
+                    .saturating_add(4 * size_of::<(PropertyKey, Value)>())
+                    .saturating_add(name.as_str().len())
+                    .saturating_add(match value {
+                        Value::String(value) => value.len(),
+                        Value::Bytes(value) => value.len(),
+                        _ => 0,
+                    });
+            }
+        }
+        bytes
+    }
+
     /// Gets all properties for an entity.
     #[must_use]
     pub fn get_all(&self, id: Id) -> FxHashMap<PropertyKey, Value> {
@@ -705,6 +729,16 @@ impl<Id: EntityId> PropertyStorage<Id> {
         }
     }
 
+    /// Visits the same visible epoch values as [`Self::get_all_at`].
+    pub fn for_each_at(&self, id: Id, epoch: EpochId, mut visit: impl FnMut(&PropertyKey, Value)) {
+        let columns = self.columns.read();
+        for (key, col) in columns.iter() {
+            if let Some(value) = col.get_at(id, epoch) {
+                visit(key, value);
+            }
+        }
+    }
+
     /// Removes all PENDING entries from all columns (transaction rollback).
     pub fn remove_pending(&self) {
         let mut columns = self.columns.write();
@@ -1014,6 +1048,13 @@ impl<Id: EntityId> PropertyColumn<Id> {
                 }
             }
         }
+    }
+
+    /// Borrows the current value without cloning its payload.
+    #[must_use]
+    #[cfg(not(feature = "temporal"))]
+    fn borrowed(&self, id: Id) -> Option<&Value> {
+        self.values.get(&id)
     }
 
     /// Gets a value for an entity.
@@ -1682,6 +1723,16 @@ impl<Id: EntityId> PropertyColumn<Id> {
                 }
             }
         }
+    }
+
+    /// Borrows the latest value, filtering out tombstones (Null).
+    #[must_use]
+    #[cfg(feature = "temporal")]
+    fn borrowed(&self, id: Id) -> Option<&Value> {
+        self.values
+            .get(&id)
+            .and_then(|log| log.latest())
+            .filter(|value| !value.is_null())
     }
 
     /// Gets the latest value for an entity, filtering out tombstones (Null).
